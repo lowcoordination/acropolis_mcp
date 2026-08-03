@@ -1,5 +1,11 @@
 import { api } from './client'
-import type { PolicyResponse, ServerCreateRequest, ServerResponse, ServerUpdateRequest } from './types'
+import type {
+  PolicyResponse,
+  ServerCreateRequest,
+  ServerResponse,
+  ServerTool,
+  ServerUpdateRequest,
+} from './types'
 
 export const serversApi = {
   list: () => api.get<ServerResponse[]>('/servers'),
@@ -9,4 +15,5 @@ export const serversApi = {
   delete: (slug: string) => api.delete<void>(`/servers/${slug}`),
   getPolicy: (slug: string) => api.get<PolicyResponse>(`/servers/${slug}/policy`),
   setPolicy: (slug: string, body: PolicyResponse) => api.put<PolicyResponse>(`/servers/${slug}/policy`, body),
+  getTools: (slug: string) => api.get<ServerTool[]>(`/servers/${slug}/tools`),
 }

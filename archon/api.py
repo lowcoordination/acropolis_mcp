@@ -115,6 +115,36 @@ def build_control_plane_router(
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
 
+    @router.get("/servers/{slug}/tools")
+    async def get_server_tools(slug: str):
+        try:
+            server = await server_repo.get(slug)
+        except ServerNotFoundError:
+            raise HTTPException(status_code=404, detail="server not found")
+
+        policy = await server_repo.get_policy(server.id)
+
+        if tools_cache is None:
+            return []
+
+        tools = await tools_cache.get_raw_tools(server.id, server.upstream_url)
+        result = []
+        for tool in tools:
+            name = tool.get("name", "")
+            if policy.mode == "allowlist":
+                status = "allowed" if name in policy.allowed else "denied"
+            elif policy.mode == "denylist":
+                status = "denied" if name in policy.denied else "allowed"
+            else:
+                status = "allowed"  # passthrough
+            result.append({
+                "name": name,
+                "description": tool.get("description"),
+                "status": status,
+                "has_param_rules": name in policy.param_rules,
+            })
+        return result
+
     @router.get("/servers/{slug}/policy", response_model=PolicyResponse)
     async def get_policy(slug: str):
         try:

@@ -86,6 +86,36 @@ async def test_get_filtered_tools_denylist_mode(db, cache, upstream):
     assert "echo" in names
 
 
+async def test_get_raw_tools_unreachable_upstream_returns_empty_not_raises(db, cache):
+    repo = ServerRepo(db)
+    server = await repo.create(slug="dead", name="Dead", upstream_url="http://127.0.0.1:1/mcp")
+
+    tools = await cache.get_raw_tools(server.id, server.upstream_url)
+    assert tools == []
+
+
+async def test_get_raw_tools_falls_back_to_stale_cache_when_upstream_goes_unreachable(db, upstream):
+    # Uses a live upstream to populate the cache, then a cache pointed at a dead URL to prove
+    # the stale-cache fallback (rather than raising) — the ToolsCache constructor takes the
+    # bridge, not the URL, so we can populate cache under the real URL then query with a dead one.
+    from argus.bridge import ProtocolBridge
+    from argus.upstream import UpstreamHandshakeCache
+    import httpx
+
+    repo = ServerRepo(db)
+    server = await repo.create(slug="s", name="S", upstream_url=f"{upstream.url}/mcp")
+
+    async with httpx.AsyncClient() as client:
+        bridge = ProtocolBridge(client, UpstreamHandshakeCache(client))
+        cache = ToolsCache(db, bridge)
+        first = await cache.get_raw_tools(server.id, server.upstream_url)
+        assert len(first) > 0
+
+        # Force a refetch against an unreachable URL — should fall back to the cache populated above.
+        second = await cache.get_raw_tools(server.id, "http://127.0.0.1:1/mcp", force_refresh=True)
+        assert {t["name"] for t in second} == {t["name"] for t in first}
+
+
 async def test_invalidate_forces_refetch(db, cache, upstream):
     repo = ServerRepo(db)
     server = await repo.create(slug="s", name="S", upstream_url=f"{upstream.url}/mcp")

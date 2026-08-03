@@ -6,7 +6,7 @@ from typing import Optional
 
 import aiosqlite
 
-from argus.bridge import ProtocolBridge
+from argus.bridge import BridgeError, ProtocolBridge
 from argus.policy import tool_is_visible
 from db.database import Database, utcnow
 from db.models import ServerPolicy
@@ -49,12 +49,21 @@ class ToolsCache:
         if rows and not force_refresh and all(self._is_fresh(r["fetched_at"], r["ttl_ms"]) for r in rows):
             return [json.loads(r["definition_json"]) for r in rows]
 
-        status, body = await self._bridge.bridge_call(
-            server_id=server_id, upstream_url=upstream_url, rpc_method="tools/list",
-            rpc_id="argus-toolslist", params={},
-        )
+        try:
+            status, body = await self._bridge.bridge_call(
+                server_id=server_id, upstream_url=upstream_url, rpc_method="tools/list",
+                rpc_id="argus-toolslist", params={},
+            )
+        except BridgeError:
+            # Upstream unreachable (connection refused, handshake failed, etc.) — serve stale
+            # cache if we have any, rather than propagating a 500 to whoever's asking for the
+            # tool list (a data-plane client, or the Archon UI's server-detail page).
+            if rows:
+                return [json.loads(r["definition_json"]) for r in rows]
+            return []
+
         if status != 200 or "result" not in body:
-            # Upstream fetch failed — serve stale cache if we have any, rather than erroring.
+            # Upstream responded, but not usefully — same fallback as above.
             if rows:
                 return [json.loads(r["definition_json"]) for r in rows]
             return []

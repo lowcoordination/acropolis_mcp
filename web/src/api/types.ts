@@ -110,3 +110,10 @@ export interface AuditEvent {
 export interface SetupStatusResponse {
   setup_complete: boolean
 }
+
+export interface ServerTool {
+  name: string
+  description: string | null
+  status: 'allowed' | 'denied'
+  has_param_rules: boolean
+}
