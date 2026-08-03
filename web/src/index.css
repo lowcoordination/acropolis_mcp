@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+/*
+ * Argus theme — Greek triad identity: marble, gold, teal (from the concept sheet:
+ * peacock-feather Argus eye, AR-crest Archon, column-S Stoa). Light = marble/parchment,
+ * dark = deep slate with the same gold/teal accents so the identity survives both modes.
+ */
+@theme {
+  --color-marble-50: #faf9f5;
+  --color-marble-100: #f2f0e6;
+  --color-marble-200: #e6e2d0;
+  --color-marble-900: #1a1a1e;
+  --color-marble-950: #101013;
+
+  --color-gold-400: #d4af6a;
+  --color-gold-500: #c19a4b;
+  --color-gold-600: #a3813a;
+
+  --color-teal-400: #4fb3a9;
+  --color-teal-500: #2f8f86;
+  --color-teal-600: #21716a;
+}
+
+:root {
+  color-scheme: light;
+  --bg: var(--color-marble-50);
+  --bg-elevated: #ffffff;
+  --border: var(--color-marble-200);
+  --text: #2a2820;
+  --text-muted: #6b6858;
+  --accent: var(--color-teal-600);
+  --accent-contrast: #ffffff;
+  --gold: var(--color-gold-600);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: var(--color-marble-950);
+    --bg-elevated: var(--color-marble-900);
+    --border: #2c2c33;
+    --text: #ece9df;
+    --text-muted: #9a978a;
+    --accent: var(--color-teal-400);
+    --accent-contrast: #0a1a18;
+    --gold: var(--color-gold-400);
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.nav-active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+.nav-inactive {
+  color: var(--text-muted);
+}
+
+.nav-inactive:hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+.btn-primary:hover {
+  filter: brightness(1.08);
+}
+
+.btn-secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.btn-secondary:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+input, select, textarea {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.badge-healthy { color: var(--color-teal-500); }
+.badge-unhealthy { color: #c0524b; }
+.badge-unknown { color: var(--text-muted); }

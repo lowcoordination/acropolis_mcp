@@ -1,3 +1,13 @@
+FROM node:22-slim AS web-build
+
+WORKDIR /web
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+
+COPY web/ ./
+RUN npm run build
+
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -11,6 +21,8 @@ COPY stoa/ ./stoa/
 COPY db/ ./db/
 
 RUN pip install --no-cache-dir .
+
+COPY --from=web-build /web/dist ./web/dist
 
 RUN mkdir -p /data && chown argus:argus /data
 

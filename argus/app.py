@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from archon.api import build_control_plane_router
 from archon.auth.apikeys import ApiKeyService
@@ -88,4 +91,35 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
 
+    _mount_web_ui(app)
+
     return app
+
+
+def _mount_web_ui(app: FastAPI) -> None:
+    """Serves the built React SPA (web/dist, produced by the Dockerfile's node build stage).
+    Registered LAST so it never shadows /api/* or /mcp/* — FastAPI/Starlette match routes in
+    registration order, and this uses a catch-all path.
+
+    In local dev (no dist/ present, e.g. running `python -m argus` directly against the repo
+    without having built web/), this mount is a no-op — use `npm run dev` in web/ instead,
+    which proxies /api and /mcp to this backend (see web/vite.config.ts)."""
+    dist_dir = Path(__file__).parent.parent / "web" / "dist"
+    if not dist_dir.is_dir():
+        return
+
+    assets_dir = dist_dir / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
+
+    index_path = dist_dir / "index.html"
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str) -> Response:
+        # A React Router client-side route (e.g. /servers/shell) has no matching file on
+        # disk — serve index.html for anything that isn't a real static asset, and let the
+        # client-side router take it from there.
+        candidate = dist_dir / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(index_path)
