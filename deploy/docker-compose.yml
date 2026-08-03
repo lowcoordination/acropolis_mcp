@@ -11,11 +11,12 @@ services:
     volumes:
       - argus-data:/data
     environment:
-      # Set a real token before exposing this beyond your own machine.
-      # Without it the /api/v1 control plane is unauthenticated.
+      # Optional: a bearer-token override for the /api/v1 control plane, for scripts/CI that
+      # shouldn't go through the browser login flow. Leave unset for normal use — visiting the
+      # UI for the first time walks you through setting an admin password instead.
       - ARGUS_ADMIN_TOKEN=${ARGUS_ADMIN_TOKEN:-}
       # "open" = no API key needed on /mcp/* (fine for a trusted LAN); "keyed" requires
-      # a Bearer API key on every data-plane request. See docs/quickstart.md.
+      # a Bearer API key on every data-plane request. Also set from the first-run wizard.
       - ARGUS_AUTH_MODE=${ARGUS_AUTH_MODE:-keyed}
 
 volumes:

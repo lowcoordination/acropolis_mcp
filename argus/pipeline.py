@@ -29,7 +29,7 @@ from argus.policy import evaluate
 from argus.rate_limiter import RateLimiterRegistry, api_key_key, server_key, tool_key
 from argus.toolslist import ToolsCache
 from db.models import ServerRecord
-from db.repo import ServerRepo
+from db.repo import ServerRepo, SettingsRepo
 
 logger = logging.getLogger("argus.pipeline")
 
@@ -62,6 +62,7 @@ class Pipeline:
         http_client: httpx.AsyncClient,
         bridge: Optional[ProtocolBridge] = None,
         tools_cache: Optional[ToolsCache] = None,
+        settings_repo: Optional[SettingsRepo] = None,
     ):
         self._settings = settings
         self._servers = server_repo
@@ -71,6 +72,7 @@ class Pipeline:
         self._client = http_client
         self._bridge = bridge
         self._tools_cache = tools_cache
+        self._settings_repo = settings_repo
 
     @property
     def tools_cache(self) -> Optional[ToolsCache]:
@@ -126,8 +128,37 @@ class Pipeline:
             raise RoutingError(404, rpc_error(None, f"server '{slug}' is disabled"))
         return server
 
+    async def _current_auth_mode(self) -> str:
+        """Data-plane auth mode, sourced live from the DB settings table (set by the first-run
+        wizard / Settings page in Archon) rather than the static env-var Settings object — the
+        env var is only the DEFAULT applied when the DB has no override yet. Reading this per
+        request means a policy change in the UI takes effect immediately, matching what the
+        Settings page's save button visibly implies it does."""
+        if self._settings_repo is not None:
+            stored = await self._settings_repo.get("auth_mode")
+            if stored is not None:
+                return stored
+        return self._settings.auth_mode
+
+    async def authenticate_no_scope(self, request: Request) -> Optional[int]:
+        """Auth check with no per-server scope requirement — for entry points that aren't
+        about one specific server (the aggregate endpoint's tools/list and server/discover,
+        which span every registered server). Still fully respects auth_mode and requires a
+        valid, enabled key when auth_mode is 'keyed'; just skips the scope check that
+        _authenticate does for a single-server request."""
+        if await self._current_auth_mode() == "open":
+            return None
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.lower().startswith("bearer "):
+            raise RoutingError(401, rpc_error(None, "missing bearer token"))
+        plaintext = auth_header[len("Bearer "):]
+        record = await self._api_keys.verify(plaintext)
+        if record is None:
+            raise RoutingError(401, rpc_error(None, "invalid or disabled api key"))
+        return record.id
+
     async def _authenticate(self, request: Request, slug: str) -> Optional[int]:
-        if self._settings.auth_mode == "open":
+        if await self._current_auth_mode() == "open":
             return None
 
         auth_header = request.headers.get("authorization", "")

@@ -53,6 +53,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         http_client=http_client,
         bridge=bridge,
         tools_cache=tools_cache,
+        settings_repo=settings_repo,
     )
     aggregate_pipeline = AggregatePipeline(
         settings=settings, server_repo=server_repo, api_keys=api_keys,

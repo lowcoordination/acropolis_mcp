@@ -14,7 +14,7 @@ from argus.audit import AuditLogger
 from argus.discover import synthesize_gateway_discover
 from argus.generation import ClientGeneration
 from argus.jsonrpc import rpc_error, sanitize_rpc_id
-from argus.pipeline import Pipeline
+from argus.pipeline import Pipeline, RoutingError
 from db.repo import ServerNotFoundError, ServerRepo
 
 logger = logging.getLogger("argus.aggregate_pipeline")
@@ -40,6 +40,21 @@ class AggregatePipeline:
 
     async def handle(self, request: Request) -> Response:
         start = time.monotonic()
+
+        # tools/call re-dispatches through Pipeline.handle(), which does its own (per-server-
+        # scoped) auth check — but tools/list and server/discover are answered directly here
+        # and would otherwise skip authentication entirely regardless of auth_mode. Check
+        # up front, before even parsing the body, so every method on this endpoint is gated.
+        try:
+            await self._per_server.authenticate_no_scope(request)
+        except RoutingError as e:
+            await self._audit.log(
+                server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
+                status_code=e.status_code, reason=e.body[:200],
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+            return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
+
         body_bytes = await request.body()
 
         try:
