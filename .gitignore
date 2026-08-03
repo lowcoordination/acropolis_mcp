@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# runtime data
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# frontend
+web/node_modules/
+web/dist/
+argus_static/
+
+# env
+.env
+.env.local
+
+.pytest_cache/
+.coverage

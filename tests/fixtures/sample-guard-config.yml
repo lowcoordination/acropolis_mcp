@@ -1,0 +1,117 @@
+listen_host: "0.0.0.0"
+audit_log: /var/log/mcp-guard/audit.jsonl
+
+servers:
+
+  shell:
+    listen_port: 9010
+    upstream: http://192.168.1.75:8010
+    rate_limit: "5/minute"
+    tools:
+      mode: allowlist
+      allowed: [shell_run]
+      rules:
+        shell_run:
+          command:
+            max_length: 200
+            block_patterns:
+              - "rm\\s+-rf"
+              - "rm\\s+-f"
+              - "sudo"
+              - ":(){:|:&};:"          # fork bomb
+              - "curl.+\\|.+sh"        # curl pipe to shell
+              - "wget.+\\|.+sh"
+              - "wget.+-O.+\\|"
+              - "\\bnc\\b"             # netcat
+              - "ncat"
+              - "mkfifo"
+              - "> /dev/"
+              - "dd if="
+
+  search:
+    listen_port: 9011
+    upstream: http://192.168.1.75:8011
+    tools:
+      mode: passthrough
+
+  fetch:
+    listen_port: 9012
+    upstream: http://192.168.1.75:8012
+    tools:
+      mode: passthrough
+
+  filesystem:
+    listen_port: 9013
+    upstream: http://192.168.1.75:8013
+    rate_limit: "60/minute"
+    tools:
+      mode: allowlist
+      allowed:
+        - read_file
+        - read_multiple_files
+        - list_directory
+        - directory_tree
+        - search_files
+        - get_file_info
+        - list_allowed_directories
+      # write_file, create_directory, move_file, edit_file are not in the allowlist
+
+  memory:
+    listen_port: 9014
+    upstream: http://192.168.1.75:8014
+    tools:
+      mode: passthrough
+
+  unifi:
+    listen_port: 9015
+    upstream: http://192.168.1.75:8015
+    rate_limit: "20/minute"
+    tools:
+      mode: denylist
+      denied:
+        - set_port_forwarding
+        - delete_port_forwarding
+        - set_firewall_rule
+        - delete_firewall_rule
+        - block_client
+        - unblock_client
+        - restart_device
+
+  github:
+    listen_port: 9016
+    upstream: http://192.168.1.75:8016
+    rate_limit: "30/minute"
+    tools:
+      mode: denylist
+      denied:
+        - create_or_update_file
+        - delete_file
+        - merge_pull_request
+        - fork_repository
+        - push_files
+
+  chroma:
+    listen_port: 9018
+    upstream: http://192.168.1.75:8018
+    tools:
+      mode: passthrough
+
+  jobspy:
+    listen_port: 9019
+    upstream: http://192.168.1.75:8019
+    rate_limit: "10/minute"
+    tools:
+      mode: allowlist
+      allowed: [search_jobs]
+      rules:
+        search_jobs:
+          proxies:
+            denied: true           # block SSRF vector
+          results_wanted:
+            max_value: 50
+
+  mn_land:
+    listen_port: 9020
+    upstream: http://192.168.1.75:8020
+    tools:
+      mode: passthrough

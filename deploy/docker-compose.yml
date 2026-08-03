@@ -1,0 +1,22 @@
+services:
+  argus:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: argus:latest
+    container_name: argus
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - argus-data:/data
+    environment:
+      # Set a real token before exposing this beyond your own machine.
+      # Without it the /api/v1 control plane is unauthenticated.
+      - ARGUS_ADMIN_TOKEN=${ARGUS_ADMIN_TOKEN:-}
+      # "open" = no API key needed on /mcp/* (fine for a trusted LAN); "keyed" requires
+      # a Bearer API key on every data-plane request. See docs/quickstart.md.
+      - ARGUS_AUTH_MODE=${ARGUS_AUTH_MODE:-keyed}
+
+volumes:
+  argus-data:

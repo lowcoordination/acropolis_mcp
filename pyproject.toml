@@ -1,0 +1,38 @@
+[project]
+name = "argus"
+version = "0.1.0"
+description = "Argus/Archon/Stoa — a self-hostable MCP gateway, policy engine, and registration hub"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "aiosqlite>=0.20.0",
+    "PyYAML>=6.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    # Pinned to 1.29.0 (protocol 2025-06-18) to match the real upstream fleet's generation —
+    # the mcp package's own 2.0.0 already speaks the 2026-07-28 stateless spec, which is the
+    # generation Argus needs to BRIDGE to, not the one its test fixtures should emulate as upstream.
+    "mcp==1.29.0",
+]
+
+[project.scripts]
+argus = "argus.__main__:cli"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["argus*", "archon*", "stoa*", "db*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
