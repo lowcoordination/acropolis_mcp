@@ -1,0 +1,34 @@
+# Example Ingress for Argus — NOT applied automatically (note the .example suffix). Copy to
+# ingress.yaml, fill in your own hostname and ingress class, and apply it once you have:
+#
+#   - an ingress controller running in your cluster (nginx-ingress, Traefik, etc.)
+#   - a way to issue TLS certs (cert-manager is the common choice; a ClusterIssuer named
+#     "letsencrypt-prod" is assumed below — replace with whatever you actually have)
+#   - a DNS record pointing your chosen hostname at your ingress controller's external IP
+#
+# See docs/tls-and-reverse-proxy.md for the non-Kubernetes version of this (Caddy/nginx).
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argus
+  namespace: argus
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx  # or "traefik", or whatever your cluster uses
+  tls:
+    - hosts:
+        - argus.example.com
+      secretName: argus-tls
+  rules:
+    - host: argus.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argus
+                port:
+                  name: http

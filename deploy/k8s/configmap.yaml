@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argus-config
+  namespace: argus
+data:
+  # "keyed" (recommended) requires an API key on every /mcp/* request; "open" requires none.
+  # Both the first-run wizard and the Settings page can also change this after deploy — the
+  # value here is only what a brand-new install starts with.
+  ARGUS_AUTH_MODE: "keyed"
+  ARGUS_HOST: "0.0.0.0"
+  ARGUS_PORT: "8000"

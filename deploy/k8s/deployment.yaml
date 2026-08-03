@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argus
+  namespace: argus
+  labels:
+    app: argus
+spec:
+  replicas: 1  # SQLite-backed; don't scale beyond 1 replica without moving to a shared DB first
+  strategy:
+    type: Recreate  # avoids two pods writing the same SQLite files at once during a rollout
+  selector:
+    matchLabels:
+      app: argus
+  template:
+    metadata:
+      labels:
+        app: argus
+    spec:
+      # Uncomment and set if your registry requires auth:
+      # imagePullSecrets:
+      #   - name: your-registry-creds
+
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: argus
+          # Replace with wherever you've pushed the built image (see the repo's Dockerfile).
+          image: argus:latest
+          imagePullPolicy: IfNotPresent
+
+          envFrom:
+            - configMapRef:
+                name: argus-config
+          env:
+            - name: ARGUS_DATA_DIR
+              value: /data
+            # Optional: a bearer-token override for the /api/v1 control plane (CI/automation
+            # only — normal use goes through the browser login flow instead). Uncomment and
+            # point at a real Secret if you want this.
+            # - name: ARGUS_ADMIN_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: argus-admin-token
+            #       key: token
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: argus-data
