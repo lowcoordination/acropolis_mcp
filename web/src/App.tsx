@@ -31,9 +31,8 @@ function App() {
 
   return (
     <Routes>
-      {/* A 401 anywhere behind Layout means the session expired — the query layer surfaces
-          that as an error boundary per-page rather than a global redirect for now; the login
-          route itself is always reachable directly. */}
+      {/* A 401 anywhere behind Layout is handled globally by the API client (see
+          api/client.ts), which redirects to /login — this route just needs to exist. */}
       <Route path="/login" element={<Login />} />
       <Route element={<Layout />}>
         <Route index element={<Dashboard />} />

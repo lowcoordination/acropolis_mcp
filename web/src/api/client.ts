@@ -26,6 +26,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // body wasn't JSON — keep statusText
     }
+    if (resp.status === 401 && window.location.pathname !== '/login') {
+      // Session expired or was never established (e.g. a bookmarked/shared dashboard link) —
+      // send the browser to the login screen instead of leaving every page to render its own
+      // "could not load" error boundary, which looks like the app is broken rather than logged out.
+      window.location.assign('/login')
+    }
     throw new ApiError(resp.status, detail)
   }
 
