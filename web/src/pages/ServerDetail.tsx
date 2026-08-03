@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { serversApi } from '../api/servers'
-import { useServer, useServerPolicy, useServerTools } from '../lib/useServers'
+import { useProbeServer, useServer, useServerPolicy, useServerTools } from '../lib/useServers'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
 import type { ParamRule, PolicyMode, PolicyResponse } from '../api/types'
 
@@ -124,6 +124,7 @@ export function ServerDetail() {
   const { data: server } = useServer(slug ?? '')
   const { data: policy, isLoading: policyLoading } = useServerPolicy(slug ?? '')
   const { data: tools, isLoading: toolsLoading } = useServerTools(slug ?? '')
+  const probeServer = useProbeServer(slug ?? '')
 
   const [draft, setDraft] = useState<PolicyResponse | null>(null)
   const [expandedTool, setExpandedTool] = useState<string | null>(null)
@@ -198,6 +199,15 @@ export function ServerDetail() {
           <h1 className="text-xl font-semibold">{server?.name ?? slug}</h1>
           {server && <HealthBadge status={server.health_status} />}
           {server && <ProtocolBadge protocol={server.upstream_protocol} />}
+          <button
+            type="button"
+            onClick={() => probeServer.mutate()}
+            disabled={probeServer.isPending}
+            className="text-xs font-medium disabled:opacity-60"
+            style={{ color: 'var(--accent)' }}
+          >
+            {probeServer.isPending ? 'Probing…' : 'Re-probe'}
+          </button>
         </div>
         <div className="mt-2 space-y-1">
           <div className="text-xs" style={{ color: 'var(--text-muted)' }}>

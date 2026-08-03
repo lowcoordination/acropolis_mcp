@@ -28,6 +28,7 @@ from argus.audit import AuditLogger
 from argus.toolslist import ToolsCache
 from db.database import utcnow
 from db.repo import AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
+from stoa.health import HealthPoller
 
 # Settings keys + defaults, applied when a key is absent from the settings table.
 _SETTINGS_DEFAULTS = {
@@ -66,6 +67,7 @@ def build_control_plane_router(
     settings_repo: Optional[SettingsRepo] = None,
     audit_repo: Optional[AuditRepo] = None,
     audit_logger: Optional[AuditLogger] = None,
+    health_poller: Optional[HealthPoller] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
@@ -87,7 +89,33 @@ def build_control_plane_router(
             )
         except SlugConflictError:
             raise HTTPException(status_code=409, detail=f"server slug '{body.slug}' already exists")
+
+        if health_poller is not None:
+            # Probe immediately rather than leaving the server at "unknown" for up to a full
+            # poll interval (60s default) — a first-time user's very first action shouldn't
+            # feel broken while they wait. A failed probe still returns 201 for the server
+            # itself; health_status just reflects "unhealthy" instead of "unknown".
+            try:
+                await health_poller.poll_one(server.slug)
+            except Exception:
+                pass  # best-effort; the background poller will retry on its own schedule
+            server = await server_repo.get(server.slug)
+
         return _server_to_response(server)
+
+    @router.post("/servers/{slug}/probe", response_model=ServerResponse)
+    async def probe_server_now(slug: str):
+        try:
+            server = await server_repo.get(slug)
+        except ServerNotFoundError:
+            raise HTTPException(status_code=404, detail="server not found")
+        if health_poller is not None:
+            await health_poller.poll_one(slug)
+            if tools_cache is not None:
+                # A manual re-probe is also the natural moment to refresh the tool catalog —
+                # e.g. after the operator adds a new tool to their own MCP server.
+                await tools_cache.get_raw_tools(server.id, server.upstream_url, force_refresh=True)
+        return _server_to_response(await server_repo.get(slug))
 
     @router.get("/servers/{slug}", response_model=ServerResponse)
     async def get_server(slug: str):

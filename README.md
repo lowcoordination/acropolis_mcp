@@ -14,7 +14,10 @@ Three modules, one process:
 
 ## Status
 
-Early development (M1: core data plane + minimal control API). Not yet ready for production use.
+Pre-1.0. The gateway, policy engine, and web UI are functional and covered by an extensive
+integration test suite (real MCP servers in every test, nothing mocked), but this hasn't yet
+seen production traffic beyond its own development. Expect rough edges; please open an issue
+if you hit one.
 
 ## Quickstart
 
@@ -22,7 +25,11 @@ Early development (M1: core data plane + minimal control API). Not yet ready for
 docker compose -f deploy/docker-compose.yml up
 ```
 
-Then open `http://localhost:8000` to finish setup.
+Then open `http://localhost:8000` to finish setup — see [docs/quickstart.md](docs/quickstart.md)
+for the full walkthrough (registering a server, locking down a tool, watching the audit log).
+
+Exposing Argus beyond your own machine? Read
+[docs/tls-and-reverse-proxy.md](docs/tls-and-reverse-proxy.md) first.
 
 ## Development
 

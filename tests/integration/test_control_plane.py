@@ -39,7 +39,10 @@ async def test_create_and_list_server(api_client):
     assert resp.status_code == 201
     body = resp.json()
     assert body["slug"] == "shell"
-    assert body["health_status"] == "unknown"
+    # Server creation probes immediately (see stoa/health.py HealthPoller.poll_one) rather than
+    # leaving health_status at "unknown" for up to a full poll interval. This upstream is
+    # unreachable in the test, so the immediate probe correctly reports "unhealthy".
+    assert body["health_status"] == "unhealthy"
 
     resp = await api_client.get("/api/v1/servers")
     assert resp.status_code == 200

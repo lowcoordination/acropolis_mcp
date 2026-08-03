@@ -8,7 +8,7 @@ import httpx
 
 from argus.upstream import CLIENT_INFO, UpstreamHandshakeCache, UpstreamHandshakeError, parse_sse_body
 from db.models import ServerRecord
-from db.repo import ServerRepo
+from db.repo import ServerNotFoundError, ServerRepo
 
 logger = logging.getLogger("stoa.health")
 
@@ -116,13 +116,27 @@ class HealthPoller:
         for server in servers:
             if not server.enabled:
                 continue
-            health_status, protocol, discover_json = await probe_server(
-                self._client, self._handshakes, server
-            )
-            await self._repo.set_health(
-                server.slug, health_status=health_status, upstream_protocol=protocol,
-                discover_json=json.dumps(discover_json) if discover_json else None,
-            )
+            await self._probe_and_store(server)
+
+    async def poll_one(self, slug: str) -> None:
+        """Probe a single server immediately, outside the normal poll cycle — used right after
+        registering a server (so it doesn't sit at 'unknown' for up to a full interval) and for
+        an explicit re-probe request from the UI."""
+        try:
+            server = await self._repo.get(slug)
+        except ServerNotFoundError:
+            return
+        if server.enabled:
+            await self._probe_and_store(server)
+
+    async def _probe_and_store(self, server: ServerRecord) -> None:
+        health_status, protocol, discover_json = await probe_server(
+            self._client, self._handshakes, server
+        )
+        await self._repo.set_health(
+            server.slug, health_status=health_status, upstream_protocol=protocol,
+            discover_json=json.dumps(discover_json) if discover_json else None,
+        )
 
     async def _loop(self) -> None:
         while True:

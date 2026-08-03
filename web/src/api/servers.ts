@@ -16,4 +16,5 @@ export const serversApi = {
   getPolicy: (slug: string) => api.get<PolicyResponse>(`/servers/${slug}/policy`),
   setPolicy: (slug: string, body: PolicyResponse) => api.put<PolicyResponse>(`/servers/${slug}/policy`, body),
   getTools: (slug: string) => api.get<ServerTool[]>(`/servers/${slug}/tools`),
+  probe: (slug: string) => api.post<ServerResponse>(`/servers/${slug}/probe`),
 }

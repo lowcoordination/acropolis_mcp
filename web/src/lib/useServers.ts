@@ -68,3 +68,15 @@ export function useSetServerPolicy(slug: string) {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['servers', slug, 'policy'] }),
   })
 }
+
+export function useProbeServer(slug: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => serversApi.probe(slug),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['servers'] })
+      queryClient.invalidateQueries({ queryKey: ['servers', slug] })
+      queryClient.invalidateQueries({ queryKey: ['servers', slug, 'tools'] })
+    },
+  })
+}
