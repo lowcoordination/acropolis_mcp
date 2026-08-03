@@ -268,7 +268,7 @@ class Pipeline:
                         return blocked_response
 
                     policy = await self._servers.get_policy(server.id)
-                    decision = evaluate(tool_name, arguments, server.name, policy)
+                    decision = await evaluate(tool_name, arguments, server.name, policy)
                     await self._audit.log(
                         server_slug=server.slug, tool=tool_name,
                         decision="BLOCKED" if decision.blocked else "ALLOWED",
@@ -342,7 +342,7 @@ class Pipeline:
                 return blocked_response
 
             policy = await self._servers.get_policy(server.id)
-            decision = evaluate(tool_name, arguments, server.name, policy)
+            decision = await evaluate(tool_name, arguments, server.name, policy)
             await self._audit.log(
                 server_slug=server.slug, tool=tool_name,
                 decision="BLOCKED" if decision.blocked else "ALLOWED",

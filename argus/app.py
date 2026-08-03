@@ -23,6 +23,7 @@ from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
 from db.repo import ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo
 from stoa.health import HealthPoller
+from stoa.retention import AuditRetentionJob
 
 
 def create_app(settings: Settings, db: Database) -> FastAPI:
@@ -42,6 +43,10 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     health_poller = HealthPoller(
         server_repo, http_client, handshake_cache,
         interval_seconds=settings.health_poll_interval_seconds,
+    )
+    retention_job = AuditRetentionJob(
+        audit_repo, settings_repo,
+        check_interval_seconds=settings.audit_retention_check_interval_seconds,
     )
 
     pipeline = Pipeline(
@@ -65,9 +70,12 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         audit.start()
         if settings.health_poll_enabled:
             health_poller.start()
+        if settings.audit_retention_enabled:
+            retention_job.start()
         try:
             yield
         finally:
+            await retention_job.stop()
             await health_poller.stop()
             await audit.stop()
             await http_client.aclose()
@@ -85,6 +93,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.bridge = bridge
     app.state.tools_cache = tools_cache
     app.state.health_poller = health_poller
+    app.state.retention_job = retention_job
 
     app.include_router(build_setup_router(settings_repo))
     app.include_router(build_control_plane_router(

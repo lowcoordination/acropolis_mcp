@@ -13,7 +13,7 @@ from db.database import Database
 
 @pytest.fixture
 async def app_transport(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     app = create_app(settings, db)
@@ -49,6 +49,42 @@ async def test_complete_setup_sets_cookie_and_marks_complete(client):
 
     status = await client.get("/api/v1/setup/status")
     assert status.json()["setup_complete"] is True
+
+
+def _cookie_attrs(resp: httpx.Response, name: str) -> str:
+    """httpx's cookie jar doesn't expose flags like HttpOnly/Secure — read the raw
+    Set-Cookie header instead."""
+    raw = resp.headers.get("set-cookie", "")
+    assert name in raw, f"{name} not found in Set-Cookie: {raw!r}"
+    return raw
+
+
+async def test_session_cookie_is_httponly_and_samesite_lax(client):
+    resp = await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
+    raw = _cookie_attrs(resp, "argus_session")
+    assert "httponly" in raw.lower()
+    assert "samesite=lax" in raw.lower()
+
+
+async def test_session_cookie_is_not_secure_over_plain_http(client):
+    # The quickstart's default flow is docker compose up -> http://localhost:8000 — the
+    # cookie must NOT carry Secure here, or the browser would silently refuse to send it
+    # back on the very next request and nobody could ever log in.
+    resp = await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
+    raw = _cookie_attrs(resp, "argus_session")
+    assert "secure" not in raw.lower()
+
+
+async def test_session_cookie_is_secure_behind_a_tls_terminating_proxy(client):
+    # Simulates the documented reverse-proxy setup (docs/tls-and-reverse-proxy.md): Argus
+    # itself only ever speaks plain HTTP, so the proxy is the only thing that can tell it
+    # the original request arrived over HTTPS, via X-Forwarded-Proto.
+    resp = await client.post(
+        "/api/v1/setup", json={"admin_password": "hunter22"},
+        headers={"X-Forwarded-Proto": "https"},
+    )
+    raw = _cookie_attrs(resp, "argus_session")
+    assert "secure" in raw.lower()
 
 
 async def test_setup_rejects_short_password(client):

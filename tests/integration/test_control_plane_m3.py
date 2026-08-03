@@ -18,7 +18,7 @@ from db.database import Database
 
 @pytest.fixture
 async def api_client(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     app = create_app(settings, db)
@@ -41,7 +41,7 @@ async def _run_real_server(tmp_path: Path):
     ASGITransport blocks a request until the ASGI app's response is fully "complete," which
     never happens for a genuinely long-lived stream running concurrently with other requests
     in the same test process."""
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     app = create_app(settings, db)

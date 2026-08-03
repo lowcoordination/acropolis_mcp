@@ -22,7 +22,7 @@ async def upstream():
 
 @pytest.fixture
 async def client(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     app = create_app(settings, db)

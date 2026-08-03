@@ -25,7 +25,7 @@ async def upstream():
 
 @pytest.fixture
 async def keyed_client(tmp_path: Path, upstream):
-    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False)  # default auth_mode=keyed
+    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False, audit_retention_enabled=False)  # default auth_mode=keyed
     db = Database(tmp_path)
     await db.connect()
     server_repo = ServerRepo(db)
@@ -81,7 +81,7 @@ async def test_aggregate_tools_list_succeeds_with_valid_key(keyed_client):
 
 
 async def test_aggregate_open_mode_requires_no_key(tmp_path: Path, upstream):
-    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     server_repo = ServerRepo(db)

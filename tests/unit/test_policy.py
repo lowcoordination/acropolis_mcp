@@ -6,9 +6,9 @@ from argus.policy import evaluate, tool_is_visible
 from db.models import ParamRule, ServerPolicy
 
 
-def test_passthrough_always_allows():
+async def test_passthrough_always_allows():
     policy = ServerPolicy(mode="passthrough")
-    decision = evaluate("anything", {}, "srv", policy)
+    decision = await evaluate("anything", {}, "srv", policy)
     assert not decision.blocked
 
 
@@ -20,9 +20,9 @@ def test_passthrough_always_allows():
         ("read_file", [], True),
     ],
 )
-def test_allowlist_mode(tool_name, allowed, expected_blocked):
+async def test_allowlist_mode(tool_name, allowed, expected_blocked):
     policy = ServerPolicy(mode="allowlist", allowed=allowed)
-    decision = evaluate(tool_name, {}, "srv", policy)
+    decision = await evaluate(tool_name, {}, "srv", policy)
     assert decision.blocked is expected_blocked
     if expected_blocked:
         assert decision.rule == "allowlist"
@@ -36,116 +36,116 @@ def test_allowlist_mode(tool_name, allowed, expected_blocked):
         ("read_file", [], False),
     ],
 )
-def test_denylist_mode(tool_name, denied, expected_blocked):
+async def test_denylist_mode(tool_name, denied, expected_blocked):
     policy = ServerPolicy(mode="denylist", denied=denied)
-    decision = evaluate(tool_name, {}, "srv", policy)
+    decision = await evaluate(tool_name, {}, "srv", policy)
     assert decision.blocked is expected_blocked
     if expected_blocked:
         assert decision.rule == "denylist"
 
 
-def test_param_max_length_violation():
+async def test_param_max_length_violation():
     policy = ServerPolicy(
         mode="allowlist",
         allowed=["shell_run"],
         param_rules={"shell_run": {"command": ParamRule(max_length=10)}},
     )
-    decision = evaluate("shell_run", {"command": "a" * 20}, "srv", policy)
+    decision = await evaluate("shell_run", {"command": "a" * 20}, "srv", policy)
     assert decision.blocked
     assert decision.rule == "max_length"
 
 
-def test_param_block_pattern_violation():
+async def test_param_block_pattern_violation():
     policy = ServerPolicy(
         mode="allowlist",
         allowed=["shell_run"],
         param_rules={"shell_run": {"command": ParamRule(block_patterns=[r"rm\s+-rf"])}},
     )
-    decision = evaluate("shell_run", {"command": "rm -rf /"}, "srv", policy)
+    decision = await evaluate("shell_run", {"command": "rm -rf /"}, "srv", policy)
     assert decision.blocked
     assert decision.rule == "block_pattern"
 
 
-def test_param_block_pattern_case_insensitive():
+async def test_param_block_pattern_case_insensitive():
     policy = ServerPolicy(
         mode="passthrough",
         param_rules={"shell_run": {"command": ParamRule(block_patterns=[r"sudo"])}},
     )
-    decision = evaluate("shell_run", {"command": "SUDO rm foo"}, "srv", policy)
+    decision = await evaluate("shell_run", {"command": "SUDO rm foo"}, "srv", policy)
     assert decision.blocked
 
 
-def test_param_denied_entirely():
+async def test_param_denied_entirely():
     policy = ServerPolicy(
         mode="passthrough",
         param_rules={"search_jobs": {"proxies": ParamRule(denied=True)}},
     )
-    decision = evaluate("search_jobs", {"proxies": "http://evil"}, "srv", policy)
+    decision = await evaluate("search_jobs", {"proxies": "http://evil"}, "srv", policy)
     assert decision.blocked
     assert decision.rule == "denied_param"
 
 
-def test_param_max_value_violation():
+async def test_param_max_value_violation():
     policy = ServerPolicy(
         mode="passthrough",
         param_rules={"search_jobs": {"results_wanted": ParamRule(max_value=50)}},
     )
-    decision = evaluate("search_jobs", {"results_wanted": 200}, "srv", policy)
+    decision = await evaluate("search_jobs", {"results_wanted": 200}, "srv", policy)
     assert decision.blocked
     assert decision.rule == "max_value"
 
 
-def test_param_max_value_non_numeric_ignored():
+async def test_param_max_value_non_numeric_ignored():
     # Non-numeric value can't violate a numeric bound — should not raise, should not block.
     policy = ServerPolicy(
         mode="passthrough",
         param_rules={"search_jobs": {"results_wanted": ParamRule(max_value=50)}},
     )
-    decision = evaluate("search_jobs", {"results_wanted": "not-a-number"}, "srv", policy)
+    decision = await evaluate("search_jobs", {"results_wanted": "not-a-number"}, "srv", policy)
     assert not decision.blocked
 
 
-def test_param_min_value_violation():
+async def test_param_min_value_violation():
     policy = ServerPolicy(
         mode="passthrough",
         param_rules={"tool": {"count": ParamRule(min_value=1)}},
     )
-    decision = evaluate("tool", {"count": 0}, "srv", policy)
+    decision = await evaluate("tool", {"count": 0}, "srv", policy)
     assert decision.blocked
     assert decision.rule == "min_value"
 
 
-def test_param_rule_applies_regardless_of_mode():
+async def test_param_rule_applies_regardless_of_mode():
     # Param validation runs even when the tool itself is allowed.
     policy = ServerPolicy(
         mode="allowlist",
         allowed=["shell_run"],
         param_rules={"shell_run": {"command": ParamRule(block_patterns=[r"sudo"])}},
     )
-    decision = evaluate("shell_run", {"command": "sudo ls"}, "srv", policy)
+    decision = await evaluate("shell_run", {"command": "sudo ls"}, "srv", policy)
     assert decision.blocked
     assert decision.rule == "block_pattern"
 
 
-def test_missing_param_not_checked():
+async def test_missing_param_not_checked():
     policy = ServerPolicy(
         mode="passthrough",
         param_rules={"tool": {"required_param": ParamRule(denied=True)}},
     )
-    decision = evaluate("tool", {"other_param": "x"}, "srv", policy)
+    decision = await evaluate("tool", {"other_param": "x"}, "srv", policy)
     assert not decision.blocked
 
 
-def test_args_summary_truncates_long_values():
+async def test_args_summary_truncates_long_values():
     policy = ServerPolicy(mode="passthrough")
-    decision = evaluate("tool", {"secret": "x" * 200}, "srv", policy)
+    decision = await evaluate("tool", {"secret": "x" * 200}, "srv", policy)
     assert decision.args_summary["secret"].endswith("[truncated]")
     assert len(decision.args_summary["secret"]) < 200
 
 
-def test_args_summary_short_values_untouched():
+async def test_args_summary_short_values_untouched():
     policy = ServerPolicy(mode="passthrough")
-    decision = evaluate("tool", {"key": "short"}, "srv", policy)
+    decision = await evaluate("tool", {"key": "short"}, "srv", policy)
     assert decision.args_summary["key"] == "short"
 
 
@@ -172,3 +172,28 @@ def test_param_rule_rejects_oversized_regex():
 def test_param_rule_rejects_invalid_regex():
     with pytest.raises(ValueError):
         ParamRule(block_patterns=["["])
+
+
+async def test_catastrophic_backtracking_pattern_times_out_instead_of_hanging():
+    """The security-critical case: a pattern vulnerable to catastrophic backtracking must
+    not be able to hang policy evaluation indefinitely. Confirmed manually before this fix
+    that "(a+)+$" against 31 chars of crafted input hangs Python's `re` for >5s uninterrupted
+    — well past what any request should wait. This test proves the fix bounds it."""
+    import time
+
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(block_patterns=[r"(a+)+$"])}},
+    )
+    evil_input = "a" * 30 + "!"
+
+    start = time.monotonic()
+    decision = await evaluate("tool", {"value": evil_input}, "srv", policy)
+    elapsed = time.monotonic() - start
+
+    # Must return well before the pattern would naturally finish (which is many seconds/
+    # unbounded) — the _REGEX_MATCH_TIMEOUT_SECONDS cap plus overhead, generously bounded.
+    assert elapsed < 2.0
+    # Failing open (not blocked) on a timed-out match is the documented, deliberate choice —
+    # see _match_with_timeout's docstring for why fail-open is safer here.
+    assert not decision.blocked

@@ -26,3 +26,10 @@ class Settings(BaseSettings):
     # of flaky failures that don't reflect anything wrong with the gateway itself.
     health_poll_enabled: bool = True
     health_poll_interval_seconds: float = 60.0
+
+    # Background audit-log pruning (stoa.retention.AuditRetentionJob). The retention WINDOW
+    # itself (settings.audit_retention_days) is DB-backed and editable from the Settings page —
+    # this flag/interval only control whether and how often the job checks; disabled by default
+    # in the test suite for the same reason health_poll_enabled is.
+    audit_retention_enabled: bool = True
+    audit_retention_check_interval_seconds: float = 3600.0

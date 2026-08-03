@@ -37,7 +37,7 @@ async def test_keyed_auth_mode_set_via_wizard_is_actually_enforced(tmp_path: Pat
     # Env var default is "keyed" (Settings.auth_mode default) — construct with the ENV default,
     # not an explicit override, mirroring what a real container with no ARGUS_AUTH_MODE set
     # would do, then drive auth_mode entirely through the wizard as a real user would.
-    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     server_repo = ServerRepo(db)
@@ -64,7 +64,7 @@ async def test_open_auth_mode_set_via_settings_page_actually_disables_auth(tmp_p
     # Start from the env-var default of "keyed", then flip to "open" via the Settings API
     # (what the Settings page's save button calls) and confirm the data plane responds to it
     # immediately, without a restart.
-    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     server_repo = ServerRepo(db)
@@ -95,7 +95,7 @@ async def test_open_auth_mode_set_via_settings_page_actually_disables_auth(tmp_p
 
 
 async def test_keyed_mode_still_accepts_a_valid_key(tmp_path: Path, upstream):
-    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     server_repo = ServerRepo(db)

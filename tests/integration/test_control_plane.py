@@ -14,7 +14,7 @@ from db.database import Database
 
 @pytest.fixture
 async def api_client(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     app = create_app(settings, db)
@@ -152,7 +152,7 @@ async def test_delete_key(api_client):
 
 
 async def test_admin_auth_enforced_when_token_set(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", admin_token="secret123", health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", admin_token="secret123", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     app = create_app(settings, db)

@@ -23,7 +23,7 @@ async def upstream():
 
 @pytest.fixture
 async def client(tmp_path: Path, upstream):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     server_repo = ServerRepo(db)
@@ -88,7 +88,7 @@ async def test_get_tools_unknown_server_404(client):
 
 
 async def test_get_tools_dead_upstream_returns_empty_not_500(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False)
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
     server_repo = ServerRepo(db)

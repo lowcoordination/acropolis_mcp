@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from archon.passwords import hash_password, verify_password
 from archon.schemas import LoginRequest, SetupRequest, SetupStatusResponse
 from archon.sessions import SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, create_session_token
 from db.repo import SettingsRepo
+
+
+def _request_is_https(request: Request) -> bool:
+    """Argus itself always speaks plain HTTP (see docs/tls-and-reverse-proxy.md) — TLS, if
+    any, is terminated by a reverse proxy in front of it. Trust X-Forwarded-Proto (set by any
+    reasonable proxy config, including the ones documented) in addition to request.url.scheme,
+    so the session cookie gets the Secure flag once a real deployment is behind HTTPS, without
+    breaking the plain-HTTP-on-localhost quickstart flow this app defaults to."""
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
+    return forwarded_proto == "https" or request.url.scheme == "https"
 
 
 def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
@@ -21,7 +31,7 @@ def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
         return SetupStatusResponse(setup_complete=admin_password_hash is not None)
 
     @router.post("/setup", response_model=SetupStatusResponse)
-    async def complete_setup(body: SetupRequest, response: Response):
+    async def complete_setup(body: SetupRequest, request: Request, response: Response):
         existing = await settings_repo.get("admin_password_hash")
         if existing is not None:
             raise HTTPException(status_code=409, detail="setup has already been completed")
@@ -40,12 +50,12 @@ def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
         token = create_session_token(session_secret)
         response.set_cookie(
             SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
-            httponly=True, samesite="lax",
+            httponly=True, samesite="lax", secure=_request_is_https(request),
         )
         return SetupStatusResponse(setup_complete=True)
 
     @router.post("/login")
-    async def login(body: LoginRequest, response: Response):
+    async def login(body: LoginRequest, request: Request, response: Response):
         stored_hash = await settings_repo.get("admin_password_hash")
         if stored_hash is None:
             raise HTTPException(status_code=400, detail="setup has not been completed yet")
@@ -58,7 +68,7 @@ def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
         token = create_session_token(session_secret)
         response.set_cookie(
             SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
-            httponly=True, samesite="lax",
+            httponly=True, samesite="lax", secure=_request_is_https(request),
         )
         return {"status": "ok"}
 
