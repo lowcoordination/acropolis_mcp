@@ -301,8 +301,11 @@ class AuditRepo:
 
     async def query(
         self, server_slug: Optional[str] = None, decision: Optional[str] = None,
-        limit: int = 100,
+        tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
     ) -> list[dict]:
+        """Newest-first. `before_id` is keyset pagination — pass the smallest `id` from the
+        previous page to fetch the next (older) page, rather than an OFFSET (which re-scans
+        and can skip/duplicate rows under concurrent inserts)."""
         clauses, params = [], []
         if server_slug:
             clauses.append("server_slug = ?")
@@ -310,6 +313,12 @@ class AuditRepo:
         if decision:
             clauses.append("decision = ?")
             params.append(decision)
+        if tool:
+            clauses.append("tool = ?")
+            params.append(tool)
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         cur = await self._conn.execute(
@@ -317,3 +326,55 @@ class AuditRepo:
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    async def count_since(self, since_iso: str, decision: Optional[str] = None) -> int:
+        clauses, params = ["ts >= ?"], [since_iso]
+        if decision:
+            clauses.append("decision = ?")
+            params.append(decision)
+        cur = await self._conn.execute(
+            f"SELECT COUNT(*) FROM audit_events WHERE {' AND '.join(clauses)}", params
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def prune_older_than(self, cutoff_iso: str) -> int:
+        cur = await self._conn.execute("DELETE FROM audit_events WHERE ts < ?", (cutoff_iso,))
+        await self._conn.commit()
+        return cur.rowcount if cur.rowcount is not None else 0
+
+
+class SettingsRepo:
+    """Key-value store for gateway-wide settings (auth_mode, aggregate default, retention,
+    admin credentials). Values are stored as plain strings; callers coerce types."""
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    @property
+    def _conn(self) -> aiosqlite.Connection:
+        assert self._db.gateway is not None
+        self._db.gateway.row_factory = aiosqlite.Row
+        return self._db.gateway
+
+    async def get(self, key: str) -> Optional[str]:
+        cur = await self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row else None
+
+    async def get_all(self) -> dict[str, str]:
+        cur = await self._conn.execute("SELECT key, value FROM settings")
+        rows = await cur.fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    async def set(self, key: str, value: str) -> None:
+        await self._conn.execute(
+            """INSERT INTO settings (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (key, value),
+        )
+        await self._conn.commit()
+
+    async def set_many(self, values: dict[str, str]) -> None:
+        for key, value in values.items():
+            await self.set(key, value)

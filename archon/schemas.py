@@ -67,3 +67,63 @@ class KeyResponse(BaseModel):
     server_scopes: Optional[list[str]]
     created_at: str
     last_used_at: Optional[str]
+
+
+class SettingsResponse(BaseModel):
+    auth_mode: str
+    aggregate_enabled: bool
+    default_ttl_ms: int
+    audit_retention_days: int
+    setup_complete: bool
+
+
+class SettingsUpdateRequest(BaseModel):
+    auth_mode: Optional[str] = None
+    aggregate_enabled: Optional[bool] = None
+    default_ttl_ms: Optional[int] = None
+    audit_retention_days: Optional[int] = None
+
+
+class ServerHealthSummary(BaseModel):
+    slug: str
+    health_status: str
+    upstream_protocol: Optional[str]
+
+
+class StatsResponse(BaseModel):
+    requests_24h: int
+    blocked_24h: int
+    allowed_24h: int
+    servers_total: int
+    servers_healthy: int
+    servers_unhealthy: int
+    server_health: list[ServerHealthSummary]
+    recent_blocked: list[dict]
+
+
+class AuditEventResponse(BaseModel):
+    id: int
+    ts: str
+    server_slug: Optional[str]
+    api_key_id: Optional[int]
+    client_ip: Optional[str]
+    endpoint: Optional[str]
+    rpc_method: Optional[str]
+    tool: Optional[str]
+    decision: str
+    rule: Optional[str]
+    matched: Optional[str]
+    reason: Optional[str]
+    args_summary: Optional[str]
+    bridged: bool
+    status_code: Optional[int]
+    latency_ms: Optional[int]
+
+
+class SetupStatusResponse(BaseModel):
+    setup_complete: bool
+
+
+class SetupRequest(BaseModel):
+    admin_password: str
+    auth_mode: str = "keyed"

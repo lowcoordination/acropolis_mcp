@@ -85,7 +85,13 @@ class UpstreamHandshakeCache:
     def invalidate(self, server_id: int) -> None:
         self._cache.pop(server_id, None)
 
-    async def get_or_handshake(self, server_id: int, upstream_url: str) -> HandshakeResult:
+    async def get_or_handshake(
+        self, server_id: int, upstream_url: str, timeout: Optional[float] = None
+    ) -> HandshakeResult:
+        """`timeout` overrides the shared http client's default for just this handshake —
+        callers on a time-sensitive path (the health poller) should pass a short one, since a
+        slow/unreachable upstream during a routine health check must not block for as long as
+        a real bridged tool call is allowed to (the client default is a generous 120s)."""
         cached = self._cache.get(server_id)
         if cached is not None:
             return cached
@@ -94,11 +100,11 @@ class UpstreamHandshakeCache:
             cached = self._cache.get(server_id)
             if cached is not None:
                 return cached
-            result = await self._handshake(upstream_url)
+            result = await self._handshake(upstream_url, timeout)
             self._cache[server_id] = result
             return result
 
-    async def _handshake(self, upstream_url: str) -> HandshakeResult:
+    async def _handshake(self, upstream_url: str, timeout: Optional[float] = None) -> HandshakeResult:
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         init_body = {
             "jsonrpc": "2.0",
@@ -111,7 +117,8 @@ class UpstreamHandshakeCache:
             },
         }
         try:
-            resp = await self._client.post(upstream_url, json=init_body, headers=headers)
+            kwargs = {"timeout": timeout} if timeout is not None else {}
+            resp = await self._client.post(upstream_url, json=init_body, headers=headers, **kwargs)
         except httpx.HTTPError as e:
             raise UpstreamHandshakeError(f"initialize request failed: {e}") from e
 

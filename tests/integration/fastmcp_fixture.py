@@ -89,4 +89,14 @@ async def run_fastmcp_server():
         yield RunningFastMCPServer(port=port, call_counter=call_counter)
     finally:
         server.should_exit = True
-        await task
+        try:
+            # uvicorn's graceful shutdown waits for in-flight connections to close. In these
+            # tests, Argus's own HealthPoller runs a real background probe against every
+            # registered server on create_app() startup — if that probe happens to be
+            # in-flight against THIS fixture exactly at teardown, the connection can be held
+            # open (keep-alive) and shutdown hangs indefinitely. force_close cuts it off
+            # rather than let a background poller from an unrelated component hang the suite.
+            await asyncio.wait_for(task, timeout=5.0)
+        except asyncio.TimeoutError:
+            server.force_exit = True
+            await asyncio.wait_for(task, timeout=5.0)

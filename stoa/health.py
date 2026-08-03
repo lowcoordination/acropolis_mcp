@@ -13,6 +13,10 @@ from db.repo import ServerRepo
 logger = logging.getLogger("stoa.health")
 
 DEFAULT_POLL_INTERVAL_SECONDS = 60.0
+# Health probes must never block on the shared http client's generous default timeout (120s,
+# sized for real tool calls) — a routine check against a briefly-unreachable or restarting
+# upstream should fail fast, not stall the whole poll cycle for every other registered server.
+PROBE_TIMEOUT_SECONDS = 10.0
 
 
 async def probe_server(
@@ -31,7 +35,9 @@ async def probe_server(
     }
 
     try:
-        resp = await client.post(server.upstream_url, json=discover_body, headers=headers, timeout=10.0)
+        resp = await client.post(
+            server.upstream_url, json=discover_body, headers=headers, timeout=PROBE_TIMEOUT_SECONDS
+        )
     except httpx.HTTPError as e:
         logger.info("probe for '%s' failed to connect: %s", server.slug, e)
         return ("unhealthy", None, None)
@@ -53,7 +59,9 @@ async def probe_server(
     # clean result — fall back to a real initialize handshake, which every 2025 upstream must
     # support and which also confirms the server is actually reachable and speaking MCP.
     try:
-        handshake = await handshake_cache.get_or_handshake(server.id, server.upstream_url)
+        handshake = await handshake_cache.get_or_handshake(
+            server.id, server.upstream_url, timeout=PROBE_TIMEOUT_SECONDS
+        )
     except UpstreamHandshakeError as e:
         logger.info("probe for '%s' failed initialize fallback: %s", server.slug, e)
         return ("unhealthy", None, None)
@@ -91,9 +99,16 @@ class HealthPoller:
         if self._task is not None:
             self._task.cancel()
             try:
-                await self._task
+                # Bounded: cancellation of a task parked in a plain asyncio.sleep() is normally
+                # near-instant, but under real ASGI server shutdown (uvicorn + anyio task
+                # groups from in-flight MCP sessions) this has been observed to stall well
+                # past that. A poller must never be allowed to block app shutdown indefinitely
+                # — abandon it after a bounded wait rather than hang the process.
+                await asyncio.wait_for(self._task, timeout=5.0)
             except asyncio.CancelledError:
                 pass
+            except asyncio.TimeoutError:
+                logger.warning("health poller task did not stop within 5s; abandoning it")
             self._task = None
 
     async def poll_once(self) -> None:

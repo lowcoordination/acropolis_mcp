@@ -19,3 +19,10 @@ class Settings(BaseSettings):
 
     max_body_bytes: int = 1_000_000
     upstream_timeout_seconds: float = 120.0
+
+    # Background health/discover polling of registered servers (stoa.health.HealthPoller).
+    # Disabled by default in the test suite (see tests fixtures) — a fully autonomous poller
+    # racing a test's own short-lived requests against the same fixture upstream is a source
+    # of flaky failures that don't reflect anything wrong with the gateway itself.
+    health_poll_enabled: bool = True
+    health_poll_interval_seconds: float = 60.0

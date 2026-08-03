@@ -25,6 +25,7 @@ class AuditLogger:
         self._repo = repo
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._flush_task: Optional[asyncio.Task] = None
+        self._subscribers: set[asyncio.Queue] = set()
 
     def start(self) -> None:
         if self._flush_task is None:
@@ -80,6 +81,26 @@ class AuditLogger:
         logger.log(level, "%s server=%s tool=%s rule=%s", decision, server_slug, tool, rule)
 
         await self._queue.put(event)
+        self._broadcast(event)
+
+    def subscribe(self) -> asyncio.Queue:
+        """Register for the live tail. Caller MUST call unsubscribe() when done (e.g. on
+        client disconnect) or the queue leaks for the lifetime of the process."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
+
+    def _broadcast(self, event: dict) -> None:
+        for q in self._subscribers:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                # A slow/stuck subscriber must not block or crash ingestion for everyone else —
+                # drop the event for that one subscriber (their tail will show a gap, not stall).
+                logger.warning("audit tail subscriber queue full, dropping event")
 
     async def _flush_loop(self) -> None:
         while True:

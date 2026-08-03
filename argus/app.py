@@ -17,7 +17,7 @@ from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
-from db.repo import ApiKeyRepo, AuditRepo, ServerRepo
+from db.repo import ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo
 from stoa.health import HealthPoller
 
 
@@ -25,6 +25,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     server_repo = ServerRepo(db)
     api_key_repo = ApiKeyRepo(db)
     audit_repo = AuditRepo(db)
+    settings_repo = SettingsRepo(db)
 
     api_keys = ApiKeyService(api_key_repo)
     rate_limiter = RateLimiterRegistry()
@@ -34,7 +35,10 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     handshake_cache = UpstreamHandshakeCache(http_client)
     bridge = ProtocolBridge(http_client, handshake_cache)
     tools_cache = ToolsCache(db, bridge)
-    health_poller = HealthPoller(server_repo, http_client, handshake_cache)
+    health_poller = HealthPoller(
+        server_repo, http_client, handshake_cache,
+        interval_seconds=settings.health_poll_interval_seconds,
+    )
 
     pipeline = Pipeline(
         settings=settings,
@@ -54,7 +58,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         audit.start()
-        health_poller.start()
+        if settings.health_poll_enabled:
+            health_poller.start()
         try:
             yield
         finally:
@@ -75,7 +80,9 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.tools_cache = tools_cache
     app.state.health_poller = health_poller
 
-    app.include_router(build_control_plane_router(server_repo, api_keys, tools_cache))
+    app.include_router(build_control_plane_router(
+        server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit,
+    ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
 
     return app

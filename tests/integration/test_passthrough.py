@@ -31,7 +31,7 @@ async def upstream():
 
 @pytest.fixture
 async def argus_client(tmp_path: Path, upstream):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open")
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False)
     db = Database(tmp_path)
     await db.connect()
 

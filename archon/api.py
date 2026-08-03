@@ -1,23 +1,41 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from archon.admin_auth import require_admin
 from archon.auth.apikeys import ApiKeyService
 from archon.schemas import (
+    AuditEventResponse,
     KeyCreatedResponse,
     KeyCreateRequest,
     KeyResponse,
     PolicyResponse,
     PolicyUpdateRequest,
     ServerCreateRequest,
+    ServerHealthSummary,
     ServerResponse,
     ServerUpdateRequest,
+    SettingsResponse,
+    SettingsUpdateRequest,
+    StatsResponse,
 )
+from argus.audit import AuditLogger
 from argus.toolslist import ToolsCache
-from db.repo import ApiKeyRepo, ServerNotFoundError, ServerRepo, SlugConflictError
+from db.database import utcnow
+from db.repo import AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
+
+# Settings keys + defaults, applied when a key is absent from the settings table.
+_SETTINGS_DEFAULTS = {
+    "auth_mode": "keyed",
+    "aggregate_enabled": "true",
+    "default_ttl_ms": "300000",
+    "audit_retention_days": "30",
+}
 
 
 def _server_to_response(server) -> ServerResponse:
@@ -36,8 +54,18 @@ def _key_to_response(key) -> KeyResponse:
     )
 
 
+async def _get_settings_with_defaults(settings_repo: SettingsRepo) -> dict[str, str]:
+    stored = await settings_repo.get_all()
+    return {**_SETTINGS_DEFAULTS, **stored}
+
+
 def build_control_plane_router(
-    server_repo: ServerRepo, api_keys: ApiKeyService, tools_cache: Optional[ToolsCache] = None,
+    server_repo: ServerRepo,
+    api_keys: ApiKeyService,
+    tools_cache: Optional[ToolsCache] = None,
+    settings_repo: Optional[SettingsRepo] = None,
+    audit_repo: Optional[AuditRepo] = None,
+    audit_logger: Optional[AuditLogger] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
@@ -138,5 +166,90 @@ def build_control_plane_router(
     @router.delete("/keys/{key_id}", status_code=204)
     async def delete_key(key_id: int):
         await api_keys.delete(key_id)
+
+    if settings_repo is not None:
+        @router.get("/settings", response_model=SettingsResponse)
+        async def get_settings():
+            values = await _get_settings_with_defaults(settings_repo)
+            return SettingsResponse(
+                auth_mode=values["auth_mode"],
+                aggregate_enabled=values["aggregate_enabled"] == "true",
+                default_ttl_ms=int(values["default_ttl_ms"]),
+                audit_retention_days=int(values["audit_retention_days"]),
+                setup_complete=await settings_repo.get("admin_password_hash") is not None,
+            )
+
+        @router.put("/settings", response_model=SettingsResponse)
+        async def update_settings(body: SettingsUpdateRequest):
+            updates: dict[str, str] = {}
+            if body.auth_mode is not None:
+                if body.auth_mode not in ("open", "keyed"):
+                    raise HTTPException(status_code=400, detail="auth_mode must be 'open' or 'keyed'")
+                updates["auth_mode"] = body.auth_mode
+            if body.aggregate_enabled is not None:
+                updates["aggregate_enabled"] = "true" if body.aggregate_enabled else "false"
+            if body.default_ttl_ms is not None:
+                updates["default_ttl_ms"] = str(body.default_ttl_ms)
+            if body.audit_retention_days is not None:
+                updates["audit_retention_days"] = str(body.audit_retention_days)
+            await settings_repo.set_many(updates)
+            return await get_settings()
+
+    if audit_repo is not None:
+        @router.get("/stats", response_model=StatsResponse)
+        async def get_stats():
+            from datetime import datetime, timedelta, timezone
+
+            since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            requests_24h = await audit_repo.count_since(since)
+            blocked_24h = await audit_repo.count_since(since, decision="BLOCKED")
+            allowed_24h = await audit_repo.count_since(since, decision="ALLOWED")
+            recent_blocked = await audit_repo.query(decision="BLOCKED", limit=10)
+
+            servers = await server_repo.list()
+            healthy = sum(1 for s in servers if s.health_status == "healthy")
+            unhealthy = sum(1 for s in servers if s.health_status == "unhealthy")
+
+            return StatsResponse(
+                requests_24h=requests_24h, blocked_24h=blocked_24h, allowed_24h=allowed_24h,
+                servers_total=len(servers), servers_healthy=healthy, servers_unhealthy=unhealthy,
+                server_health=[
+                    ServerHealthSummary(
+                        slug=s.slug, health_status=s.health_status, upstream_protocol=s.upstream_protocol,
+                    )
+                    for s in servers
+                ],
+                recent_blocked=recent_blocked,
+            )
+
+        @router.get("/audit", response_model=list[AuditEventResponse])
+        async def query_audit(
+            server_slug: Optional[str] = None, decision: Optional[str] = None,
+            tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
+        ):
+            events = await audit_repo.query(
+                server_slug=server_slug, decision=decision, tool=tool,
+                before_id=before_id, limit=min(limit, 500),
+            )
+            return [AuditEventResponse(**{**e, "bridged": bool(e["bridged"])}) for e in events]
+
+        if audit_logger is not None:
+            @router.get("/audit/tail")
+            async def audit_tail(request: Request):
+                async def event_stream():
+                    q = audit_logger.subscribe()
+                    try:
+                        while True:
+                            if await request.is_disconnected():
+                                break
+                            try:
+                                event = await asyncio.wait_for(q.get(), timeout=15.0)
+                                yield f"data: {json.dumps(event)}\n\n"
+                            except asyncio.TimeoutError:
+                                yield ": keepalive\n\n"
+                    finally:
+                        audit_logger.unsubscribe(q)
+
+                return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     return router
