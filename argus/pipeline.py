@@ -13,6 +13,9 @@ from starlette.background import BackgroundTask
 from archon.auth.apikeys import ApiKeyService
 from archon.settings import Settings
 from argus.audit import AuditLogger
+from argus.bridge import BridgeError, ProtocolBridge
+from argus.discover import synthesize_server_discover
+from argus.generation import ClientGeneration, detect_client_generation
 from argus.headers import (
     MCP_METHOD_HEADER,
     MCP_NAME_HEADER,
@@ -24,6 +27,7 @@ from argus.headers import (
 from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
 from argus.policy import evaluate
 from argus.rate_limiter import RateLimiterRegistry, api_key_key, server_key, tool_key
+from argus.toolslist import ToolsCache
 from db.models import ServerRecord
 from db.repo import ServerRepo
 
@@ -42,9 +46,10 @@ class RoutingError(Exception):
 
 class Pipeline:
     """
-    M1 scope: per-server passthrough proxy. No aggregate endpoint, no protocol bridging yet —
-    both client and upstream are assumed to speak the same (2025-06-18-style) generation.
-    That scope boundary is deliberate (see plan milestone M1 vs M2).
+    M2: per-server proxy that additionally bridges 2026-generation stateless clients to
+    2025-generation upstreams (the whole real fleet, today). A 2025-generation client is still
+    served by raw passthrough, unchanged from M1 — bridging only engages when Mcp-Method is
+    present on the request (see argus.generation.detect_client_generation).
     """
 
     def __init__(
@@ -55,6 +60,8 @@ class Pipeline:
         rate_limiter: RateLimiterRegistry,
         audit: AuditLogger,
         http_client: httpx.AsyncClient,
+        bridge: Optional[ProtocolBridge] = None,
+        tools_cache: Optional[ToolsCache] = None,
     ):
         self._settings = settings
         self._servers = server_repo
@@ -62,15 +69,39 @@ class Pipeline:
         self._rate_limiter = rate_limiter
         self._audit = audit
         self._client = http_client
+        self._bridge = bridge
+        self._tools_cache = tools_cache
 
-    async def handle(self, request: Request, slug: str, path: str) -> Response:
+    @property
+    def tools_cache(self) -> Optional[ToolsCache]:
+        return self._tools_cache
+
+    async def handle(
+        self, request: Request, slug: str, path: str, body_override: Optional[bytes] = None,
+        force_generation: Optional[ClientGeneration] = None,
+    ) -> Response:
+        """`body_override` lets a caller (the aggregate pipeline) substitute a rewritten body
+        — e.g. a de-namespaced tool name — without touching Starlette's internal body cache.
+
+        `force_generation` lets a caller bypass header-based generation detection. The aggregate
+        endpoint is itself an inherently 2026-shaped concept (a single namespaced stateless
+        call) regardless of whether the original inbound request happened to carry Mcp-Method —
+        it must always be bridged, not accidentally fall back to 2025 raw passthrough (which
+        forwards headers the real upstream may reject, e.g. a bare `Accept: application/json`
+        that FastMCP 406s on because it expects `application/json, text/event-stream`).
+        """
         start = time.monotonic()
         server: Optional[ServerRecord] = None
         try:
             server = await self._resolve_server(slug)
             api_key_id = await self._authenticate(request, slug)
-            body_bytes = await self._read_body_guarded(request)
-            response = await self._process(request, server, path, body_bytes, api_key_id)
+            body_bytes = (
+                self._guard_body_size(body_override) if body_override is not None
+                else await self._read_body_guarded(request)
+            )
+            response = await self._process(
+                request, server, path, body_bytes, api_key_id, force_generation=force_generation
+            )
             return response
         except RoutingError as e:
             await self._audit.log(
@@ -121,7 +152,10 @@ class Pipeline:
                 raise RoutingError(400, rpc_error(None, "invalid content-length header"))
 
         body_bytes = await request.body()
-        if len(body_bytes) > max_bytes:
+        return self._guard_body_size(body_bytes)
+
+    def _guard_body_size(self, body_bytes: bytes) -> bytes:
+        if len(body_bytes) > self._settings.max_body_bytes:
             raise RoutingError(413, rpc_error(None, "payload too large"))
         return body_bytes
 
@@ -132,6 +166,7 @@ class Pipeline:
         path: str,
         body_bytes: bytes,
         api_key_id: Optional[int],
+        force_generation: Optional[ClientGeneration] = None,
     ) -> Response:
         start = time.monotonic()
         rpc_id: Any = None
@@ -150,15 +185,34 @@ class Pipeline:
                 params = body_json.get("params", {}) or {}
                 body_name = extract_name_from_params(rpc_method, params)
 
-                mismatch_response = self._check_header_consistency(request, rpc_method, body_name)
-                if mismatch_response is not None:
-                    await self._audit.log(
-                        server_slug=server.slug, tool=body_name, decision="ERROR",
-                        endpoint="per-server", rpc_method=rpc_method,
-                        api_key_id=api_key_id, reason="Mcp-Method/Mcp-Name header mismatch",
-                        status_code=400, latency_ms=int((time.monotonic() - start) * 1000),
+                # Header/body consistency is only meaningful when headers were actually sent by
+                # the real client — skip it for a forced (aggregate-originated) dispatch, since
+                # the rewritten body's tool name legitimately won't match the ORIGINAL request's
+                # (still-namespaced) Mcp-Name header, if one was even present.
+                if force_generation is None:
+                    mismatch_response = self._check_header_consistency(request, rpc_method, body_name)
+                    if mismatch_response is not None:
+                        await self._audit.log(
+                            server_slug=server.slug, tool=body_name, decision="ERROR",
+                            endpoint="per-server", rpc_method=rpc_method,
+                            api_key_id=api_key_id, reason="Mcp-Method/Mcp-Name header mismatch",
+                            status_code=400, latency_ms=int((time.monotonic() - start) * 1000),
+                        )
+                        return mismatch_response
+
+                generation = force_generation or detect_client_generation(request)
+
+                if rpc_method == "server/discover":
+                    return self._handle_discover(server, rpc_id)
+
+                if rpc_method == "tools/list" and self._tools_cache is not None:
+                    return await self._handle_tools_list(server, rpc_id, api_key_id, start)
+
+                if generation == ClientGeneration.GEN_2026 and self._bridge is not None:
+                    return await self._handle_bridged(
+                        server, rpc_method, rpc_id, params, body_json.get("_meta"),
+                        api_key_id, start,
                     )
-                    return mismatch_response
 
                 if rpc_method == "tools/call":
                     tool_name = body_json.get("params", {}).get("name")
@@ -209,6 +263,93 @@ class Pipeline:
                     )
 
         return await self._forward(request, server, path, body_bytes)
+
+    def _handle_discover(self, server: ServerRecord, rpc_id: Any) -> Response:
+        result = synthesize_server_discover(server)
+        return Response(
+            content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": result}),
+            status_code=200, media_type="application/json",
+        )
+
+    async def _handle_tools_list(
+        self, server: ServerRecord, rpc_id: Any, api_key_id: Optional[int], start: float
+    ) -> Response:
+        policy = await self._servers.get_policy(server.id)
+        tools = await self._tools_cache.get_filtered_tools(server.id, server.upstream_url, policy)
+        await self._audit.log(
+            server_slug=server.slug, tool=None, decision="PASSTHROUGH",
+            endpoint="per-server", rpc_method="tools/list", api_key_id=api_key_id,
+            latency_ms=int((time.monotonic() - start) * 1000),
+        )
+        return Response(
+            content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": {"tools": tools}}),
+            status_code=200, media_type="application/json",
+        )
+
+    async def _handle_bridged(
+        self, server: ServerRecord, rpc_method: str, rpc_id: Any, params: dict,
+        meta: Optional[dict], api_key_id: Optional[int], start: float,
+    ) -> Response:
+        if rpc_method == "tools/call":
+            tool_name = params.get("name")
+            arguments = params.get("arguments") or {}
+
+            if not tool_name or not isinstance(tool_name, str):
+                await self._audit.log(
+                    server_slug=server.slug, tool="<missing>", decision="BLOCKED",
+                    endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
+                    reason="tools/call missing required 'name' field", status_code=400,
+                    latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
+                )
+                return Response(
+                    content=rpc_error(rpc_id, "tools/call missing required 'name' field"),
+                    status_code=400, media_type="application/json",
+                )
+
+            blocked_response = await self._check_rate_limits(server, tool_name, api_key_id, rpc_id, start)
+            if blocked_response is not None:
+                return blocked_response
+
+            policy = await self._servers.get_policy(server.id)
+            decision = evaluate(tool_name, arguments, server.name, policy)
+            await self._audit.log(
+                server_slug=server.slug, tool=tool_name,
+                decision="BLOCKED" if decision.blocked else "ALLOWED",
+                endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
+                rule=decision.rule, matched=decision.matched,
+                args_summary=decision.args_summary, reason=decision.reason,
+                latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
+            )
+            if decision.blocked:
+                return Response(
+                    content=rpc_error(
+                        rpc_id, f"Blocked by argus: {decision.reason}",
+                        data={"tool": tool_name, "rule": decision.rule, "matched": decision.matched},
+                    ),
+                    status_code=403, media_type="application/json",
+                )
+        else:
+            await self._audit.log(
+                server_slug=server.slug, tool=None, decision="PASSTHROUGH",
+                endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
+                latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
+            )
+
+        try:
+            status, body = await self._bridge.bridge_call(
+                server_id=server.id, upstream_url=server.upstream_url, rpc_method=rpc_method,
+                rpc_id=rpc_id, params=params, meta=meta,
+            )
+        except BridgeError as e:
+            await self._audit.log(
+                server_slug=server.slug, tool=None, decision="ERROR",
+                endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
+                reason=e.body[:200], status_code=e.status_code, bridged=True,
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+            return Response(content=e.body, status_code=e.status_code, media_type="application/json")
+
+        return Response(content=json.dumps(body), status_code=status, media_type="application/json")
 
     def _check_header_consistency(
         self, request: Request, rpc_method: str, body_name: Optional[str]

@@ -8,12 +8,17 @@ from fastapi import FastAPI
 from archon.api import build_control_plane_router
 from archon.auth.apikeys import ApiKeyService
 from archon.settings import Settings
+from argus.aggregate_pipeline import AggregatePipeline
 from argus.audit import AuditLogger
+from argus.bridge import ProtocolBridge
 from argus.pipeline import Pipeline
 from argus.rate_limiter import RateLimiterRegistry
 from argus.routes import build_data_plane_router
+from argus.toolslist import ToolsCache
+from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
 from db.repo import ApiKeyRepo, AuditRepo, ServerRepo
+from stoa.health import HealthPoller
 
 
 def create_app(settings: Settings, db: Database) -> FastAPI:
@@ -26,6 +31,11 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     audit = AuditLogger(audit_repo)
     http_client = httpx.AsyncClient(timeout=settings.upstream_timeout_seconds)
 
+    handshake_cache = UpstreamHandshakeCache(http_client)
+    bridge = ProtocolBridge(http_client, handshake_cache)
+    tools_cache = ToolsCache(db, bridge)
+    health_poller = HealthPoller(server_repo, http_client, handshake_cache)
+
     pipeline = Pipeline(
         settings=settings,
         server_repo=server_repo,
@@ -33,14 +43,22 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         rate_limiter=rate_limiter,
         audit=audit,
         http_client=http_client,
+        bridge=bridge,
+        tools_cache=tools_cache,
+    )
+    aggregate_pipeline = AggregatePipeline(
+        settings=settings, server_repo=server_repo, api_keys=api_keys,
+        audit=audit, per_server_pipeline=pipeline,
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         audit.start()
+        health_poller.start()
         try:
             yield
         finally:
+            await health_poller.stop()
             await audit.stop()
             await http_client.aclose()
 
@@ -53,8 +71,11 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.rate_limiter = rate_limiter
     app.state.audit = audit
     app.state.http_client = http_client
+    app.state.bridge = bridge
+    app.state.tools_cache = tools_cache
+    app.state.health_poller = health_poller
 
-    app.include_router(build_control_plane_router(server_repo, api_keys))
-    app.include_router(build_data_plane_router(pipeline))
+    app.include_router(build_control_plane_router(server_repo, api_keys, tools_cache))
+    app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
 
     return app

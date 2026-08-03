@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request, Response
 
+from argus.aggregate_pipeline import AggregatePipeline
 from argus.pipeline import Pipeline
 
 
-def build_data_plane_router(pipeline: Pipeline) -> APIRouter:
+def build_data_plane_router(
+    pipeline: Pipeline, aggregate_pipeline: AggregatePipeline | None = None
+) -> APIRouter:
     router = APIRouter()
+
+    if aggregate_pipeline is not None:
+        @router.post("/mcp")
+        async def aggregate(request: Request) -> Response:
+            return await aggregate_pipeline.handle(request)
 
     @router.api_route(
         "/mcp/{slug}/{path:path}",

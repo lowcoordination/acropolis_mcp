@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+
+import httpx
+
+from argus.upstream import CLIENT_INFO, UpstreamHandshakeCache, UpstreamHandshakeError, parse_sse_body
+from db.models import ServerRecord
+from db.repo import ServerRepo
+
+logger = logging.getLogger("stoa.health")
+
+DEFAULT_POLL_INTERVAL_SECONDS = 60.0
+
+
+async def probe_server(
+    client: httpx.AsyncClient, handshake_cache: UpstreamHandshakeCache, server: ServerRecord
+) -> tuple[str, str | None, dict | None]:
+    """Probe one server's generation and health.
+
+    Tries `server/discover` first (mandatory RPC for 2026-generation servers per the spec);
+    on method-not-found, falls back to the 2025-generation `initialize` handshake. Returns
+    (health_status, upstream_protocol, discover_json_dict).
+    """
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    discover_body = {
+        "jsonrpc": "2.0", "id": "argus-discover", "method": "server/discover",
+        "params": {"clientInfo": CLIENT_INFO},
+    }
+
+    try:
+        resp = await client.post(server.upstream_url, json=discover_body, headers=headers, timeout=10.0)
+    except httpx.HTTPError as e:
+        logger.info("probe for '%s' failed to connect: %s", server.slug, e)
+        return ("unhealthy", None, None)
+
+    if resp.status_code == 200:
+        parsed = (
+            parse_sse_body(resp.text)
+            if "text/event-stream" in resp.headers.get("content-type", "")
+            else (json.loads(resp.text) if resp.text else None)
+        )
+        if parsed and "result" in parsed:
+            # A real server/discover response — this is a 2026-generation server.
+            return ("healthy", "2026-07-28", parsed["result"])
+        if parsed and parsed.get("error", {}).get("message", "").lower().find("method") != -1:
+            # Method-not-found-shaped error — fall through to the 2025 handshake below.
+            pass
+
+    # Either server/discover isn't implemented (2025-generation) or the probe didn't return a
+    # clean result — fall back to a real initialize handshake, which every 2025 upstream must
+    # support and which also confirms the server is actually reachable and speaking MCP.
+    try:
+        handshake = await handshake_cache.get_or_handshake(server.id, server.upstream_url)
+    except UpstreamHandshakeError as e:
+        logger.info("probe for '%s' failed initialize fallback: %s", server.slug, e)
+        return ("unhealthy", None, None)
+
+    discover_json = {
+        "protocolVersion": handshake.protocol_version,
+        "serverInfo": handshake.server_info,
+        "capabilities": handshake.capabilities,
+    }
+    return ("healthy", handshake.protocol_version, discover_json)
+
+
+class HealthPoller:
+    """Background task: periodically probes every enabled server and updates its health/
+    protocol/discover_json fields via ServerRepo.set_health()."""
+
+    def __init__(
+        self,
+        server_repo: ServerRepo,
+        client: httpx.AsyncClient,
+        handshake_cache: UpstreamHandshakeCache,
+        interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    ):
+        self._repo = server_repo
+        self._client = client
+        self._handshakes = handshake_cache
+        self._interval = interval_seconds
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def poll_once(self) -> None:
+        servers = await self._repo.list()
+        for server in servers:
+            if not server.enabled:
+                continue
+            health_status, protocol, discover_json = await probe_server(
+                self._client, self._handshakes, server
+            )
+            await self._repo.set_health(
+                server.slug, health_status=health_status, upstream_protocol=protocol,
+                discover_json=json.dumps(discover_json) if discover_json else None,
+            )
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await self.poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("health poll iteration failed")
+            await asyncio.sleep(self._interval)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from archon.admin_auth import require_admin
@@ -14,6 +16,7 @@ from archon.schemas import (
     ServerResponse,
     ServerUpdateRequest,
 )
+from argus.toolslist import ToolsCache
 from db.repo import ApiKeyRepo, ServerNotFoundError, ServerRepo, SlugConflictError
 
 
@@ -33,7 +36,9 @@ def _key_to_response(key) -> KeyResponse:
     )
 
 
-def build_control_plane_router(server_repo: ServerRepo, api_keys: ApiKeyService) -> APIRouter:
+def build_control_plane_router(
+    server_repo: ServerRepo, api_keys: ApiKeyService, tools_cache: Optional[ToolsCache] = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
     @router.get("/health")
@@ -98,6 +103,10 @@ def build_control_plane_router(server_repo: ServerRepo, api_keys: ApiKeyService)
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
         await server_repo.set_policy(server.id, body)
+        if tools_cache is not None:
+            # A stale filtered tools/list would otherwise show a tool that was just denied,
+            # or hide one that was just allowed, until the TTL naturally expires.
+            await tools_cache.invalidate(server.id)
         policy = await server_repo.get_policy(server.id)
         return PolicyResponse(**policy.model_dump())
 
