@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -37,6 +38,15 @@ logger = logging.getLogger("argus.policy")
 _REGEX_MATCH_TIMEOUT_SECONDS = 0.5
 _mp_context = multiprocessing.get_context("forkserver")
 
+# Waiting on result_queue.get() blocks a thread for up to _REGEX_MATCH_TIMEOUT_SECONDS + 0.2s.
+# asyncio's default executor (shared by every unrelated run_in_executor(None, ...) call in the
+# process, sized min(32, cpu_count+4)) is NOT an acceptable place to put that wait: a burst of
+# concurrent tools/call requests against servers with block_patterns rules could exhaust it on
+# their own and stall unrelated work sharing the same pool. Give this one blocking wait its own
+# small dedicated pool instead — sized well above any realistic concurrent-policy-check count,
+# but bounded so a pathological flood can't spawn unbounded threads.
+_wait_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="policy-regex-wait")
+
 
 def _regex_worker(pattern, value: str, result_queue) -> None:
     result_queue.put(pattern.search(value) is not None)
@@ -55,25 +65,37 @@ async def _match_with_timeout(compiled, value: str) -> bool:
     loop = asyncio.get_event_loop()
     try:
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, result_queue.get, True, _REGEX_MATCH_TIMEOUT_SECONDS),
+            loop.run_in_executor(
+                _wait_executor, result_queue.get, True, _REGEX_MATCH_TIMEOUT_SECONDS
+            ),
             timeout=_REGEX_MATCH_TIMEOUT_SECONDS + 0.2,
         )
         process.join(timeout=1.0)
         return result
-    except Exception:
+    except asyncio.TimeoutError:
         logger.warning(
             "block_pattern match exceeded %.1fs (pattern=%r) — terminating and treating as "
             "no-match; this pattern is likely vulnerable to catastrophic backtracking and "
             "should be rewritten",
             _REGEX_MATCH_TIMEOUT_SECONDS, compiled.pattern,
         )
+        return False
+    except Exception:
+        # Not the expected timeout — an infra failure (forkserver unavailable, fd/process
+        # limits, queue error). Still fail open (a policy bug must never turn ALLOW into a
+        # hang), but log distinctly so an operator doesn't chase a nonexistent bad regex.
+        logger.exception(
+            "block_pattern match for pattern=%r failed unexpectedly (not a timeout) — "
+            "treating as no-match",
+            compiled.pattern,
+        )
+        return False
+    finally:
         process.terminate()
         process.join(timeout=1.0)
         if process.is_alive():
             process.kill()
             process.join(timeout=1.0)
-        return False
-    finally:
         result_queue.close()
 
 

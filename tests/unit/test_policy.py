@@ -197,3 +197,30 @@ async def test_catastrophic_backtracking_pattern_times_out_instead_of_hanging():
     # Failing open (not blocked) on a timed-out match is the documented, deliberate choice —
     # see _match_with_timeout's docstring for why fail-open is safer here.
     assert not decision.blocked
+
+
+async def test_concurrent_backtracking_patterns_do_not_serialize():
+    """Regression test for the shared-executor finding: block_pattern's wait must run on its
+    own dedicated thread pool, not asyncio's process-wide default executor. If it shared the
+    default pool, several concurrent pathological matches would serialize behind each other
+    (and could stall unrelated run_in_executor(None, ...) work elsewhere in the process). Firing
+    several at once and bounding total wall time proves they run concurrently instead."""
+    import asyncio
+    import time
+
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(block_patterns=[r"(a+)+$"])}},
+    )
+    evil_input = "a" * 30 + "!"
+
+    start = time.monotonic()
+    decisions = await asyncio.gather(
+        *(evaluate("tool", {"value": evil_input}, "srv", policy) for _ in range(8))
+    )
+    elapsed = time.monotonic() - start
+
+    # If these serialized on a starved shared pool, 8 * ~0.7s would blow well past this.
+    # Running concurrently, total time should stay close to a single timeout's worth.
+    assert elapsed < 2.5
+    assert all(not d.blocked for d in decisions)

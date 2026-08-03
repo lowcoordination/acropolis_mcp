@@ -26,10 +26,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // body wasn't JSON — keep statusText
     }
-    if (resp.status === 401 && window.location.pathname !== '/login') {
+    const isRead = (init?.method ?? 'GET') === 'GET'
+    if (resp.status === 401 && isRead && window.location.pathname !== '/login') {
       // Session expired or was never established (e.g. a bookmarked/shared dashboard link) —
       // send the browser to the login screen instead of leaving every page to render its own
-      // "could not load" error boundary, which looks like the app is broken rather than logged out.
+      // "could not load" error boundary, which looks like the app is broken rather than logged
+      // out. Reads only: a 401 on a write (save policy, create key, etc.) means the user was
+      // mid-action with real unsaved input on the page — hard-navigating away would silently
+      // discard it. Those callers already get the thrown ApiError and handle it locally
+      // (e.g. ServerDetail's savePolicy.onError), same as any other failed save.
       window.location.assign('/login')
     }
     throw new ApiError(resp.status, detail)

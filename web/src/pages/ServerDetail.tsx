@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { ApiError } from '../api/client'
 import { serversApi } from '../api/servers'
 import { useProbeServer, useServer, useServerPolicy, useServerTools } from '../lib/useServers'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
@@ -128,6 +129,7 @@ export function ServerDetail() {
 
   const [draft, setDraft] = useState<PolicyResponse | null>(null)
   const [expandedTool, setExpandedTool] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   useEffect(() => {
     if (policy) setDraft(policy)
@@ -136,8 +138,21 @@ export function ServerDetail() {
   const savePolicy = useMutation({
     mutationFn: (body: PolicyResponse) => serversApi.setPolicy(slug!, body),
     onSuccess: () => {
+      setSaveError(null)
       queryClient.invalidateQueries({ queryKey: ['servers', slug, 'policy'] })
       queryClient.invalidateQueries({ queryKey: ['servers', slug, 'tools'] })
+    },
+    onError: (err) => {
+      // Deliberately not auto-redirected to /login even on a 401 (see api/client.ts) — this
+      // draft may be the only copy of unsaved edits, so surface the failure here instead of
+      // navigating away and silently discarding it.
+      setSaveError(
+        err instanceof ApiError && err.status === 401
+          ? 'Your session expired — log in again, then Save policy to retry.'
+          : err instanceof ApiError
+            ? err.message
+            : 'Something went wrong saving the policy.',
+      )
     },
   })
 
@@ -249,22 +264,29 @@ export function ServerDetail() {
         </div>
 
         {isDirty && (
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => savePolicy.mutate(draft)}
-              className="btn-primary rounded-md px-4 py-2 text-sm font-medium disabled:opacity-60"
-              disabled={savePolicy.isPending}
-            >
-              {savePolicy.isPending ? 'Saving…' : 'Save policy'}
-            </button>
-            <button
-              type="button"
-              onClick={() => setDraft(policy ?? null)}
-              className="btn-secondary rounded-md px-4 py-2 text-sm font-medium"
-            >
-              Discard changes
-            </button>
+          <div className="space-y-2">
+            {saveError && (
+              <p className="text-sm" style={{ color: '#c0524b' }}>
+                {saveError}
+              </p>
+            )}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => savePolicy.mutate(draft)}
+                className="btn-primary rounded-md px-4 py-2 text-sm font-medium disabled:opacity-60"
+                disabled={savePolicy.isPending}
+              >
+                {savePolicy.isPending ? 'Saving…' : 'Save policy'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setDraft(policy ?? null)}
+                className="btn-secondary rounded-md px-4 py-2 text-sm font-medium"
+              >
+                Discard changes
+              </button>
+            </div>
           </div>
         )}
       </div>
