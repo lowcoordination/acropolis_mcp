@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from archon.api import build_control_plane_router
 from archon.auth.apikeys import ApiKeyService
 from archon.settings import Settings
+from archon.setup import build_setup_router
 from argus.aggregate_pipeline import AggregatePipeline
 from argus.audit import AuditLogger
 from argus.bridge import ProtocolBridge
@@ -71,6 +72,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
 
     app.state.settings = settings
     app.state.db = db
+    app.state.settings_repo = settings_repo
     app.state.server_repo = server_repo
     app.state.api_keys = api_keys
     app.state.rate_limiter = rate_limiter
@@ -80,6 +82,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.tools_cache = tools_cache
     app.state.health_poller = health_poller
 
+    app.include_router(build_setup_router(settings_repo))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit,
     ))

@@ -127,3 +127,7 @@ class SetupStatusResponse(BaseModel):
 class SetupRequest(BaseModel):
     admin_password: str
     auth_mode: str = "keyed"
+
+
+class LoginRequest(BaseModel):
+    admin_password: str
