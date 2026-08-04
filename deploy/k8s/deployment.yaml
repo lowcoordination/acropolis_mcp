@@ -1,21 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: argus
-  namespace: argus
+  name: acropolis
+  namespace: acropolis
   labels:
-    app: argus
+    app: acropolis
 spec:
   replicas: 1  # SQLite-backed; don't scale beyond 1 replica without moving to a shared DB first
   strategy:
     type: Recreate  # avoids two pods writing the same SQLite files at once during a rollout
   selector:
     matchLabels:
-      app: argus
+      app: acropolis
   template:
     metadata:
       labels:
-        app: argus
+        app: acropolis
     spec:
       # Uncomment and set if your registry requires auth:
       # imagePullSecrets:
@@ -27,24 +27,24 @@ spec:
         fsGroup: 1000
 
       containers:
-        - name: argus
+        - name: acropolis
           # Replace with wherever you've pushed the built image (see the repo's Dockerfile).
-          image: argus:latest
+          image: acropolis:latest
           imagePullPolicy: IfNotPresent
 
           envFrom:
             - configMapRef:
-                name: argus-config
+                name: acropolis-config
           env:
-            - name: ARGUS_DATA_DIR
+            - name: ACROPOLIS_DATA_DIR
               value: /data
             # Optional: a bearer-token override for the /api/v1 control plane (CI/automation
             # only — normal use goes through the browser login flow instead). Uncomment and
             # point at a real Secret if you want this.
-            # - name: ARGUS_ADMIN_TOKEN
+            # - name: ACROPOLIS_ADMIN_TOKEN
             #   valueFrom:
             #     secretKeyRef:
-            #       name: argus-admin-token
+            #       name: acropolis-admin-token
             #       key: token
 
           ports:
@@ -85,4 +85,4 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: argus-data
+            claimName: acropolis-data

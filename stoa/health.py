@@ -30,7 +30,7 @@ async def probe_server(
     """
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     discover_body = {
-        "jsonrpc": "2.0", "id": "argus-discover", "method": "server/discover",
+        "jsonrpc": "2.0", "id": "acropolis-discover", "method": "server/discover",
         "params": {"clientInfo": CLIENT_INFO},
     }
 

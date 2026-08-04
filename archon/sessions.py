@@ -7,7 +7,7 @@ import json
 import time
 from typing import Optional
 
-SESSION_COOKIE_NAME = "argus_session"
+SESSION_COOKIE_NAME = "acropolis_session"
 SESSION_MAX_AGE_SECONDS = 7 * 24 * 3600  # 7 days
 
 

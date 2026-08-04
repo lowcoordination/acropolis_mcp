@@ -33,7 +33,7 @@ export function Layout() {
           >
             A
           </span>
-          <span className="font-semibold tracking-tight">Argus</span>
+          <span className="font-semibold tracking-tight">Acropolis</span>
         </div>
         <nav className="flex-1 px-2 space-y-0.5">
           {navItems.map((item) => (

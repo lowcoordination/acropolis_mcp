@@ -10,7 +10,7 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      // In dev, proxy API calls to a locally-running Argus backend (python -m argus)
+      // In dev, proxy API calls to a locally-running Acropolis backend (python -m argus)
       // so `npm run dev` doesn't need CORS handling.
       '/api': 'http://localhost:8000',
       '/mcp': 'http://localhost:8000',

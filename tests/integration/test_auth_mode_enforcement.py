@@ -35,7 +35,7 @@ def _tool_call_body(tool: str, req_id: int = 1) -> dict:
 
 async def test_keyed_auth_mode_set_via_wizard_is_actually_enforced(tmp_path: Path, upstream):
     # Env var default is "keyed" (Settings.auth_mode default) — construct with the ENV default,
-    # not an explicit override, mirroring what a real container with no ARGUS_AUTH_MODE set
+    # not an explicit override, mirroring what a real container with no ACROPOLIS_AUTH_MODE set
     # would do, then drive auth_mode entirely through the wizard as a real user would.
     settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)

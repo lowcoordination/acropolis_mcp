@@ -13,7 +13,7 @@ logger = logging.getLogger("argus.upstream")
 MCP_2025_VERSION = "2025-06-18"
 MCP_2026_VERSION = "2026-07-28"
 
-CLIENT_INFO = {"name": "argus-gateway", "version": "0.1.0"}
+CLIENT_INFO = {"name": "acropolis-gateway", "version": "0.1.0"}
 
 # Deliberately advertise NO sampling/elicitation/roots capabilities when bridging to a
 # 2025-generation upstream — those are all "server calls back into the client" patterns,
@@ -108,7 +108,7 @@ class UpstreamHandshakeCache:
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         init_body = {
             "jsonrpc": "2.0",
-            "id": "argus-handshake",
+            "id": "acropolis-handshake",
             "method": "initialize",
             "params": {
                 "protocolVersion": MCP_2025_VERSION,

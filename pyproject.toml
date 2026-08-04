@@ -1,7 +1,7 @@
 [project]
-name = "argus"
+name = "acropolis"
 version = "0.1.0"
-description = "Argus/Archon/Stoa — a self-hostable MCP gateway, policy engine, and registration hub"
+description = "Acropolis (Argus/Archon/Stoa) — a self-hostable MCP gateway, policy engine, and registration hub"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-argus = "argus.__main__:cli"
+acropolis = "argus.__main__:cli"
 
 [build-system]
 requires = ["setuptools>=68"]

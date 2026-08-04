@@ -1,11 +1,11 @@
-# Putting Argus behind TLS
+# Putting Acropolis behind TLS
 
-Read this before you expose Argus to anything beyond `localhost` or a network you fully
+Read this before you expose Acropolis to anything beyond `localhost` or a network you fully
 trust — including a home LAN with guests, IoT devices, or anyone else's laptop on it.
 
 ## Why this matters
 
-Argus, by default, serves plain HTTP. Two things travel over that connection that matter:
+Acropolis, by default, serves plain HTTP. Two things travel over that connection that matter:
 
 - **Your admin session cookie** — set once you complete the first-run wizard or log in.
   Anyone who can see this cookie in transit can use it to reach the control plane: read your
@@ -14,11 +14,11 @@ Argus, by default, serves plain HTTP. Two things travel over that connection tha
   setting) — sent as a bearer token on every `/mcp/*` request. Anyone who can see one in
   transit can use it exactly as your own client would.
 
-On plain HTTP, both of these are readable by anything between the client and Argus: a
+On plain HTTP, both of these are readable by anything between the client and Acropolis: a
 shared Wi-Fi network, a compromised router, an ISP, a proxy you don't control. TLS
 (HTTPS) encrypts the connection so that traffic is unreadable in transit.
 
-If you're only ever accessing Argus from `localhost` on the same machine it runs on, this
+If you're only ever accessing Acropolis from `localhost` on the same machine it runs on, this
 isn't a concern — traffic never leaves the box. The moment you expose it on your LAN, a VPN,
 or the public internet, put it behind TLS first.
 
@@ -28,13 +28,13 @@ reminder, not a substitute for actually fixing it.
 
 ## The shape of the fix
 
-Argus doesn't terminate TLS itself — it expects a reverse proxy in front of it to handle
-certificates and HTTPS, then forward plain HTTP to Argus over a connection the proxy
+Acropolis doesn't terminate TLS itself — it expects a reverse proxy in front of it to handle
+certificates and HTTPS, then forward plain HTTP to Acropolis over a connection the proxy
 controls (usually `localhost` or a private network). This is the standard shape for
 self-hosted apps and lets you reuse whatever proxy you already run, if any.
 
 ```
-Internet / LAN  --HTTPS-->  reverse proxy  --HTTP-->  Argus (localhost:8000)
+Internet / LAN  --HTTPS-->  reverse proxy  --HTTP-->  Acropolis (localhost:8000)
 ```
 
 Below are two options. Caddy is the simplest if you're starting from nothing — it gets you
@@ -50,7 +50,7 @@ internet (needed once, for the initial certificate challenge).
 Install Caddy, then create `/etc/caddy/Caddyfile`:
 
 ```
-argus.yourdomain.com {
+acropolis.yourdomain.com {
     reverse_proxy localhost:8000
 }
 ```
@@ -71,10 +71,10 @@ If you're managing certificates yourself (e.g. via `certbot`) or already have ng
 ```nginx
 server {
     listen 443 ssl;
-    server_name argus.yourdomain.com;
+    server_name acropolis.yourdomain.com;
 
-    ssl_certificate     /etc/letsencrypt/live/argus.yourdomain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/argus.yourdomain.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/acropolis.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/acropolis.yourdomain.com/privkey.pem;
 
     location / {
         proxy_pass http://localhost:8000;
@@ -92,24 +92,24 @@ server {
 
 server {
     listen 80;
-    server_name argus.yourdomain.com;
+    server_name acropolis.yourdomain.com;
     return 301 https://$host$request_uri;
 }
 ```
 
-Get a certificate with `certbot --nginx -d argus.yourdomain.com` (or your preferred ACME
+Get a certificate with `certbot --nginx -d acropolis.yourdomain.com` (or your preferred ACME
 client), then reload nginx.
 
 ## After TLS is in place
 
-- Update how you (and any MCP clients) reach Argus to use `https://` instead of `http://`.
-- If you're running the docker-compose setup, Argus itself still only needs to listen on
+- Update how you (and any MCP clients) reach Acropolis to use `https://` instead of `http://`.
+- If you're running the docker-compose setup, Acropolis itself still only needs to listen on
   `localhost` or an internal Docker network reachable by the proxy — you don't need to
   expose port 8000 outside the host at all. Remove the `ports:` mapping in
   `deploy/docker-compose.yml` (or bind it to `127.0.0.1:8000:8000`) once the proxy is the only
-  thing reaching Argus directly.
+  thing reaching Acropolis directly.
 - Re-check the Settings page — the open-mode-over-HTTP warning should disappear once you're
-  accessing Argus via `https://`.
+  accessing Acropolis via `https://`.
 
 ## What TLS does *not* fix
 
@@ -119,4 +119,4 @@ do, or what `auth_mode: open` means. If you want defense in depth beyond TLS:
 - Use `auth_mode: keyed` (the default) rather than `open`, even on a private network.
 - Scope API keys to specific servers when a client only needs one (see the Keys page).
 - Put the reverse proxy itself behind your network's normal access controls (firewall rules,
-  VPN-only access, etc.) if Argus is managing anything sensitive.
+  VPN-only access, etc.) if Acropolis is managing anything sensitive.

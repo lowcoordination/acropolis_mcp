@@ -45,7 +45,7 @@ async def test_complete_setup_sets_cookie_and_marks_complete(client):
     resp = await client.post("/api/v1/setup", json={"admin_password": "hunter22", "auth_mode": "keyed"})
     assert resp.status_code == 200
     assert resp.json()["setup_complete"] is True
-    assert "argus_session" in resp.cookies
+    assert "acropolis_session" in resp.cookies
 
     status = await client.get("/api/v1/setup/status")
     assert status.json()["setup_complete"] is True
@@ -61,7 +61,7 @@ def _cookie_attrs(resp: httpx.Response, name: str) -> str:
 
 async def test_session_cookie_is_httponly_and_samesite_lax(client):
     resp = await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
-    raw = _cookie_attrs(resp, "argus_session")
+    raw = _cookie_attrs(resp, "acropolis_session")
     assert "httponly" in raw.lower()
     assert "samesite=lax" in raw.lower()
 
@@ -71,19 +71,19 @@ async def test_session_cookie_is_not_secure_over_plain_http(client):
     # cookie must NOT carry Secure here, or the browser would silently refuse to send it
     # back on the very next request and nobody could ever log in.
     resp = await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
-    raw = _cookie_attrs(resp, "argus_session")
+    raw = _cookie_attrs(resp, "acropolis_session")
     assert "secure" not in raw.lower()
 
 
 async def test_session_cookie_is_secure_behind_a_tls_terminating_proxy(client):
-    # Simulates the documented reverse-proxy setup (docs/tls-and-reverse-proxy.md): Argus
+    # Simulates the documented reverse-proxy setup (docs/tls-and-reverse-proxy.md): Acropolis
     # itself only ever speaks plain HTTP, so the proxy is the only thing that can tell it
     # the original request arrived over HTTPS, via X-Forwarded-Proto.
     resp = await client.post(
         "/api/v1/setup", json={"admin_password": "hunter22"},
         headers={"X-Forwarded-Proto": "https"},
     )
-    raw = _cookie_attrs(resp, "argus_session")
+    raw = _cookie_attrs(resp, "acropolis_session")
     assert "secure" in raw.lower()
 
 
@@ -120,7 +120,7 @@ async def test_login_with_correct_password_grants_session(client, app_transport)
     async with httpx.AsyncClient(transport=app_transport, base_url="http://argus.test") as fresh:
         login = await fresh.post("/api/v1/login", json={"admin_password": "hunter22"})
         assert login.status_code == 200
-        assert "argus_session" in login.cookies
+        assert "acropolis_session" in login.cookies
 
         resp = await fresh.get("/api/v1/servers")
         assert resp.status_code == 200

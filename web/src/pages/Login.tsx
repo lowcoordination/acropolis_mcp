@@ -35,7 +35,7 @@ export function Login() {
           >
             A
           </span>
-          <h1 className="text-lg font-semibold">Sign in to Argus</h1>
+          <h1 className="text-lg font-semibold">Sign in to Acropolis</h1>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>

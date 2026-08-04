@@ -281,7 +281,7 @@ class Pipeline:
                     if decision.blocked:
                         return Response(
                             content=rpc_error(
-                                rpc_id, f"Blocked by argus: {decision.reason}",
+                                rpc_id, f"Blocked by acropolis: {decision.reason}",
                                 data={"tool": tool_name, "rule": decision.rule, "matched": decision.matched},
                             ),
                             status_code=403, media_type="application/json",
@@ -354,7 +354,7 @@ class Pipeline:
             if decision.blocked:
                 return Response(
                     content=rpc_error(
-                        rpc_id, f"Blocked by argus: {decision.reason}",
+                        rpc_id, f"Blocked by acropolis: {decision.reason}",
                         data={"tool": tool_name, "rule": decision.rule, "matched": decision.matched},
                     ),
                     status_code=403, media_type="application/json",

@@ -11,7 +11,7 @@ from db.repo import SettingsRepo
 
 
 def _request_is_https(request: Request) -> bool:
-    """Argus itself always speaks plain HTTP (see docs/tls-and-reverse-proxy.md) — TLS, if
+    """Acropolis itself always speaks plain HTTP (see docs/tls-and-reverse-proxy.md) — TLS, if
     any, is terminated by a reverse proxy in front of it. Trust X-Forwarded-Proto (set by any
     reasonable proxy config, including the ones documented) in addition to request.url.scheme,
     so the session cookie gets the Secure flag once a real deployment is behind HTTPS, without

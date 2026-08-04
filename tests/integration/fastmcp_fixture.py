@@ -91,7 +91,7 @@ async def run_fastmcp_server():
         server.should_exit = True
         try:
             # uvicorn's graceful shutdown waits for in-flight connections to close. In these
-            # tests, Argus's own HealthPoller runs a real background probe against every
+            # tests, Acropolis's own HealthPoller runs a real background probe against every
             # registered server on create_app() startup — if that probe happens to be
             # in-flight against THIS fixture exactly at teardown, the connection can be held
             # open (keep-alive) and shutdown hangs indefinitely. force_close cuts it off

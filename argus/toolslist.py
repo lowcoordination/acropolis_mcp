@@ -52,7 +52,7 @@ class ToolsCache:
         try:
             status, body = await self._bridge.bridge_call(
                 server_id=server_id, upstream_url=upstream_url, rpc_method="tools/list",
-                rpc_id="argus-toolslist", params={},
+                rpc_id="acropolis-toolslist", params={},
             )
         except BridgeError:
             # Upstream unreachable (connection refused, handshake failed, etc.) — serve stale

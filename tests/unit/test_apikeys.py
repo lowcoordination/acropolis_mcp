@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from archon.auth.apikeys import ApiKeyService, KEY_PREFIX
+from archon.auth.apikeys import ApiKeyService, DISPLAY_PREFIX_LEN, KEY_PREFIX
 from db.database import Database
 from db.repo import ApiKeyRepo
 
@@ -21,7 +21,7 @@ async def test_create_returns_plaintext_once(service):
     generated = await service.create("test-key")
     assert generated.plaintext.startswith(KEY_PREFIX)
     assert generated.record.name == "test-key"
-    assert generated.record.key_prefix == generated.plaintext[:12]
+    assert generated.record.key_prefix == generated.plaintext[:DISPLAY_PREFIX_LEN]
 
 
 async def test_verify_accepts_correct_plaintext(service):
@@ -33,7 +33,7 @@ async def test_verify_accepts_correct_plaintext(service):
 
 async def test_verify_rejects_wrong_key(service):
     await service.create("test-key")
-    record = await service.verify("argus_totally-wrong-key")
+    record = await service.verify("acropolis_totally-wrong-key")
     assert record is None
 
 

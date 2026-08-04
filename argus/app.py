@@ -80,7 +80,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
             await audit.stop()
             await http_client.aclose()
 
-    app = FastAPI(title="Argus", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app = FastAPI(title="Acropolis", docs_url=None, redoc_url=None, lifespan=lifespan)
 
     app.state.settings = settings
     app.state.db = db

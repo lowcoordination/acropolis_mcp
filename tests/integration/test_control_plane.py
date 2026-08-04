@@ -114,7 +114,7 @@ async def test_create_key_returns_plaintext_once(api_client):
     resp = await api_client.post("/api/v1/keys", json={"name": "friend-key"})
     assert resp.status_code == 201
     body = resp.json()
-    assert body["plaintext"].startswith("argus_")
+    assert body["plaintext"].startswith("acropolis_")
 
     list_resp = await api_client.get("/api/v1/keys")
     assert "plaintext" not in list_resp.text

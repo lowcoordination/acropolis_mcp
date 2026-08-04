@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="ARGUS_")
+    model_config = SettingsConfigDict(env_prefix="ACROPOLIS_")
 
     data_dir: str = "./data"
     host: str = "0.0.0.0"

@@ -1,5 +1,5 @@
 """End-to-end: a 2026-style stateless client (no initialize, Mcp-Method header on every
-request) talking through the real Argus app to a real 2025-06-18 FastMCP upstream."""
+request) talking through the real Acropolis app to a real 2025-06-18 FastMCP upstream."""
 from __future__ import annotations
 
 import asyncio

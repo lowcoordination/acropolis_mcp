@@ -1,5 +1,5 @@
 """
-Integration tests: real Argus FastAPI app (via ASGI transport, no sockets) proxying to a real
+Integration tests: real Acropolis FastAPI app (via ASGI transport, no sockets) proxying to a real
 FastMCP 2025-06-18 upstream (via a real socket, since FastMCP needs an actual server to run).
 
 Covers M1's ship test: a 2025-generation client talking through argus/{slug} to a real
@@ -59,7 +59,7 @@ def _initialize_body(req_id: int = 1) -> dict:
         "params": {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
-            "clientInfo": {"name": "argus-test-client", "version": "0.0.1"},
+            "clientInfo": {"name": "acropolis-test-client", "version": "0.0.1"},
         },
     }
 
@@ -79,7 +79,7 @@ MCP_HEADERS = {"Content-Type": "application/json", "Accept": "application/json, 
 async def _initialized_session_headers(client: httpx.AsyncClient) -> dict:
     """Real 2025-06-18 clients must initialize() before any other call, and FastMCP mints a
     Mcp-Session-Id that must be echoed on every subsequent request. M1 is pure passthrough,
-    so argus does no session handling itself — it just relays whatever the upstream issues."""
+    so acropolis does no session handling itself — it just relays whatever the upstream issues."""
     resp = await client.post("/mcp/test-server", json=_initialize_body(), headers=MCP_HEADERS)
     assert resp.status_code == 200, resp.text
     session_id = resp.headers.get("mcp-session-id")

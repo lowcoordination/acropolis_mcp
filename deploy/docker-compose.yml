@@ -1,23 +1,23 @@
 services:
-  argus:
+  acropolis:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: argus:latest
-    container_name: argus
+    image: acropolis:latest
+    container_name: acropolis
     restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
-      - argus-data:/data
+      - acropolis-data:/data
     environment:
       # Optional: a bearer-token override for the /api/v1 control plane, for scripts/CI that
       # shouldn't go through the browser login flow. Leave unset for normal use — visiting the
       # UI for the first time walks you through setting an admin password instead.
-      - ARGUS_ADMIN_TOKEN=${ARGUS_ADMIN_TOKEN:-}
+      - ACROPOLIS_ADMIN_TOKEN=${ACROPOLIS_ADMIN_TOKEN:-}
       # "open" = no API key needed on /mcp/* (fine for a trusted LAN); "keyed" requires
       # a Bearer API key on every data-plane request. Also set from the first-run wizard.
-      - ARGUS_AUTH_MODE=${ARGUS_AUTH_MODE:-keyed}
+      - ACROPOLIS_AUTH_MODE=${ACROPOLIS_AUTH_MODE:-keyed}
 
 volumes:
-  argus-data:
+  acropolis-data:

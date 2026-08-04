@@ -20,7 +20,7 @@ function App() {
   if (isError) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        Could not reach the Argus backend.
+        Could not reach the Acropolis backend.
       </div>
     )
   }

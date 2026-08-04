@@ -12,7 +12,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN useradd -m -u 1000 argus
+RUN useradd -m -u 1000 acropolis
 
 COPY pyproject.toml .
 COPY argus/ ./argus/
@@ -24,13 +24,13 @@ RUN pip install --no-cache-dir .
 
 COPY --from=web-build /web/dist ./web/dist
 
-RUN mkdir -p /data && chown argus:argus /data
+RUN mkdir -p /data && chown acropolis:acropolis /data
 
-USER argus
+USER acropolis
 
-ENV ARGUS_DATA_DIR=/data
-ENV ARGUS_HOST=0.0.0.0
-ENV ARGUS_PORT=8000
+ENV ACROPOLIS_DATA_DIR=/data
+ENV ACROPOLIS_HOST=0.0.0.0
+ENV ACROPOLIS_PORT=8000
 
 EXPOSE 8000
 

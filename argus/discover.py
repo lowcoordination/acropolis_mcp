@@ -5,7 +5,7 @@ from typing import Optional
 
 from db.models import ServerRecord
 
-ARGUS_VERSION = "0.1.0"
+ACROPOLIS_VERSION = "0.1.0"
 
 
 def synthesize_server_discover(server: ServerRecord) -> dict:
@@ -31,13 +31,13 @@ def synthesize_server_discover(server: ServerRecord) -> dict:
 
 
 def synthesize_gateway_discover(servers: list[ServerRecord]) -> dict:
-    """server/discover for the aggregate /mcp endpoint — presents Argus itself as one server
-    whose capabilities are the union of its enabled, in_aggregate upstreams. Per the spec,
-    subscriptions capability is deliberately omitted (subscriptions/listen is unsupported —
-    see argus.bridge._UNSUPPORTED_2026_METHODS and the plan's M2 punt rationale)."""
+    """server/discover for the aggregate /mcp endpoint — presents Acropolis itself as one
+    server whose capabilities are the union of its enabled, in_aggregate upstreams. Per the
+    spec, subscriptions capability is deliberately omitted (subscriptions/listen is
+    unsupported — see argus.bridge._UNSUPPORTED_2026_METHODS and the plan's M2 punt rationale)."""
     aggregated = [s for s in servers if s.enabled and s.in_aggregate]
     return {
-        "serverInfo": {"name": "argus-gateway", "version": ARGUS_VERSION},
+        "serverInfo": {"name": "acropolis-gateway", "version": ACROPOLIS_VERSION},
         "capabilities": {
             "tools": {"listChanged": False},
             # resources/prompts are not exposed on the aggregate endpoint in M2 (v1 aggregates

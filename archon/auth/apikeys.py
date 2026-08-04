@@ -9,9 +9,9 @@ from typing import Optional
 from db.models import ApiKeyRecord
 from db.repo import ApiKeyRepo
 
-KEY_PREFIX = "argus_"
+KEY_PREFIX = "acropolis_"
 KEY_RANDOM_BYTES = 32
-DISPLAY_PREFIX_LEN = 12  # "argus_" + 6 chars, enough to identify a key in the UI without revealing it
+DISPLAY_PREFIX_LEN = 16  # "acropolis_" + 6 chars, enough to identify a key in the UI without revealing it
 
 
 @dataclass

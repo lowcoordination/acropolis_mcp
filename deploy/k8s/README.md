@@ -1,9 +1,9 @@
 # Kubernetes manifests
 
-Generic manifests for running Argus on any Kubernetes cluster — no assumptions about a
-specific cloud provider, ingress controller, or storage class. If you just want to try Argus
+Generic manifests for running Acropolis on any Kubernetes cluster — no assumptions about a
+specific cloud provider, ingress controller, or storage class. If you just want to try Acropolis
 quickly, [docker compose](../docker-compose.yml) is the faster path; use these if you're
-already running workloads on Kubernetes and want Argus alongside them.
+already running workloads on Kubernetes and want Acropolis alongside them.
 
 ## Before you apply
 
@@ -11,7 +11,7 @@ already running workloads on Kubernetes and want Argus alongside them.
    control — Docker Hub, GHCR, a self-hosted registry). The repo root's `Dockerfile` builds
    it; there's no published image to pull as-is yet.
 2. **Edit `deployment.yaml`**: replace the `image:` field with your pushed image.
-3. Decide how you'll reach Argus — a `ClusterIP` Service plus `kubectl port-forward` for a
+3. Decide how you'll reach Acropolis — a `ClusterIP` Service plus `kubectl port-forward` for a
    quick look, an `Ingress` (see `ingress.yaml.example`) for a real hostname with TLS, or
    `type: LoadBalancer` in `service.yaml` if your cluster provisions external IPs.
 
@@ -34,8 +34,8 @@ kubectl apply -f namespace.yaml -f configmap.yaml -f pvc.yaml -f deployment.yaml
 Confirm it came up:
 
 ```bash
-kubectl -n argus get pods
-kubectl -n argus port-forward svc/argus 8000:8000
+kubectl -n acropolis get pods
+kubectl -n acropolis port-forward svc/acropolis 8000:8000
 ```
 
 Then open `http://localhost:8000` and finish setup, same as the
@@ -45,7 +45,7 @@ Then open `http://localhost:8000` and finish setup, same as the
 
 | File | Purpose |
 |---|---|
-| `namespace.yaml` | The `argus` namespace everything else lives in. |
+| `namespace.yaml` | The `acropolis` namespace everything else lives in. |
 | `configmap.yaml` | Non-secret env vars (`auth_mode` default, host/port). |
 | `pvc.yaml` | 1Gi persistent volume for the SQLite config + audit databases. |
 | `deployment.yaml` | Single-replica Deployment. Non-root, resource limits, liveness/readiness probes on `/api/v1/health`. |
@@ -54,7 +54,7 @@ Then open `http://localhost:8000` and finish setup, same as the
 
 ## Why only one replica
 
-Argus stores its config and audit log in SQLite on a single `ReadWriteOnce` volume. Running
+Acropolis stores its config and audit log in SQLite on a single `ReadWriteOnce` volume. Running
 more than one replica would mean two processes writing the same SQLite files, which isn't
 safe. The Deployment uses `strategy: Recreate` for the same reason — a rolling update would
 briefly run two pods against the same volume otherwise. If you outgrow this (very high audit
@@ -65,7 +65,7 @@ tweak — open an issue if you're hitting that ceiling.
 
 There's no Secret manifest here because there's nothing that requires one by default — the
 admin password is set through the web UI's first-run wizard and stored (hashed) in the SQLite
-database on the PVC, not as a Kubernetes Secret. The one exception is `ARGUS_ADMIN_TOKEN`, an
+database on the PVC, not as a Kubernetes Secret. The one exception is `ACROPOLIS_ADMIN_TOKEN`, an
 optional bearer-token override for automation that bypasses the browser login flow — see the
 commented-out block in `deployment.yaml` if you need it; wire it to a real Secret rather than
 putting it in the ConfigMap.

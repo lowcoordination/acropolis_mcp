@@ -44,7 +44,7 @@ export function SetupWizard() {
           >
             A
           </span>
-          <h1 className="text-lg font-semibold">Welcome to Argus</h1>
+          <h1 className="text-lg font-semibold">Welcome to Acropolis</h1>
         </div>
         <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
           Set an admin password to finish setting up your gateway.

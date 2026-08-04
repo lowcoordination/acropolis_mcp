@@ -1,6 +1,6 @@
 # Protocol bridging
 
-MCP has two generations of the spec in the wild right now, and Argus talks to both without
+MCP has two generations of the spec in the wild right now, and Acropolis talks to both without
 you having to think about which one your upstream servers or clients speak.
 
 ## The two generations
@@ -13,17 +13,17 @@ request on that connection carries it. Responses to POST requests come back as
 **2026-07-28** — the current spec, finalized recently. Stateless: no `initialize` handshake,
 no session id. Every request carries its own protocol version and client info; every response
 is a single, complete JSON object. Two new headers, `Mcp-Method` and `Mcp-Name`, are required
-on every request specifically so a gateway (like Argus) can route and enforce policy without
+on every request specifically so a gateway (like Acropolis) can route and enforce policy without
 parsing the JSON-RPC body first.
 
-Realistically, almost every MCP server you point Argus at today is 2025-06-18. 2026-07-28
-clients will show up over time as SDKs and agent frameworks catch up to the new spec. Argus is
+Realistically, almost every MCP server you point Acropolis at today is 2025-06-18. 2026-07-28
+clients will show up over time as SDKs and agent frameworks catch up to the new spec. Acropolis is
 built to make that transition invisible: register your (2025-generation) server once, and it
 works correctly whether the client talking to it is old or new.
 
-## How Argus tells them apart
+## How Acropolis tells them apart
 
-Argus looks for the `Mcp-Method` header. If it's present, the request is treated as
+Acropolis looks for the `Mcp-Method` header. If it's present, the request is treated as
 2026-generation and stateless. If it's absent, the request is treated as 2025-generation —
 which means it should be part of a session that started with a real `initialize` call.
 
@@ -33,12 +33,12 @@ spec to send it on every request.
 
 ## What happens on each path
 
-**2025 client → 2025 upstream (today's default case):** Argus passes the request through
+**2025 client → 2025 upstream (today's default case):** Acropolis passes the request through
 unchanged — the same `initialize`/session/SSE dance the client and upstream would do directly,
 just proxied. This is the path your existing clients (an agent framework, a chat app with MCP
-support) use without any changes beyond pointing them at Argus's URL instead of the upstream's.
+support) use without any changes beyond pointing them at Acropolis's URL instead of the upstream's.
 
-**2026 client → 2025 upstream (the bridge):** this is the interesting case. Argus:
+**2026 client → 2025 upstream (the bridge):** this is the interesting case. Acropolis:
 
 1. Maintains a cached `initialize` handshake with the upstream on the client's behalf — done
    once per upstream server, not once per stateless request, so a 2026 client's statelessness
@@ -48,16 +48,16 @@ support) use without any changes beyond pointing them at Argus's URL instead of 
    result, returning it as a plain JSON body — a 2026 client never has to know the upstream
    replied with SSE at all.
 
-Argus deliberately advertises no `sampling`, `elicitation`, or `roots` capability when it
+Acropolis deliberately advertises no `sampling`, `elicitation`, or `roots` capability when it
 establishes this handshake. Those are all "the server calls back into the client mid-request"
-patterns, and a bridged 2026 client has no channel for Argus to relay that callback through
-(see MRTR below) — so Argus tells 2025 upstreams up front not to attempt one.
+patterns, and a bridged 2026 client has no channel for Acropolis to relay that callback through
+(see MRTR below) — so Acropolis tells 2025 upstreams up front not to attempt one.
 
 **tools/list, filtered:** regardless of which generation asked, the tools a caller can
 actually see reflect the server's current policy — a tool denied by policy simply isn't in the
 list. This is true for both the per-server and aggregate endpoints.
 
-**server/discover:** mandatory for 2026-generation servers, so Argus answers it for every
+**server/discover:** mandatory for 2026-generation servers, so Acropolis answers it for every
 server it proxies — synthesized from whatever the upstream told it during the handshake
 (protocol version, server info, capabilities), even for a 2025-generation upstream that's never
 heard of this method.
@@ -67,12 +67,12 @@ heard of this method.
 Two pieces of the 2026 spec are intentionally unimplemented, not silently broken:
 
 **`subscriptions/listen`** (server-to-client push notifications over a long-lived stream) — a
-2026 client that tries this gets a clean `-32601` (method not found), and Argus's
+2026 client that tries this gets a clean `-32601` (method not found), and Acropolis's
 `server/discover` response never advertises the subscriptions capability, so a
 spec-conforming client shouldn't attempt it in the first place.
 
 **MRTR (Multi Round-Trip Requests)** — the mechanism a 2026-generation server would use to ask
-its client a follow-up question mid-call. Since Argus tells every bridged 2025 upstream not to
+its client a follow-up question mid-call. Since Acropolis tells every bridged 2025 upstream not to
 attempt this (see above), it shouldn't come up in practice. If a 2025 upstream ever does try to
 initiate a mid-call callback anyway, the bridge fails that specific call with a clear error
 rather than silently hanging or dropping the callback.
@@ -87,8 +87,8 @@ signal this needs to be built — please open an issue rather than assuming it's
 ## What this means for you, practically
 
 - You don't need to know or configure anything about protocol generations. Register your
-  server's URL; Argus figures out how to talk to it.
-- If you're building a 2026-generation client, point it at Argus the same way you'd point it
+  server's URL; Acropolis figures out how to talk to it.
+- If you're building a 2026-generation client, point it at Acropolis the same way you'd point it
   at a native 2026 server — the stateless request shape, headers, and response format are the
   same either way.
 - Policy (allow/deny/param rules/rate limits) applies identically regardless of which

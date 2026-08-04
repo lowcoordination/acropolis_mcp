@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: argus
-  namespace: argus
+  name: acropolis
+  namespace: acropolis
 spec:
-  # ClusterIP by default — reach Argus via `kubectl port-forward` for a quick look, or (more
+  # ClusterIP by default — reach Acropolis via `kubectl port-forward` for a quick look, or (more
   # realistically) put an Ingress in front of it (see ingress.yaml.example in this directory)
   # so it gets a real hostname and TLS. Change to LoadBalancer if your cluster provisions
   # external IPs (e.g. MetalLB, a cloud LB controller) and you want one directly:
@@ -13,7 +13,7 @@ spec:
   #
   type: ClusterIP
   selector:
-    app: argus
+    app: acropolis
   ports:
     - name: http
       port: 8000

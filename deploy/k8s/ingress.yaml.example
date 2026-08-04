@@ -1,4 +1,4 @@
-# Example Ingress for Argus — NOT applied automatically (note the .example suffix). Copy to
+# Example Ingress for Acropolis — NOT applied automatically (note the .example suffix). Copy to
 # ingress.yaml, fill in your own hostname and ingress class, and apply it once you have:
 #
 #   - an ingress controller running in your cluster (nginx-ingress, Traefik, etc.)
@@ -11,24 +11,24 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: argus
-  namespace: argus
+  name: acropolis
+  namespace: acropolis
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
   ingressClassName: nginx  # or "traefik", or whatever your cluster uses
   tls:
     - hosts:
-        - argus.example.com
-      secretName: argus-tls
+        - acropolis.example.com
+      secretName: acropolis-tls
   rules:
-    - host: argus.example.com
+    - host: acropolis.example.com
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: argus
+                name: acropolis
                 port:
                   name: http

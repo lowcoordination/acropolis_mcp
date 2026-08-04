@@ -1,6 +1,6 @@
 # Policy cookbook
 
-Every server registered in Argus has a policy: a mode, an allow/deny list, optional
+Every server registered in Acropolis has a policy: a mode, an allow/deny list, optional
 per-parameter rules, and an optional rate limit. This page is worked examples for common
 situations — everything here can be set through the **server detail page** in the UI, or via
 `PUT /api/v1/servers/{slug}/policy` directly if you'd rather script it.
