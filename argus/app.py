@@ -26,6 +26,25 @@ from stoa.health import HealthPoller
 from stoa.retention import AuditRetentionJob
 
 
+# F20 fix (review 2026-08-04): no Content-Security-Policy, X-Frame-Options, or
+# X-Content-Type-Options anywhere, no middleware registered. No CSP means no defence-in-depth
+# if an XSS is ever introduced into the React SPA; no frame protection means the admin
+# dashboard is clickjackable (embed it in an invisible iframe over a fake UI, trick the admin
+# into clicking through actions on the real page underneath). Applied gateway-wide, including
+# /mcp/* — those responses are JSON, not HTML, but the headers are harmless there and this way
+# nothing has to remember to apply them selectively. HSTS is deliberately NOT set here: TLS, if
+# any, is terminated by a reverse proxy in front of Acropolis (see
+# docs/tls-and-reverse-proxy.md), and HSTS is a proxy-layer concern — setting it here would
+# advertise HTTPS-only even when an operator is legitimately running plain HTTP on a trusted
+# LAN, which is this product's documented default. Documented in that same doc instead.
+async def _security_headers_middleware(request, call_next):
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
 def create_app(settings: Settings, db: Database) -> FastAPI:
     server_repo = ServerRepo(db)
     api_key_repo = ApiKeyRepo(db)
@@ -81,6 +100,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
             await http_client.aclose()
 
     app = FastAPI(title="Acropolis", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app.middleware("http")(_security_headers_middleware)
 
     app.state.settings = settings
     app.state.db = db
@@ -95,9 +115,10 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.health_poller = health_poller
     app.state.retention_job = retention_job
 
-    app.include_router(build_setup_router(settings_repo))
+    app.include_router(build_setup_router(settings_repo, rate_limiter))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
+        rate_limiter,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
 

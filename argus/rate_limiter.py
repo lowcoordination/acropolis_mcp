@@ -47,22 +47,45 @@ def server_key(slug: str) -> str:
 
 
 def tool_key(slug: str, tool_name: str) -> str:
+    """F9 (review 2026-08-04, tracked gap, not this sprint's scope): tool_key is constructed
+    and checked on every tools/call (see Pipeline._check_rate_limits), but nothing anywhere
+    ever calls register() for a tool_key — ServerPolicy has no per-tool rate_limit field
+    surfaced from tool_policies.rate_limit (the DB column exists; the model doesn't expose it).
+    check_all() treats an unregistered key as unlimited, so this lookup always passes. Matches
+    the real fleet's guard-config.yml, which only ever configured server-level limits — kept as
+    a documented gap rather than removed, since the DB column and this key builder are the
+    natural landing point when per-tool limits are implemented."""
     return f"srv:{slug}:tool:{tool_name}"
-
-
-def api_key_key(key_id: int) -> str:
-    return f"key:{key_id}"
 
 
 class RateLimiterRegistry:
     def __init__(self) -> None:
         self._buckets: dict[str, TokenBucket] = {}
+        # F8: tracks the spec string each key was last registered with, so ensure_current can
+        # tell "the policy hasn't changed, leave the bucket's consumed-token state alone" apart
+        # from "the operator changed the limit, rebuild the bucket" without unregistering (and
+        # thus resetting) on every single request.
+        self._specs: dict[str, str] = {}
 
     def register(self, key: str, spec: str) -> None:
+        """Builds a FRESH bucket, resetting any consumed-token state for `key`. Call this when
+        the spec has genuinely changed (see ensure_current for the common "is it still the same
+        limit" case) or when a bucket is being registered for the first time."""
         self._buckets[key] = parse_spec(spec)
+        self._specs[key] = spec
+
+    def ensure_current(self, key: str, spec: str) -> None:
+        """(Re)registers `key` only if `spec` differs from what it was last registered with, or
+        if it isn't registered at all. A no-op — and critically, does NOT touch the existing
+        bucket's consumed-token state — when the policy hasn't changed since the last call.
+        This is what makes it safe to call on every request without defeating the limit by
+        resetting every caller to a fresh full bucket each time."""
+        if self._specs.get(key) != spec:
+            self.register(key, spec)
 
     def unregister(self, key: str) -> None:
         self._buckets.pop(key, None)
+        self._specs.pop(key, None)
 
     def is_registered(self, key: str) -> bool:
         return key in self._buckets

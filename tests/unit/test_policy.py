@@ -178,7 +178,13 @@ async def test_catastrophic_backtracking_pattern_times_out_instead_of_hanging():
     """The security-critical case: a pattern vulnerable to catastrophic backtracking must
     not be able to hang policy evaluation indefinitely. Confirmed manually before this fix
     that "(a+)+$" against 31 chars of crafted input hangs Python's `re` for >5s uninterrupted
-    — well past what any request should wait. This test proves the fix bounds it."""
+    — well past what any request should wait. This test proves the fix bounds it.
+
+    F2 fix (2026-08-04 review): a timed-out match is now UNDETERMINED, and _check_param treats
+    UNDETERMINED on an operator-authored block_pattern rule as a match — i.e. BLOCKED, not
+    allowed. The original fail-open design here was found to be silently defeatable under
+    concurrent load (see test_policy_engine_blocks_under_concurrent_redos_flood below); failing
+    closed on a rule the operator explicitly wrote is the corrected, documented trade-off."""
     import time
 
     policy = ServerPolicy(
@@ -194,9 +200,8 @@ async def test_catastrophic_backtracking_pattern_times_out_instead_of_hanging():
     # Must return well before the pattern would naturally finish (which is many seconds/
     # unbounded) — the _REGEX_MATCH_TIMEOUT_SECONDS cap plus overhead, generously bounded.
     assert elapsed < 2.0
-    # Failing open (not blocked) on a timed-out match is the documented, deliberate choice —
-    # see _match_with_timeout's docstring for why fail-open is safer here.
-    assert not decision.blocked
+    assert decision.blocked
+    assert decision.rule == "block_pattern_undetermined"
 
 
 async def test_concurrent_backtracking_patterns_do_not_serialize():
@@ -204,7 +209,10 @@ async def test_concurrent_backtracking_patterns_do_not_serialize():
     own dedicated thread pool, not asyncio's process-wide default executor. If it shared the
     default pool, several concurrent pathological matches would serialize behind each other
     (and could stall unrelated run_in_executor(None, ...) work elsewhere in the process). Firing
-    several at once and bounding total wall time proves they run concurrently instead."""
+    several at once and bounding total wall time proves they run concurrently instead.
+
+    F2 fix: all should time out -> UNDETERMINED -> blocked (see the fail-open->fail-closed note
+    on test_catastrophic_backtracking_pattern_times_out_instead_of_hanging above)."""
     import asyncio
     import time
 
@@ -223,4 +231,51 @@ async def test_concurrent_backtracking_patterns_do_not_serialize():
     # If these serialized on a starved shared pool, 8 * ~0.7s would blow well past this.
     # Running concurrently, total time should stay close to a single timeout's worth.
     assert elapsed < 2.5
-    assert all(not d.blocked for d in decisions)
+    assert all(d.blocked for d in decisions)
+
+
+async def test_policy_engine_does_not_fail_open_under_concurrent_redos_flood():
+    """F2 regression test — reproduces the reviewer's exact probe. Pre-fix: asyncio.wait_for's
+    timeout clock started at SUBMISSION to the 16-worker wait_executor, not at the point a
+    match actually began waiting. With more than 16 concurrent pathological matches in flight,
+    the 17th+ would sit queued in the executor's own backlog, burn its whole deadline before
+    ever starting, and get treated identically to "the regex genuinely took too long" — i.e.
+    silently allowed. The reviewer measured this directly: 40 concurrent ReDoS requests against
+    one server let a completely UNRELATED server's must-block rule pass 10/10 requests that
+    should have been blocked, logged as ALLOWED.
+
+    This test fires well over _MAX_CONCURRENT_REGEX_CHECKS (16) pathological matches against a
+    "flood" server concurrently with must-block requests against a separate "victim" server, and
+    asserts every victim request is still blocked — proving the semaphore-before-process.start()
+    fix actually closes the window, not just that a single match times out correctly."""
+    import asyncio
+
+    flood_policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(block_patterns=[r"(a+)+$"])}},
+    )
+    victim_policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(block_patterns=[r"^BLOCK_ME$"])}},
+    )
+    evil_input = "a" * 30 + "!"
+
+    async def flood_request():
+        return await evaluate("tool", {"value": evil_input}, "flood-server", flood_policy)
+
+    async def victim_request():
+        return await evaluate("tool", {"value": "BLOCK_ME"}, "victim-server", victim_policy)
+
+    # 40 flood requests (well over the 16-worker pool) racing 10 victim requests, all fired
+    # concurrently via gather — not sequentially, which is what let this bug hide in every
+    # prior test in this suite.
+    flood_tasks = [flood_request() for _ in range(40)]
+    victim_tasks = [victim_request() for _ in range(10)]
+    results = await asyncio.gather(*flood_tasks, *victim_tasks)
+    victim_decisions = results[40:]
+
+    assert all(d.blocked for d in victim_decisions), (
+        f"expected 10/10 victim requests blocked, got "
+        f"{sum(1 for d in victim_decisions if d.blocked)}/10 — policy engine failed open "
+        f"under concurrent ReDoS load"
+    )

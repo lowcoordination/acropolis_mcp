@@ -247,6 +247,34 @@ async def test_server_rate_limit_enforced(argus_client):
     assert upstream.call_counter.get("echo") == 2  # the 3rd call must never reach the upstream
 
 
+async def test_server_rate_limit_change_takes_effect_without_restart(argus_client):
+    """F8 regression (review 2026-08-04): raising a rate limit via a real set_policy() call —
+    the same path the /api/v1/servers/{slug}/policy route uses — must take effect on the VERY
+    NEXT request. Pre-fix, the bucket was registered once and the `not is_registered(...)`
+    guard meant a changed limit was silently ignored until process restart."""
+    client, server_repo, upstream, _ = argus_client
+    server = await server_repo.get("test-server")
+    headers = await _initialized_session_headers(client)
+
+    await server_repo.set_policy(server.id, ServerPolicy(mode="passthrough", rate_limit="1/hour"))
+    resp1 = await client.post(
+        "/mcp/test-server", json=_tool_call_body("echo", {"message": "a"}), headers=headers,
+    )
+    resp2 = await client.post(
+        "/mcp/test-server", json=_tool_call_body("echo", {"message": "b"}), headers=headers,
+    )
+    assert (resp1.status_code, resp2.status_code) == (200, 429)  # exhausted at limit 1
+
+    # Operator raises the limit through the real policy-write path — not a restart.
+    await server_repo.set_policy(server.id, ServerPolicy(mode="passthrough", rate_limit="10/hour"))
+    resp3 = await client.post(
+        "/mcp/test-server", json=_tool_call_body("echo", {"message": "c"}), headers=headers,
+    )
+    assert resp3.status_code == 200, (
+        "raising the rate limit via set_policy() did not take effect on the next request"
+    )
+
+
 async def test_header_match_allowed_through(argus_client):
     client, _, upstream, _ = argus_client
     session_headers = await _initialized_session_headers(client)

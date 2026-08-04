@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import multiprocessing
+import queue
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -38,65 +40,95 @@ logger = logging.getLogger("argus.policy")
 _REGEX_MATCH_TIMEOUT_SECONDS = 0.5
 _mp_context = multiprocessing.get_context("forkserver")
 
-# Waiting on result_queue.get() blocks a thread for up to _REGEX_MATCH_TIMEOUT_SECONDS + 0.2s.
-# asyncio's default executor (shared by every unrelated run_in_executor(None, ...) call in the
-# process, sized min(32, cpu_count+4)) is NOT an acceptable place to put that wait: a burst of
-# concurrent tools/call requests against servers with block_patterns rules could exhaust it on
-# their own and stall unrelated work sharing the same pool. Give this one blocking wait its own
-# small dedicated pool instead — sized well above any realistic concurrent-policy-check count,
-# but bounded so a pathological flood can't spawn unbounded threads.
-_wait_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="policy-regex-wait")
+# F2/F10 fix (review 2026-08-04): waiting on result_queue.get() blocks a thread for up to
+# _REGEX_MATCH_TIMEOUT_SECONDS + 0.2s. asyncio's default executor (shared by every unrelated
+# run_in_executor(None, ...) call in the process, sized min(32, cpu_count+4)) is NOT an
+# acceptable place to put that wait: a burst of concurrent tools/call requests against servers
+# with block_patterns rules could exhaust it on their own and stall unrelated work sharing the
+# same pool. Give this one blocking wait its own small dedicated pool instead.
+#
+# F2: that pool is ALSO where the original fail-open bug lived. asyncio.wait_for's clock starts
+# at SUBMISSION to the executor, not at the point the wait actually begins running — with only
+# 16 workers, the 17th+ concurrent match sits queued in the executor's own backlog burning its
+# deadline before it ever starts waiting, times out, and was (incorrectly) treated identically
+# to "the regex genuinely took too long." Confirmed by the reviewer: 40 concurrent ReDoS
+# requests against one server let 10/10 requests on an UNRELATED server bypass block_patterns
+# entirely, logged as ALLOWED. Fixed by acquiring a semaphore BEFORE starting the child process
+# at all, so the timeout clock only ever measures genuine match time, never queue-wait time —
+# a request that can't get a slot yet blocks on the semaphore (bounded, but never silently
+# treated as "did not match").
+_MAX_CONCURRENT_REGEX_CHECKS = 16
+_regex_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REGEX_CHECKS)
+_wait_executor = ThreadPoolExecutor(
+    max_workers=_MAX_CONCURRENT_REGEX_CHECKS, thread_name_prefix="policy-regex-wait"
+)
+
+
+class MatchOutcome(enum.Enum):
+    """F2 fix: a timed-out or otherwise-failed match is no longer silently folded into
+    "did not match." Security invariant for a gateway: an UNDETERMINED result on an
+    operator-authored block_pattern rule must be treated as a match (block), never as a pass —
+    see _check_param, and docs/policy-cookbook.md for the operator-facing explanation."""
+
+    MATCHED = "matched"
+    NOT_MATCHED = "not_matched"
+    UNDETERMINED = "undetermined"
 
 
 def _regex_worker(pattern, value: str, result_queue) -> None:
     result_queue.put(pattern.search(value) is not None)
 
 
-async def _match_with_timeout(compiled, value: str) -> bool:
-    """Runs compiled.search(value) in a forked child process with a hard wall-clock timeout.
-    If the match doesn't finish in time, the child is forcibly terminated (SIGTERM, then
-    SIGKILL if it doesn't die promptly) — this is the part a thread-based approach cannot do.
-    Treats a timeout as "no match" rather than "blocked": failing open on a pathological
-    pattern is safer than a policy bug turning what should be the ALLOW path into a hang."""
-    result_queue = _mp_context.Queue()
-    process = _mp_context.Process(target=_regex_worker, args=(compiled, value, result_queue))
-    process.start()
+async def _match_with_timeout(compiled, value: str) -> MatchOutcome:
+    """Runs compiled.search(value) in a forked child process with a hard wall-clock timeout that
+    starts only once the process is actually running (see _regex_semaphore above — this is what
+    fixes F2). If the match doesn't finish in time, the child is forcibly terminated (SIGTERM,
+    then SIGKILL if it doesn't die promptly) — this is the part a thread-based approach cannot
+    do. Returns MatchOutcome.UNDETERMINED on timeout or infra failure; the caller (_check_param)
+    decides what that means for the block/allow decision — this function no longer makes that
+    call itself, which is what let F2's fail-open happen silently."""
+    async with _regex_semaphore:
+        result_queue = _mp_context.Queue()
+        process = _mp_context.Process(target=_regex_worker, args=(compiled, value, result_queue))
+        process.start()
 
-    loop = asyncio.get_event_loop()
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        try:
+            matched = await loop.run_in_executor(
                 _wait_executor, result_queue.get, True, _REGEX_MATCH_TIMEOUT_SECONDS
-            ),
-            timeout=_REGEX_MATCH_TIMEOUT_SECONDS + 0.2,
-        )
-        process.join(timeout=1.0)
-        return result
-    except asyncio.TimeoutError:
-        logger.warning(
-            "block_pattern match exceeded %.1fs (pattern=%r) — terminating and treating as "
-            "no-match; this pattern is likely vulnerable to catastrophic backtracking and "
-            "should be rewritten",
-            _REGEX_MATCH_TIMEOUT_SECONDS, compiled.pattern,
-        )
-        return False
-    except Exception:
-        # Not the expected timeout — an infra failure (forkserver unavailable, fd/process
-        # limits, queue error). Still fail open (a policy bug must never turn ALLOW into a
-        # hang), but log distinctly so an operator doesn't chase a nonexistent bad regex.
-        logger.exception(
-            "block_pattern match for pattern=%r failed unexpectedly (not a timeout) — "
-            "treating as no-match",
-            compiled.pattern,
-        )
-        return False
-    finally:
-        process.terminate()
-        process.join(timeout=1.0)
-        if process.is_alive():
-            process.kill()
+            )
             process.join(timeout=1.0)
-        result_queue.close()
+            return MatchOutcome.MATCHED if matched else MatchOutcome.NOT_MATCHED
+        except queue.Empty:
+            # The expected timeout path: result_queue.get(True, timeout) raises queue.Empty
+            # when the deadline passes with nothing queued — NOT asyncio.TimeoutError (this
+            # was F10: the pre-fix except clause caught asyncio.TimeoutError specifically, so
+            # queue.Empty always fell through to the generic handler below, and the tuned
+            # actionable warning here was dead code — confirmed uncovered by any test).
+            logger.warning(
+                "block_pattern match exceeded %.1fs (pattern=%r) — terminating and treating as "
+                "UNDETERMINED; this pattern is likely vulnerable to catastrophic backtracking "
+                "and should be rewritten",
+                _REGEX_MATCH_TIMEOUT_SECONDS, compiled.pattern,
+            )
+            return MatchOutcome.UNDETERMINED
+        except Exception:
+            # Not the expected timeout — an infra failure (forkserver unavailable, fd/process
+            # limits, queue error). Logged distinctly (F10) so an operator doesn't chase a
+            # nonexistent bad regex when the real cause is environmental.
+            logger.exception(
+                "block_pattern match for pattern=%r failed unexpectedly (not a timeout) — "
+                "treating as UNDETERMINED",
+                compiled.pattern,
+            )
+            return MatchOutcome.UNDETERMINED
+        finally:
+            process.terminate()
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1.0)
+            result_queue.close()
 
 
 @dataclass
@@ -131,8 +163,19 @@ async def _check_param(name: str, value: Any, rule: ParamRule) -> Optional[tuple
         return ("max_length", f"len={len(s)} exceeds max={rule.max_length}")
 
     for compiled in rule.compiled_patterns():
-        if await _match_with_timeout(compiled, s):
+        outcome = await _match_with_timeout(compiled, s)
+        if outcome is MatchOutcome.MATCHED:
             return ("block_pattern", compiled.pattern)
+        if outcome is MatchOutcome.UNDETERMINED:
+            # F2 fix: a timeout or infra failure on an operator-authored block_pattern rule is
+            # treated as a match, not a pass. The old fail-open-on-timeout design meant a
+            # request could disable enforcement just by generating enough concurrent load —
+            # confirmed by the reviewer with a 40-concurrent-request probe that dropped block
+            # rate from 10/10 to 0/10. Failing closed here means a genuinely pathological
+            # pattern degrades to "blocks everything it's checked against" instead of "blocks
+            # nothing under load" — visible and loud rather than a silent bypass. See
+            # docs/policy-cookbook.md for the operator-facing explanation of this trade-off.
+            return ("block_pattern_undetermined", compiled.pattern)
 
     if rule.max_value is not None:
         try:

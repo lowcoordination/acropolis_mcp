@@ -139,6 +139,30 @@ async def test_login_before_setup_rejected(client):
     assert resp.status_code == 400
 
 
+async def test_login_rate_limited_after_repeated_wrong_passwords(client, app_transport):
+    """F16 regression (review 2026-08-04): /login had NO throttling at all — an unthrottled
+    single-password login guarding the sole credential for the entire gateway. This fires more
+    than the configured bucket size (10/minute) of wrong-password attempts and asserts a 429
+    eventually replaces the 401s, proving the rate limiter is actually wired into this route."""
+    await client.post("/api/v1/setup", json={"admin_password": "correct-horse-battery"})
+
+    statuses = []
+    async with httpx.AsyncClient(transport=app_transport, base_url="http://argus.test") as fresh:
+        for _ in range(15):
+            resp = await fresh.post("/api/v1/login", json={"admin_password": "wrong"})
+            statuses.append(resp.status_code)
+
+        assert 401 in statuses, "expected some wrong-password attempts to be rejected normally"
+        assert 429 in statuses, (
+            "expected the login rate limiter to kick in after repeated attempts — got: " + str(statuses)
+        )
+        # Once rate-limited, the correct password must ALSO be rejected (429, not 200) — the
+        # limit gates the endpoint, not just wrong-password guesses, which is what makes it
+        # effective against a credential-stuffing style attack.
+        final = await fresh.post("/api/v1/login", json={"admin_password": "correct-horse-battery"})
+        assert final.status_code == 429
+
+
 async def test_logout_clears_session(client):
     await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
     assert (await client.get("/api/v1/servers")).status_code == 200
@@ -147,4 +171,66 @@ async def test_logout_clears_session(client):
     assert logout.status_code == 200
 
     resp = await client.get("/api/v1/servers")
+    assert resp.status_code == 401
+
+
+async def test_logout_all_invalidates_a_different_sessions_cookie(client, app_transport):
+    """F18 regression (review 2026-08-04): pre-fix, POST /logout only cleared the CALLER's
+    cookie — the token itself stayed cryptographically valid server-side for its full 7 days.
+    A stolen cookie could not be invalidated short of hand-editing the settings table. This is
+    the actual security property F18 buys: revoking a session another client is still holding."""
+    setup = await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
+    stolen_cookie = setup.cookies.get("acropolis_session")
+    assert stolen_cookie is not None
+
+    # A second, independent client presenting the SAME cookie value — simulating an attacker
+    # who exfiltrated it via some other means (this is what F1/F5 in Plan 1 closed off, but the
+    # cookie could leak via other channels too — this test is specifically about revocation).
+    async with httpx.AsyncClient(
+        transport=app_transport, base_url="http://argus.test", cookies={"acropolis_session": stolen_cookie},
+    ) as attacker:
+        assert (await attacker.get("/api/v1/servers")).status_code == 200  # cookie is valid
+
+        # The real admin invalidates every outstanding session, including their own.
+        revoke = await client.post("/api/v1/logout-all")
+        assert revoke.status_code == 200
+
+        # The stolen cookie — same bytes, never touched — is now rejected.
+        assert (await attacker.get("/api/v1/servers")).status_code == 401
+
+
+async def test_change_password_invalidates_other_sessions_but_not_the_caller(client, app_transport):
+    """F18: change-password bumps session_version (revoking every OTHER outstanding session)
+    but issues the caller a fresh token at the new version, so changing your own password
+    doesn't lock yourself out."""
+    await client.post("/api/v1/setup", json={"admin_password": "old-password-123"})
+    original_cookie = client.cookies.get("acropolis_session")
+
+    resp = await client.post(
+        "/api/v1/change-password",
+        json={"current_password": "old-password-123", "new_password": "new-password-456"},
+    )
+    assert resp.status_code == 200
+
+    # The caller's own client (httpx auto-updates its cookie jar from Set-Cookie) still works.
+    assert (await client.get("/api/v1/servers")).status_code == 200
+
+    # A DIFFERENT client holding the pre-change cookie is now rejected.
+    async with httpx.AsyncClient(
+        transport=app_transport, base_url="http://argus.test", cookies={"acropolis_session": original_cookie},
+    ) as other:
+        assert (await other.get("/api/v1/servers")).status_code == 401
+
+    # The new password logs in fine; the old one is rejected.
+    async with httpx.AsyncClient(transport=app_transport, base_url="http://argus.test") as fresh:
+        assert (await fresh.post("/api/v1/login", json={"admin_password": "old-password-123"})).status_code == 401
+        assert (await fresh.post("/api/v1/login", json={"admin_password": "new-password-456"})).status_code == 200
+
+
+async def test_change_password_rejects_wrong_current_password(client):
+    await client.post("/api/v1/setup", json={"admin_password": "correct-current"})
+    resp = await client.post(
+        "/api/v1/change-password",
+        json={"current_password": "wrong-current", "new_password": "new-password-456"},
+    )
     assert resp.status_code == 401

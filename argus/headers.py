@@ -34,6 +34,33 @@ def strip_hop_by_hop(raw_headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes
     return [(k, v) for k, v in raw_headers if k.lower() not in HOP_BY_HOP_HEADERS]
 
 
+# F19 fix (review 2026-08-04): the upstream response used to be relayed with headers=dict(
+# r.headers) — every header the upstream sent, unfiltered, straight to the browser. Since the
+# SPA and /mcp/* share an origin, a malicious or compromised upstream could emit Set-Cookie on
+# the ACROPOLIS origin (can't forge a valid signed admin session — see archon/sessions.py's
+# HMAC — but can clobber the admin's real cookie as a denial-of-service), or inject
+# caching/content-type directives the browser then trusts as if Acropolis itself sent them.
+# Relaying upstream transfer-encoding/content-length while Starlette re-frames the streamed
+# body is also a request-smuggling hazard behind some reverse proxies. Allowlist instead of
+# denylist: only forward headers a legitimate MCP JSON-RPC response actually needs, so a newly
+# invented dangerous header doesn't silently start passing through unnoticed.
+ALLOWED_RESPONSE_HEADERS = frozenset(
+    {
+        b"content-type",
+        b"cache-control",
+        b"mcp-session-id",
+        b"mcp-protocol-version",
+    }
+)
+
+
+def filter_response_headers(headers) -> dict[str, str]:
+    """Allowlists upstream response headers before they're relayed to the browser. `headers`
+    accepts anything supporting .items() with str keys (httpx.Headers, dict) — always
+    lower-cased for comparison since HTTP header names are case-insensitive."""
+    return {k: v for k, v in headers.items() if k.lower().encode() in ALLOWED_RESPONSE_HEADERS}
+
+
 # MCP spec 2026-07-28: required routing headers on Streamable HTTP POST requests.
 MCP_METHOD_HEADER = "Mcp-Method"
 MCP_NAME_HEADER = "Mcp-Name"

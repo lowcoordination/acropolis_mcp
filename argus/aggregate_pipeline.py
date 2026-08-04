@@ -62,6 +62,14 @@ class AggregatePipeline:
         except json.JSONDecodeError:
             body_json = None
 
+        # F11 fix (review 2026-08-04): a JSON-RPC batch (top-level array — spec-legal) parses
+        # successfully but isn't a dict, so body_json.get(...) below would raise
+        # AttributeError -> unhandled 500. Confirmed:
+        # `[{"jsonrpc":"2.0","id":1,"method":"ping"}]` crashed pre-fix. Same fix as
+        # argus/pipeline.py's _process — treat non-dict JSON the same as unparseable JSON.
+        if not isinstance(body_json, dict):
+            body_json = None
+
         if body_json is None:
             return Response(
                 content=rpc_error(None, "aggregate endpoint requires a JSON-RPC body"),

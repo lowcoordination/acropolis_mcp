@@ -77,6 +77,23 @@ Treat a blocklist like this as a speed bump, not a sandbox — regex matching on
 string can't catch every way to express the same intent. If a tool is dangerous enough that
 you don't trust a blocklist, deny it outright instead.
 
+### What happens if a pattern is slow
+
+Every `block_patterns` match runs with a hard 0.5s timeout in an isolated process, so a
+pathological regex (accidentally vulnerable to catastrophic backtracking, or just slow against
+unusually long input) can never hang a request or stall the event loop. If a match can't
+complete in time — whether because the pattern is genuinely slow or the gateway is under heavy
+concurrent load — **the call is blocked**, the same as an actual match. The audit log records
+this as `rule: block_pattern_undetermined` rather than `block_pattern`, so you can tell the two
+apart.
+
+This is a deliberate fail-*closed* choice: a rule you explicitly wrote should never silently
+stop enforcing just because the gateway is busy. If you see `block_pattern_undetermined`
+appearing regularly in the audit log, it usually means the pattern itself needs simplifying
+(anchor it more tightly, avoid nested quantifiers like `(a+)+`) rather than the gateway being
+overloaded — a well-formed pattern against realistic input completes in well under a
+millisecond.
+
 ## Recipe: deny a parameter outright (the SSRF case)
 
 Some tools take a parameter that's fine most of the time but dangerous in a specific shape —

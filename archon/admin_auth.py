@@ -4,7 +4,7 @@ import hmac
 
 from fastapi import Header, HTTPException, Request
 
-from archon.sessions import SESSION_COOKIE_NAME, verify_session_token
+from archon.sessions import DEFAULT_SESSION_VERSION, SESSION_COOKIE_NAME, verify_session_token
 from db.repo import SettingsRepo
 
 
@@ -48,6 +48,12 @@ async def require_admin(
     if session_secret is None:
         raise HTTPException(status_code=401, detail="server misconfigured: no session secret")
 
+    # F18: current_session_version is read live from settings on every request, same DB-is-
+    # authoritative pattern as auth_mode — a version bump (logout-all, password change) must
+    # invalidate outstanding tokens on the very next request, not require a restart.
+    stored_version = await settings_repo.get("session_version")
+    current_session_version = int(stored_version) if stored_version is not None else DEFAULT_SESSION_VERSION
+
     cookie = request.cookies.get(SESSION_COOKIE_NAME)
-    if not cookie or not verify_session_token(cookie, session_secret):
+    if not cookie or not verify_session_token(cookie, session_secret, current_session_version):
         raise HTTPException(status_code=401, detail="not authenticated")

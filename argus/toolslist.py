@@ -24,13 +24,19 @@ class ToolsCache:
         self._bridge = bridge
 
     @property
-    def _conn(self) -> aiosqlite.Connection:
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
         assert self._db.gateway is not None
         self._db.gateway.row_factory = aiosqlite.Row
         return self._db.gateway
 
     async def _cached_rows(self, server_id: int) -> list[aiosqlite.Row]:
-        cur = await self._conn.execute(
+        cur = await self._read.execute(
             "SELECT * FROM tools_cache WHERE server_id = ? ORDER BY tool_name", (server_id,)
         )
         return list(await cur.fetchall())
@@ -77,21 +83,33 @@ class ToolsCache:
     async def _store(
         self, server_id: int, tools: list[dict], ttl_ms: Optional[int], cache_scope: Optional[str]
     ) -> None:
-        await self._conn.execute("DELETE FROM tools_cache WHERE server_id = ?", (server_id,))
-        now = utcnow()
-        for tool in tools:
-            await self._conn.execute(
-                """INSERT INTO tools_cache (server_id, tool_name, definition_json, ttl_ms, cache_scope, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (server_id, tool["name"], json.dumps(tool), ttl_ms, cache_scope, now),
-            )
-        await self._conn.commit()
+        # F7: DELETE-then-N-INSERT, same shape as ServerRepo.set_policy — serialize through the
+        # write lock + explicit transaction so a concurrent reader (a different connection) never
+        # observes the gap. The INSERT-OR-REPLACE + malformed-tool-name hardening this method
+        # still needs is tracked as Plan 3 scope (03-reliability-and-ops.md §26); this only
+        # closes the same-shape isolation gap F7 targets.
+        async with self._db.gateway_write_lock:
+            await self._write.execute("BEGIN IMMEDIATE")
+            try:
+                await self._write.execute("DELETE FROM tools_cache WHERE server_id = ?", (server_id,))
+                now = utcnow()
+                for tool in tools:
+                    await self._write.execute(
+                        """INSERT INTO tools_cache (server_id, tool_name, definition_json, ttl_ms, cache_scope, fetched_at)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (server_id, tool["name"], json.dumps(tool), ttl_ms, cache_scope, now),
+                    )
+                await self._write.commit()
+            except BaseException:
+                await self._write.rollback()
+                raise
 
     async def invalidate(self, server_id: int) -> None:
         """Called on policy write — a stale filtered list would otherwise show a tool that
         was just denied, or hide one that was just allowed."""
-        await self._conn.execute("DELETE FROM tools_cache WHERE server_id = ?", (server_id,))
-        await self._conn.commit()
+        async with self._db.gateway_write_lock:
+            await self._write.execute("DELETE FROM tools_cache WHERE server_id = ?", (server_id,))
+            await self._write.commit()
 
     async def get_filtered_tools(
         self, server_id: int, upstream_url: str, policy: ServerPolicy

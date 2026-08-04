@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Optional
 
 import aiosqlite
@@ -35,31 +36,42 @@ def _row_to_server(row: aiosqlite.Row) -> ServerRecord:
 
 
 class ServerRepo:
-    """CRUD for `servers` + their attached `server_policies` / `tool_policies` / `param_rules`."""
+    """CRUD for `servers` + their attached `server_policies` / `tool_policies` / `param_rules`.
+
+    F7: reads and writes go through SEPARATE connections (see Database's docstring) — writes
+    additionally serialize through `gateway_write_lock` and use an explicit transaction so a
+    multi-statement write (create, set_policy) is atomic from every reader's perspective, not
+    just readable-or-not on the writer's own connection."""
 
     def __init__(self, db: Database):
         self._db = db
 
     @property
-    def _conn(self) -> aiosqlite.Connection:
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
         assert self._db.gateway is not None
         self._db.gateway.row_factory = aiosqlite.Row
         return self._db.gateway
 
     async def list(self) -> list[ServerRecord]:
-        cur = await self._conn.execute("SELECT * FROM servers ORDER BY slug")
+        cur = await self._read.execute("SELECT * FROM servers ORDER BY slug")
         rows = await cur.fetchall()
         return [_row_to_server(r) for r in rows]
 
     async def get(self, slug: str) -> ServerRecord:
-        cur = await self._conn.execute("SELECT * FROM servers WHERE slug = ?", (slug,))
+        cur = await self._read.execute("SELECT * FROM servers WHERE slug = ?", (slug,))
         row = await cur.fetchone()
         if row is None:
             raise ServerNotFoundError(slug)
         return _row_to_server(row)
 
     async def get_by_id(self, server_id: int) -> ServerRecord:
-        cur = await self._conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,))
+        cur = await self._read.execute("SELECT * FROM servers WHERE id = ?", (server_id,))
         row = await cur.fetchone()
         if row is None:
             raise ServerNotFoundError(str(server_id))
@@ -73,22 +85,30 @@ class ServerRepo:
         enabled: bool = True,
         in_aggregate: bool = True,
     ) -> ServerRecord:
-        existing = await self._conn.execute("SELECT 1 FROM servers WHERE slug = ?", (slug,))
-        if await existing.fetchone() is not None:
-            raise SlugConflictError(slug)
+        # F7: two-table write (servers + server_policies) — serialize against other gateway.db
+        # writers so a concurrent commit can't land between the INSERT and its paired policy row.
+        async with self._db.gateway_write_lock:
+            existing = await self._write.execute("SELECT 1 FROM servers WHERE slug = ?", (slug,))
+            if await existing.fetchone() is not None:
+                raise SlugConflictError(slug)
 
-        now = utcnow()
-        cur = await self._conn.execute(
-            """INSERT INTO servers
-               (slug, name, upstream_url, enabled, in_aggregate, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (slug, name, upstream_url, int(enabled), int(in_aggregate), now, now),
-        )
-        await self._conn.execute(
-            "INSERT INTO server_policies (server_id, mode, updated_at) VALUES (?, 'passthrough', ?)",
-            (cur.lastrowid, now),
-        )
-        await self._conn.commit()
+            await self._write.execute("BEGIN IMMEDIATE")
+            try:
+                now = utcnow()
+                cur = await self._write.execute(
+                    """INSERT INTO servers
+                       (slug, name, upstream_url, enabled, in_aggregate, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (slug, name, upstream_url, int(enabled), int(in_aggregate), now, now),
+                )
+                await self._write.execute(
+                    "INSERT INTO server_policies (server_id, mode, updated_at) VALUES (?, 'passthrough', ?)",
+                    (cur.lastrowid, now),
+                )
+                await self._write.commit()
+            except BaseException:
+                await self._write.rollback()
+                raise
         return await self.get(slug)
 
     async def update(
@@ -118,44 +138,47 @@ class ServerRepo:
         fields.append("updated_at = ?")
         values.append(utcnow())
         values.append(current.id)
-        await self._conn.execute(f"UPDATE servers SET {', '.join(fields)} WHERE id = ?", values)
-        await self._conn.commit()
+        async with self._db.gateway_write_lock:
+            await self._write.execute(f"UPDATE servers SET {', '.join(fields)} WHERE id = ?", values)
+            await self._write.commit()
         return await self.get(slug)
 
     async def delete(self, slug: str) -> None:
         current = await self.get(slug)
-        await self._conn.execute("DELETE FROM servers WHERE id = ?", (current.id,))
-        await self._conn.commit()
+        async with self._db.gateway_write_lock:
+            await self._write.execute("DELETE FROM servers WHERE id = ?", (current.id,))
+            await self._write.commit()
 
     async def set_health(
         self, slug: str, health_status: str, upstream_protocol: Optional[str] = None,
         discover_json: Optional[str] = None,
     ) -> None:
         current = await self.get(slug)
-        await self._conn.execute(
-            """UPDATE servers SET health_status = ?, upstream_protocol = COALESCE(?, upstream_protocol),
-               discover_json = COALESCE(?, discover_json), last_seen_at = ?, updated_at = ?
-               WHERE id = ?""",
-            (health_status, upstream_protocol, discover_json, utcnow(), utcnow(), current.id),
-        )
-        await self._conn.commit()
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                """UPDATE servers SET health_status = ?, upstream_protocol = COALESCE(?, upstream_protocol),
+                   discover_json = COALESCE(?, discover_json), last_seen_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (health_status, upstream_protocol, discover_json, utcnow(), utcnow(), current.id),
+            )
+            await self._write.commit()
 
     async def get_policy(self, server_id: int) -> ServerPolicy:
-        cur = await self._conn.execute(
+        cur = await self._read.execute(
             "SELECT mode, rate_limit FROM server_policies WHERE server_id = ?", (server_id,)
         )
         row = await cur.fetchone()
         mode = row["mode"] if row else "passthrough"
         rate_limit = row["rate_limit"] if row else None
 
-        cur = await self._conn.execute(
+        cur = await self._read.execute(
             "SELECT tool_name, action FROM tool_policies WHERE server_id = ?", (server_id,)
         )
         rows = await cur.fetchall()
         allowed = [r["tool_name"] for r in rows if r["action"] == "allow"]
         denied = [r["tool_name"] for r in rows if r["action"] == "deny"]
 
-        cur = await self._conn.execute(
+        cur = await self._read.execute(
             """SELECT tool_name, param_name, max_length, max_value, min_value, denied, block_patterns
                FROM param_rules WHERE server_id = ?""",
             (server_id,),
@@ -176,45 +199,70 @@ class ServerRepo:
         )
 
     async def set_policy(self, server_id: int, policy: ServerPolicy) -> None:
-        await self._conn.execute(
-            """INSERT INTO server_policies (server_id, mode, rate_limit, updated_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(server_id) DO UPDATE SET mode=excluded.mode,
-                   rate_limit=excluded.rate_limit, updated_at=excluded.updated_at""",
-            (server_id, policy.mode, policy.rate_limit, utcnow()),
-        )
-        await self._conn.execute("DELETE FROM tool_policies WHERE server_id = ?", (server_id,))
-        for tool_name in policy.allowed:
-            await self._conn.execute(
-                "INSERT INTO tool_policies (server_id, tool_name, action) VALUES (?, ?, 'allow')",
-                (server_id, tool_name),
-            )
-        for tool_name in policy.denied:
-            await self._conn.execute(
-                "INSERT INTO tool_policies (server_id, tool_name, action) VALUES (?, ?, 'deny')",
-                (server_id, tool_name),
-            )
-        await self._conn.execute("DELETE FROM param_rules WHERE server_id = ?", (server_id,))
-        for tool_name, params in policy.param_rules.items():
-            for param_name, rule in params.items():
-                await self._conn.execute(
-                    """INSERT INTO param_rules
-                       (server_id, tool_name, param_name, max_length, max_value, min_value, denied, block_patterns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        server_id, tool_name, param_name, rule.max_length, rule.max_value,
-                        rule.min_value, int(rule.denied), json.dumps(rule.block_patterns),
-                    ),
+        # F7: this is the exact multi-statement write (DELETE-then-reinsert across three
+        # tables) that motivated the read/write connection split — see Database's docstring.
+        # Readers use a SEPARATE WAL connection, so they only ever see the state before this
+        # BEGIN IMMEDIATE or after this COMMIT — never the gap in between.
+        async with self._db.gateway_write_lock:
+            await self._write.execute("BEGIN IMMEDIATE")
+            try:
+                await self._write.execute(
+                    """INSERT INTO server_policies (server_id, mode, rate_limit, updated_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(server_id) DO UPDATE SET mode=excluded.mode,
+                           rate_limit=excluded.rate_limit, updated_at=excluded.updated_at""",
+                    (server_id, policy.mode, policy.rate_limit, utcnow()),
                 )
-        await self._conn.commit()
+                await self._write.execute("DELETE FROM tool_policies WHERE server_id = ?", (server_id,))
+                for tool_name in policy.allowed:
+                    await self._write.execute(
+                        "INSERT INTO tool_policies (server_id, tool_name, action) VALUES (?, ?, 'allow')",
+                        (server_id, tool_name),
+                    )
+                for tool_name in policy.denied:
+                    await self._write.execute(
+                        "INSERT INTO tool_policies (server_id, tool_name, action) VALUES (?, ?, 'deny')",
+                        (server_id, tool_name),
+                    )
+                await self._write.execute("DELETE FROM param_rules WHERE server_id = ?", (server_id,))
+                for tool_name, params in policy.param_rules.items():
+                    for param_name, rule in params.items():
+                        await self._write.execute(
+                            """INSERT INTO param_rules
+                               (server_id, tool_name, param_name, max_length, max_value, min_value, denied, block_patterns)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                server_id, tool_name, param_name, rule.max_length, rule.max_value,
+                                rule.min_value, int(rule.denied), json.dumps(rule.block_patterns),
+                            ),
+                        )
+                await self._write.commit()
+            except BaseException:
+                await self._write.rollback()
+                raise
 
 
 class ApiKeyRepo:
+    # F7: touch_last_used used to commit() on every authenticated data-plane request — a
+    # gratuitous disk write on its own, and the specific trigger that made set_policy's
+    # DELETE-then-reinsert race real (see Database's docstring). Debounced in-process rather
+    # than removed outright, since "last used" is still useful for an operator auditing which
+    # keys are stale — freshness within this window is a fine trade for not writing on every
+    # single proxied call.
+    _TOUCH_DEBOUNCE_SECONDS = 60
+
     def __init__(self, db: Database):
         self._db = db
+        self._last_touch: dict[int, float] = {}
 
     @property
-    def _conn(self) -> aiosqlite.Connection:
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
         assert self._db.gateway is not None
         self._db.gateway.row_factory = aiosqlite.Row
         return self._db.gateway
@@ -222,46 +270,55 @@ class ApiKeyRepo:
     async def create(self, name: str, key_hash: str, key_prefix: str,
                       server_scopes: Optional[list[str]] = None) -> ApiKeyRecord:
         now = utcnow()
-        cur = await self._conn.execute(
-            """INSERT INTO api_keys (name, key_hash, key_prefix, server_scopes, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (name, key_hash, key_prefix, json.dumps(server_scopes) if server_scopes else None, now),
-        )
-        await self._conn.commit()
+        async with self._db.gateway_write_lock:
+            cur = await self._write.execute(
+                """INSERT INTO api_keys (name, key_hash, key_prefix, server_scopes, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (name, key_hash, key_prefix, json.dumps(server_scopes) if server_scopes else None, now),
+            )
+            await self._write.commit()
         return await self.get_by_id(cur.lastrowid)
 
     async def get_by_id(self, key_id: int) -> ApiKeyRecord:
-        cur = await self._conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,))
+        cur = await self._read.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,))
         row = await cur.fetchone()
         if row is None:
             raise ServerNotFoundError(str(key_id))
         return self._row_to_record(row)
 
     async def get_by_hash(self, key_hash: str) -> Optional[ApiKeyRecord]:
-        cur = await self._conn.execute(
+        cur = await self._read.execute(
             "SELECT * FROM api_keys WHERE key_hash = ? AND enabled = 1", (key_hash,)
         )
         row = await cur.fetchone()
         return self._row_to_record(row) if row else None
 
     async def list(self) -> list[ApiKeyRecord]:
-        cur = await self._conn.execute("SELECT * FROM api_keys ORDER BY created_at DESC")
+        cur = await self._read.execute("SELECT * FROM api_keys ORDER BY created_at DESC")
         rows = await cur.fetchall()
         return [self._row_to_record(r) for r in rows]
 
     async def set_enabled(self, key_id: int, enabled: bool) -> None:
-        await self._conn.execute("UPDATE api_keys SET enabled = ? WHERE id = ?", (int(enabled), key_id))
-        await self._conn.commit()
+        async with self._db.gateway_write_lock:
+            await self._write.execute("UPDATE api_keys SET enabled = ? WHERE id = ?", (int(enabled), key_id))
+            await self._write.commit()
 
     async def delete(self, key_id: int) -> None:
-        await self._conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
-        await self._conn.commit()
+        async with self._db.gateway_write_lock:
+            await self._write.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+            await self._write.commit()
 
     async def touch_last_used(self, key_id: int) -> None:
-        await self._conn.execute(
-            "UPDATE api_keys SET last_used_at = ? WHERE id = ?", (utcnow(), key_id)
-        )
-        await self._conn.commit()
+        now = time.monotonic()
+        last = self._last_touch.get(key_id)
+        if last is not None and (now - last) < self._TOUCH_DEBOUNCE_SECONDS:
+            return
+        self._last_touch[key_id] = now
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                "UPDATE api_keys SET last_used_at = ? WHERE id = ?", (utcnow(), key_id)
+            )
+            await self._write.commit()
 
     @staticmethod
     def _row_to_record(row: aiosqlite.Row) -> ApiKeyRecord:
@@ -352,29 +409,51 @@ class SettingsRepo:
         self._db = db
 
     @property
-    def _conn(self) -> aiosqlite.Connection:
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
         assert self._db.gateway is not None
         self._db.gateway.row_factory = aiosqlite.Row
         return self._db.gateway
 
     async def get(self, key: str) -> Optional[str]:
-        cur = await self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        cur = await self._read.execute("SELECT value FROM settings WHERE key = ?", (key,))
         row = await cur.fetchone()
         return row["value"] if row else None
 
     async def get_all(self) -> dict[str, str]:
-        cur = await self._conn.execute("SELECT key, value FROM settings")
+        cur = await self._read.execute("SELECT key, value FROM settings")
         rows = await cur.fetchall()
         return {r["key"]: r["value"] for r in rows}
 
     async def set(self, key: str, value: str) -> None:
-        await self._conn.execute(
-            """INSERT INTO settings (key, value) VALUES (?, ?)
-               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
-            (key, value),
-        )
-        await self._conn.commit()
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                """INSERT INTO settings (key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (key, value),
+            )
+            await self._write.commit()
 
     async def set_many(self, values: dict[str, str]) -> None:
-        for key, value in values.items():
-            await self.set(key, value)
+        # F7: batch into ONE transaction under the write lock, rather than N separate set()
+        # calls each taking/releasing the lock — avoids interleaving another writer's change
+        # between two settings that are logically saved together (e.g. the setup wizard writing
+        # admin_password_hash + session_secret + auth_mode as one atomic unit).
+        async with self._db.gateway_write_lock:
+            await self._write.execute("BEGIN IMMEDIATE")
+            try:
+                for key, value in values.items():
+                    await self._write.execute(
+                        """INSERT INTO settings (key, value) VALUES (?, ?)
+                           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                        (key, value),
+                    )
+                await self._write.commit()
+            except BaseException:
+                await self._write.rollback()
+                raise

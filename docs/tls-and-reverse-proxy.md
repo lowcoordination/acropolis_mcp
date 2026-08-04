@@ -110,6 +110,13 @@ client), then reload nginx.
   thing reaching Acropolis directly.
 - Re-check the Settings page — the open-mode-over-HTTP warning should disappear once you're
   accessing Acropolis via `https://`.
+- Add `Strict-Transport-Security` at the proxy, not in Acropolis itself. Acropolis sets a small
+  set of security headers on every response (CSP, `X-Frame-Options`, `X-Content-Type-Options`),
+  but deliberately does *not* set HSTS — that's a proxy-layer decision, since Acropolis itself
+  always speaks plain HTTP and doesn't know whether the deployment in front of it terminates
+  TLS. Once you're running behind TLS, add it in your proxy config, e.g. for Caddy:
+  `header Strict-Transport-Security "max-age=31536000"`, or for nginx:
+  `add_header Strict-Transport-Security "max-age=31536000" always;`.
 
 ## What TLS does *not* fix
 

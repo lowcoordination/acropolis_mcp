@@ -21,12 +21,13 @@ from argus.headers import (
     MCP_NAME_HEADER,
     METHODS_REQUIRING_NAME,
     extract_name_from_params,
+    filter_response_headers,
     header_matches_body,
     strip_hop_by_hop,
 )
 from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
 from argus.policy import evaluate
-from argus.rate_limiter import RateLimiterRegistry, api_key_key, server_key, tool_key
+from argus.rate_limiter import RateLimiterRegistry, server_key, tool_key
 from argus.toolslist import ToolsCache
 from db.models import ServerRecord
 from db.repo import ServerRepo, SettingsRepo
@@ -210,6 +211,16 @@ class Pipeline:
             except json.JSONDecodeError:
                 body_json = None
 
+            # F11 fix (review 2026-08-04): a JSON-RPC batch (a top-level array — spec-legal) or
+            # a bare top-level JSON string/number both parse successfully but aren't a dict, so
+            # body_json.get(...) below would raise AttributeError -> unhandled 500. Confirmed:
+            # `[{"jsonrpc":"2.0","id":1,"method":"ping"}]` and a bare `"hello"` body both
+            # crashed the pipeline pre-fix. Treat anything non-dict the same as unparseable —
+            # falls through to the PASSTHROUGH/forward path below with rpc_method="" untouched,
+            # same as today's un-parseable-JSON case, rather than inventing new handling.
+            if not isinstance(body_json, dict):
+                body_json = None
+
             if body_json is not None:
                 rpc_id = body_json.get("id")
                 rpc_method = body_json.get("method", "")
@@ -246,8 +257,13 @@ class Pipeline:
                     )
 
                 if rpc_method == "tools/call":
-                    tool_name = body_json.get("params", {}).get("name")
-                    arguments = body_json.get("params", {}).get("arguments") or {}
+                    # F11 fix: this used to re-read body_json.get("params", {}) from scratch
+                    # instead of reusing the `params` local computed above (line 216, which
+                    # already has the `or {}` guard) — re-introducing the exact
+                    # params-can-be-None crash two lines after it was fixed for the `params`
+                    # local. Reuse `params` here so there's only one place this is guarded.
+                    tool_name = params.get("name")
+                    arguments = params.get("arguments") or {}
 
                     if not tool_name or not isinstance(tool_name, str):
                         await self._audit.log(
@@ -400,21 +416,42 @@ class Pipeline:
     async def _check_rate_limits(
         self, server: ServerRecord, tool_name: str, api_key_id: Optional[int], rpc_id: Any, start: float
     ) -> Optional[Response]:
-        # Lazily (re)register the server-level bucket from its current policy. Cheap: register()
-        # only replaces the dict entry, and unregistered keys are treated as unlimited, so a
-        # server with no rate_limit configured never gets a bucket at all.
-        # NOTE (tracked gap, not M1 scope): tool_policies.rate_limit exists in the DB schema but
-        # ServerPolicy doesn't surface per-tool limits yet, so only the server-level limit is
-        # enforced here — matches what the real guard-config.yml fleet actually used.
+        # F8 fix (review 2026-08-04): this used to be `if policy.rate_limit and not
+        # is_registered(srv_key): register(...)` — a bucket was built ONCE per process and
+        # never refreshed, so an operator raising a limit from 5/minute to 500/minute got a 200
+        # from the API but the gateway kept enforcing 5/minute until restart. The fix can't be
+        # "just always call register()" either — TokenBucket construction resets consumed
+        # state, so registering fresh on every request would hand every caller an always-full
+        # bucket and defeat rate limiting entirely. Instead: (re)register only when the SPEC
+        # STRING has actually changed since it was last registered for this key, via
+        # RateLimiterRegistry.ensure_current — a no-op on the hot path once the bucket matches
+        # the live policy, but picks up an operator's change on the very next request.
+        #
+        # F9 fix (review 2026-08-04): tool_key(...) and the now-removed api_key_key(...) were
+        # both constructed and passed to check_all() here, but nothing anywhere ever called
+        # register() for either — check_all() treats an unregistered key as "unlimited", so
+        # both lookups always passed regardless of load. A compromised or runaway API key had
+        # NO rate limit whatsoever, despite the code reading as though one was enforced.
+        #
+        # Per-tool limits: the DB column (tool_policies.rate_limit) exists but ServerPolicy
+        # doesn't surface it — documented as a tracked gap on tool_key()'s own docstring rather
+        # than silently dropped, since it matches what the real guard-config.yml fleet actually
+        # configured (server-level only).
+        #
+        # Per-API-key limits: there is currently no schema field to configure one (api_keys has
+        # no rate_limit column) — adding one is a real feature (migration + API + UI), out of
+        # scope for this fix. Removed the dead api_key_key construction rather than leave code
+        # that LOOKED like it enforced a per-key limit while doing nothing; see F23-adjacent
+        # design-gap note in the vault (03-reliability-and-ops.md) for where to land it.
         policy = await self._servers.get_policy(server.id)
         srv_key = server_key(server.slug)
-        if policy.rate_limit and not self._rate_limiter.is_registered(srv_key):
-            self._rate_limiter.register(srv_key, policy.rate_limit)
+        if policy.rate_limit:
+            self._rate_limiter.ensure_current(srv_key, policy.rate_limit)
+        else:
+            self._rate_limiter.unregister(srv_key)
 
         keys = [srv_key] if policy.rate_limit else []
         keys.append(tool_key(server.slug, tool_name))
-        if api_key_id is not None:
-            keys.append(api_key_key(api_key_id))
         if not await self._rate_limiter.check_all(keys):
             await self._audit.log(
                 server_slug=server.slug, tool=tool_name, decision="BLOCKED",
@@ -451,6 +488,6 @@ class Pipeline:
         r = await self._client.send(upstream_req, stream=True)
 
         return StreamingResponse(
-            r.aiter_raw(), status_code=r.status_code, headers=dict(r.headers),
-            background=BackgroundTask(r.aclose),
+            r.aiter_raw(), status_code=r.status_code,
+            headers=filter_response_headers(r.headers), background=BackgroundTask(r.aclose),
         )

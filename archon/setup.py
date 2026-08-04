@@ -1,13 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from archon.passwords import hash_password, verify_password
-from archon.schemas import LoginRequest, SetupRequest, SetupStatusResponse
-from archon.sessions import SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, create_session_token
+from archon.schemas import LoginRequest, PasswordChangeRequest, SetupRequest, SetupStatusResponse
+from archon.sessions import (
+    DEFAULT_SESSION_VERSION,
+    SESSION_COOKIE_NAME,
+    SESSION_MAX_AGE_SECONDS,
+    create_session_token,
+)
+from argus.rate_limiter import RateLimiterRegistry
 from db.repo import SettingsRepo
+
+# F16 fix (review 2026-08-04): no throttling existed on /login or /setup at all. PBKDF2-SHA256
+# at 600k iterations costs ~67ms/attempt — correct, OWASP-compliant work, but with no lockout it
+# still permits ~15 guesses/sec sustained against an 8-character-minimum password that is the
+# SOLE credential for the entire gateway. Per-source-IP token bucket, reusing the same
+# RateLimiterRegistry the data plane already uses. Generous enough not to lock out a legitimate
+# admin who mistypes a password a few times, tight enough to make sustained guessing impractical.
+_LOGIN_RATE_LIMIT_SPEC = "10/minute"
 
 
 def _request_is_https(request: Request) -> bool:
@@ -20,9 +36,23 @@ def _request_is_https(request: Request) -> bool:
     return forwarded_proto == "https" or request.url.scheme == "https"
 
 
-def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+async def _current_session_version(settings_repo: SettingsRepo) -> int:
+    stored = await settings_repo.get("session_version")
+    return int(stored) if stored is not None else DEFAULT_SESSION_VERSION
+
+
+def build_setup_router(
+    settings_repo: SettingsRepo, rate_limiter: Optional[RateLimiterRegistry] = None
+) -> APIRouter:
     """Setup and login endpoints — deliberately NOT behind require_admin, since they're how
-    an admin gets established (setup) or authenticated (login) in the first place."""
+    an admin gets established (setup) or authenticated (login) in the first place.
+
+    `rate_limiter` is optional only so existing direct-construction call sites (tests) don't
+    break; every real deployment via create_app() passes the shared RateLimiterRegistry."""
     router = APIRouter(prefix="/api/v1")
 
     @router.get("/setup/status", response_model=SetupStatusResponse)
@@ -32,6 +62,15 @@ def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
 
     @router.post("/setup", response_model=SetupStatusResponse)
     async def complete_setup(body: SetupRequest, request: Request, response: Response):
+        # F16: rate-limit setup attempts per source IP too — the pre-setup window is the
+        # highest-value target of all (whoever completes it first becomes the admin).
+        if rate_limiter is not None:
+            key = f"setup:{_client_ip(request)}"
+            if not rate_limiter.is_registered(key):
+                rate_limiter.register(key, _LOGIN_RATE_LIMIT_SPEC)
+            if not await rate_limiter.check(key):
+                raise HTTPException(status_code=429, detail="too many setup attempts, slow down")
+
         existing = await settings_repo.get("admin_password_hash")
         if existing is not None:
             raise HTTPException(status_code=409, detail="setup has already been completed")
@@ -41,13 +80,21 @@ def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
             raise HTTPException(status_code=400, detail="auth_mode must be 'open' or 'keyed'")
 
         session_secret = secrets.token_hex(32)
+        # F16: hash_password runs PBKDF2-HMAC-SHA256 at 600k iterations synchronously — ~67ms
+        # of pure CPU with the GIL held. Called directly inside `async def`, that blocks the
+        # SINGLE event loop thread for the duration, stalling every other in-flight request
+        # (data plane included) for as long as the hash takes. run_in_executor moves it off
+        # the loop thread; a burst of concurrent setup/login attempts then costs thread-pool
+        # contention instead of blocking the whole gateway.
+        loop = asyncio.get_running_loop()
+        password_hash = await loop.run_in_executor(None, hash_password, body.admin_password)
         await settings_repo.set_many({
-            "admin_password_hash": hash_password(body.admin_password),
+            "admin_password_hash": password_hash,
             "session_secret": session_secret,
             "auth_mode": body.auth_mode,
         })
 
-        token = create_session_token(session_secret)
+        token = create_session_token(session_secret, session_version=DEFAULT_SESSION_VERSION)
         response.set_cookie(
             SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
             httponly=True, samesite="lax", secure=_request_is_https(request),
@@ -56,16 +103,37 @@ def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
 
     @router.post("/login")
     async def login(body: LoginRequest, request: Request, response: Response):
+        # F16: per-source-IP token bucket ahead of the password check — an unthrottled login
+        # guarding the sole credential for the entire gateway is not an acceptable posture,
+        # especially once anything is reachable off a trusted LAN.
+        if rate_limiter is not None:
+            key = f"login:{_client_ip(request)}"
+            if not rate_limiter.is_registered(key):
+                rate_limiter.register(key, _LOGIN_RATE_LIMIT_SPEC)
+            if not await rate_limiter.check(key):
+                raise HTTPException(status_code=429, detail="too many login attempts, slow down")
+
         stored_hash = await settings_repo.get("admin_password_hash")
         if stored_hash is None:
             raise HTTPException(status_code=400, detail="setup has not been completed yet")
-        if not verify_password(body.admin_password, stored_hash):
+
+        # F16: see the identical run_in_executor note on /setup above — verify_password runs
+        # the same synchronous PBKDF2 work and must not block the event loop either.
+        loop = asyncio.get_running_loop()
+        password_ok = await loop.run_in_executor(None, verify_password, body.admin_password, stored_hash)
+        if not password_ok:
             raise HTTPException(status_code=401, detail="incorrect password")
 
         session_secret = await settings_repo.get("session_secret")
-        assert session_secret is not None  # set alongside admin_password_hash at setup time
+        if session_secret is None:
+            # F26 (§26 cleanup, folded in here since it's a one-line change on a line already
+            # being touched): the old `assert session_secret is not None` is stripped entirely
+            # under `python -O`, after which create_session_token(None) raises a confusing
+            # AttributeError instead of a clear error. Explicit raise survives -O.
+            raise HTTPException(status_code=500, detail="server misconfigured: no session secret")
 
-        token = create_session_token(session_secret)
+        current_version = await _current_session_version(settings_repo)
+        token = create_session_token(session_secret, session_version=current_version)
         response.set_cookie(
             SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
             httponly=True, samesite="lax", secure=_request_is_https(request),
@@ -75,6 +143,50 @@ def build_setup_router(settings_repo: SettingsRepo) -> APIRouter:
     @router.post("/logout")
     async def logout(response: Response):
         response.delete_cookie(SESSION_COOKIE_NAME)
+        return {"status": "ok"}
+
+    @router.post("/change-password")
+    async def change_password(body: PasswordChangeRequest, request: Request, response: Response):
+        # F18: a password change is the clearest possible signal that any outstanding session
+        # tokens — including a stolen cookie the admin doesn't know about — should stop working.
+        # Bumping session_version invalidates every previously-issued token in one write.
+        stored_hash = await settings_repo.get("admin_password_hash")
+        if stored_hash is None:
+            raise HTTPException(status_code=400, detail="setup has not been completed yet")
+
+        loop = asyncio.get_running_loop()
+        password_ok = await loop.run_in_executor(
+            None, verify_password, body.current_password, stored_hash
+        )
+        if not password_ok:
+            raise HTTPException(status_code=401, detail="incorrect current password")
+        if len(body.new_password) < 8:
+            raise HTTPException(status_code=400, detail="password must be at least 8 characters")
+
+        new_hash = await loop.run_in_executor(None, hash_password, body.new_password)
+        new_version = await _current_session_version(settings_repo) + 1
+        await settings_repo.set_many({
+            "admin_password_hash": new_hash,
+            "session_version": str(new_version),
+        })
+
+        # Issue the caller a fresh, valid-under-the-new-version token so THEY aren't logged out
+        # by their own password change — only every OTHER outstanding session is invalidated.
+        session_secret = await settings_repo.get("session_secret")
+        if session_secret is not None:
+            token = create_session_token(session_secret, session_version=new_version)
+            response.set_cookie(
+                SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
+                httponly=True, samesite="lax", secure=_request_is_https(request),
+            )
+        return {"status": "ok"}
+
+    @router.post("/logout-all")
+    async def logout_all():
+        # F18: explicit "invalidate every session, including this one" — bumps the version
+        # without issuing a fresh token, unlike change-password's self-preserving bump.
+        new_version = await _current_session_version(settings_repo) + 1
+        await settings_repo.set("session_version", str(new_version))
         return {"status": "ok"}
 
     return router

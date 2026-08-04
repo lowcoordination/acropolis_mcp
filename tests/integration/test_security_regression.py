@@ -16,6 +16,7 @@ import contextlib
 import socket
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
 import httpx
 import pytest
@@ -176,13 +177,15 @@ class TestF1PathTraversalFixed:
 
 class _HeaderCapturingUpstream:
     """A minimal raw TCP listener standing in for an MCP upstream — captures the exact request
-    headers Acropolis forwards, then replies with a bare 200 so the pipeline doesn't error out.
-    Simpler and more honest than mocking: proves what actually crossed the wire."""
+    headers Acropolis forwards, then replies with a bare 200 (plus any `extra_response_headers`
+    the test configured) so the pipeline doesn't error out. Simpler and more honest than
+    mocking: proves what actually crossed the wire in both directions."""
 
-    def __init__(self):
+    def __init__(self, extra_response_headers: Optional[dict[str, str]] = None):
         self.received_headers: dict[str, str] = {}
         self._server: asyncio.AbstractServer | None = None
         self.url = ""
+        self._extra_response_headers = extra_response_headers or {}
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         data = await reader.readuntil(b"\r\n\r\n")
@@ -191,9 +194,12 @@ class _HeaderCapturingUpstream:
                 k, v = line.split(": ", 1)
                 self.received_headers[k.lower()] = v
         body = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+        extra = "".join(f"{k}: {v}\r\n" for k, v in self._extra_response_headers.items())
         writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                f"{extra}Content-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
         )
         await writer.drain()
         writer.close()
@@ -292,6 +298,88 @@ class TestF6UpstreamTraversalFixed:
                     )
                     assert r.status_code == 200
 
-# NOTE: F11 (spec-legal JSON-RPC bodies crashing the pipeline) is Plan 2 scope, not Plan 1 — its
-# fix is not implemented yet, so no regression test for it lives in this module. Add it here when
-# Plan 2's F11 fix lands (see 02-enforcement-and-internet-facing.md in the vault).
+
+# ---------------------------------------------------------------------------
+# F19 (Plan 2 scope) — upstream response headers relayed to the browser must be filtered
+# ---------------------------------------------------------------------------
+
+class TestF19ResponseHeadersFiltered:
+    async def test_malicious_set_cookie_from_upstream_never_reaches_the_browser(self, tmp_path):
+        upstream = _HeaderCapturingUpstream(
+            extra_response_headers={"Set-Cookie": "acropolis_session=attacker-controlled; Max-Age=0"}
+        )
+        await upstream.start()
+        try:
+            async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
+                server_repo = ServerRepo(db)
+                await server_repo.create(slug="test-server", name="Test", upstream_url=upstream.url)
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    r = await client.get("/mcp/test-server/mcp")
+                    assert "set-cookie" not in {k.lower() for k in r.headers}
+        finally:
+            await upstream.stop()
+
+
+# ---------------------------------------------------------------------------
+# F11 (Plan 2 scope) — spec-legal JSON-RPC bodies must not crash the pipeline
+# ---------------------------------------------------------------------------
+
+class TestSpecLegalBodiesDoNotCrash:
+    """A JSON-RPC batch (top-level array) and params: null are both spec-legal shapes. Pre-fix,
+    both reached body_json.get(...)/params.get(...) on a non-dict and raised AttributeError,
+    which escaped as a bare 500 with a stack trace — reachable by any client, trivially.
+
+    These tests need a REAL, reachable upstream: a non-dict body makes _process() fall through
+    to raw passthrough (the same path an unparseable body takes), so with no live upstream the
+    request would 500 for the unrelated, not-yet-fixed reason of F3 (unreachable upstream ->
+    unhandled exception, Plan 3 scope) rather than proving F11 specifically."""
+
+    async def test_batch_body_on_per_server_endpoint_does_not_500(self, tmp_path):
+        async with run_fastmcp_server() as upstream:
+            async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
+                server_repo = ServerRepo(db)
+                await server_repo.create(slug="test-server", name="Test", upstream_url=upstream.url)
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    r = await client.post(
+                        "/mcp/test-server",
+                        content='[{"jsonrpc":"2.0","id":1,"method":"ping"}]',
+                        headers={"Content-Type": "application/json"},
+                    )
+                    assert r.status_code != 500
+
+    async def test_null_params_on_per_server_endpoint_does_not_500(self, tmp_path):
+        async with run_fastmcp_server() as upstream:
+            async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
+                server_repo = ServerRepo(db)
+                await server_repo.create(slug="test-server", name="Test", upstream_url=upstream.url)
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    r = await client.post(
+                        "/mcp/test-server",
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": None},
+                    )
+                    assert r.status_code != 500
+
+    async def test_bare_string_body_on_per_server_endpoint_does_not_500(self, tmp_path):
+        async with run_fastmcp_server() as upstream:
+            async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
+                server_repo = ServerRepo(db)
+                await server_repo.create(slug="test-server", name="Test", upstream_url=upstream.url)
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    r = await client.post(
+                        "/mcp/test-server",
+                        content='"just a string, not an object"',
+                        headers={"Content-Type": "application/json"},
+                    )
+                    assert r.status_code != 500
+
+    async def test_batch_body_on_aggregate_endpoint_does_not_500(self, tmp_path):
+        async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                r = await client.post(
+                    "/mcp",
+                    content='[{"jsonrpc":"2.0","id":1,"method":"ping"}]',
+                    headers={"Content-Type": "application/json"},
+                )
+                assert r.status_code != 500
+                # Non-dict body should get the same clean 400 as an unparseable body, not a 500.
+                assert r.status_code == 400

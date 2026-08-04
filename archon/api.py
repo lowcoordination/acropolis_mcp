@@ -25,6 +25,7 @@ from archon.schemas import (
     StatsResponse,
 )
 from argus.audit import AuditLogger
+from argus.rate_limiter import RateLimiterRegistry, server_key
 from argus.toolslist import ToolsCache
 from db.database import utcnow
 from db.repo import AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
@@ -68,6 +69,7 @@ def build_control_plane_router(
     audit_repo: Optional[AuditRepo] = None,
     audit_logger: Optional[AuditLogger] = None,
     health_poller: Optional[HealthPoller] = None,
+    rate_limiter: Optional[RateLimiterRegistry] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
@@ -142,6 +144,11 @@ def build_control_plane_router(
             await server_repo.delete(slug)
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
+        if rate_limiter is not None:
+            # F8: the rate-limit bucket is keyed on the slug STRING, not the server's DB id —
+            # if this slug is deleted and later recreated with a different rate_limit, the old
+            # bucket (and its old consumed-token state) must not still be registered under it.
+            rate_limiter.unregister(server_key(slug))
 
     @router.get("/servers/{slug}/tools")
     async def get_server_tools(slug: str):

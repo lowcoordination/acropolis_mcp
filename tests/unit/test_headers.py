@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from argus.headers import extract_name_from_params, header_matches_body, strip_hop_by_hop
+import httpx
+
+from argus.headers import (
+    extract_name_from_params,
+    filter_response_headers,
+    header_matches_body,
+    strip_hop_by_hop,
+)
 
 
 def test_strip_hop_by_hop_removes_all_listed():
@@ -69,3 +76,38 @@ def test_header_matches_body_name_mismatch_rejected():
 
 def test_header_matches_body_method_present_name_absent_ok():
     assert header_matches_body("tools/list", None, "tools/list", None) is True
+
+
+def test_filter_response_headers_drops_malicious_set_cookie():
+    # F19 regression (review 2026-08-04): a malicious/compromised upstream emitting Set-Cookie
+    # on Acropolis's own origin (the SPA and /mcp/* share an origin) could clobber the admin's
+    # real session cookie — a denial-of-service even without forging a valid signature.
+    upstream_headers = httpx.Headers({
+        "content-type": "application/json",
+        "set-cookie": "acropolis_session=attacker-controlled; Max-Age=0",
+    })
+    filtered = filter_response_headers(upstream_headers)
+    assert "set-cookie" not in {k.lower() for k in filtered}
+    assert filtered.get("content-type") == "application/json"
+
+
+def test_filter_response_headers_drops_transfer_encoding_and_content_length():
+    # Relaying upstream transfer-encoding/content-length while Starlette re-frames the
+    # streamed body is a request-smuggling hazard behind some reverse proxies.
+    upstream_headers = httpx.Headers({
+        "content-type": "application/json",
+        "transfer-encoding": "chunked",
+        "content-length": "9999",
+    })
+    filtered = filter_response_headers(upstream_headers)
+    assert "transfer-encoding" not in {k.lower() for k in filtered}
+    assert "content-length" not in {k.lower() for k in filtered}
+
+
+def test_filter_response_headers_keeps_mcp_session_id():
+    # Must not be so aggressive it breaks the protocol — mcp-session-id is how a 2025-generation
+    # upstream's session is threaded back to the client.
+    upstream_headers = httpx.Headers({"mcp-session-id": "abc123", "x-unlisted-header": "drop-me"})
+    filtered = filter_response_headers(upstream_headers)
+    assert filtered.get("mcp-session-id") == "abc123"
+    assert "x-unlisted-header" not in {k.lower() for k in filtered}
