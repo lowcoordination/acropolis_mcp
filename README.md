@@ -12,6 +12,9 @@ Three modules, one process:
 - **Stoa** — the registration hub. Keeps an inventory of your MCP servers, polls their health and
   capabilities, and caches their tool catalogs.
 
+New here? [docs/use-cases.md](docs/use-cases.md) walks through what problems this actually
+solves before you dive into setup.
+
 ## Status
 
 Pre-1.0. The gateway, policy engine, and web UI are functional and covered by an extensive
