@@ -3,6 +3,14 @@ from __future__ import annotations
 # Hop-by-hop headers that must never be forwarded by a proxy (RFC 7230 §6.1),
 # plus host/content-length/transfer-encoding which the HTTP client recomputes itself.
 # The original mcp-guard prototype only stripped 3 of these — extended here.
+#
+# SECURITY: authorization and cookie are stripped here too, even though neither is hop-by-hop
+# by the RFC 7230 definition. Without this, the CALLER's gateway credentials (their Bearer
+# acropolis_* API key, or — since the SPA and /mcp/* share an origin — the admin's
+# acropolis_session cookie) are forwarded verbatim to whatever upstream MCP server is
+# registered. Any registered upstream (third-party, compromised, or attacker-registered) could
+# harvest and replay those credentials. If an upstream needs its own auth, that must come from a
+# per-server credential the operator configures — never from relaying the client's own headers.
 HOP_BY_HOP_HEADERS = frozenset(
     {
         b"host",
@@ -16,6 +24,8 @@ HOP_BY_HOP_HEADERS = frozenset(
         b"trailer",
         b"trailers",
         b"upgrade",
+        b"authorization",
+        b"cookie",
     }
 )
 

@@ -8,12 +8,26 @@ def test_strip_hop_by_hop_removes_all_listed():
         (b"host", b"example.com"),
         (b"content-length", b"10"),
         (b"connection", b"keep-alive"),
-        (b"authorization", b"Bearer x"),
         (b"x-custom", b"value"),
     ]
     stripped = strip_hop_by_hop(raw)
     kept_keys = {k for k, _ in stripped}
-    assert kept_keys == {b"authorization", b"x-custom"}
+    assert kept_keys == {b"x-custom"}
+
+
+def test_strip_hop_by_hop_removes_authorization_and_cookie():
+    # Security regression guard (review finding F5, 2026-08-04): authorization and cookie are
+    # not RFC 7230 hop-by-hop headers, but they must never reach an upstream MCP server — see
+    # the comment on HOP_BY_HOP_HEADERS in argus/headers.py for the credential-leak this closes.
+    raw = [
+        (b"authorization", b"Bearer acropolis_secret"),
+        (b"cookie", b"acropolis_session=abc"),
+        (b"x-custom", b"value"),
+    ]
+    stripped_keys = {k for k, _ in strip_hop_by_hop(raw)}
+    assert b"authorization" not in stripped_keys
+    assert b"cookie" not in stripped_keys
+    assert b"x-custom" in stripped_keys
 
 
 def test_strip_hop_by_hop_case_insensitive():

@@ -123,13 +123,22 @@ def _mount_web_ui(app: FastAPI) -> None:
         app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
 
     index_path = dist_dir / "index.html"
+    resolved_dist = dist_dir.resolve()
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str) -> Response:
         # A React Router client-side route (e.g. /servers/shell) has no matching file on
         # disk — serve index.html for anything that isn't a real static asset, and let the
         # client-side router take it from there.
-        candidate = dist_dir / full_path
-        if full_path and candidate.is_file():
+        #
+        # SECURITY: full_path is raw, attacker-controlled input. Two traversal vectors must be
+        # closed before touching the filesystem: (1) pathlib's __truediv__ silently discards the
+        # left operand when the right side is absolute — Path("/app/dist") / "/etc/passwd"
+        # becomes "/etc/passwd" — which a request line starting "//" produces; (2) uvicorn does
+        # not normalise ".." before routing, so "/../" reaches this handler intact. Stripping a
+        # leading "/" defuses (1); resolving and checking containment via is_relative_to defuses
+        # both, including any percent-decoded or symlink-based escape.
+        candidate = (dist_dir / full_path.lstrip("/")).resolve()
+        if full_path and candidate.is_file() and candidate.is_relative_to(resolved_dist):
             return FileResponse(candidate)
         return FileResponse(index_path)

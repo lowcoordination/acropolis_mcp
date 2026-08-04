@@ -431,6 +431,14 @@ class Pipeline:
     async def _forward(
         self, request: Request, server: ServerRecord, path: str, body_bytes: bytes
     ) -> Response:
+        # SECURITY: httpx.URL normalises dot segments during parsing, so
+        # f"{upstream}/mcp/../../admin" resolves OUTSIDE the configured upstream endpoint —
+        # an arbitrary path on the upstream host, bypassing whatever prefix the operator
+        # registered. path comes straight from the /mcp/{slug}/{path:path} route with no prior
+        # validation, so it must be rejected here, before the URL is ever constructed.
+        if path and (path.startswith("/") or "/../" in f"/{path}/" or path in ("..", ".")):
+            raise RoutingError(400, rpc_error(None, "invalid upstream path"))
+
         upstream_url = httpx.URL(
             f"{server.upstream_url}/{path}".rstrip("/") if path else server.upstream_url,
             query=request.url.query.encode("utf-8"),
