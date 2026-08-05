@@ -12,7 +12,7 @@ export function StatTile({ label, value, accent = 'default' }: StatTileProps) {
       </div>
       <div
         className="text-2xl font-semibold mt-1"
-        style={{ color: accent === 'danger' ? '#c0524b' : 'var(--text)' }}
+        style={{ color: accent === 'danger' ? 'var(--danger)' : 'var(--text)' }}
       >
         {value}
       </div>

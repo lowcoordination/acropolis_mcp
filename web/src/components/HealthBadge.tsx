@@ -3,8 +3,8 @@ interface HealthBadgeProps {
 }
 
 const DOT_COLOR: Record<string, string> = {
-  healthy: 'var(--color-teal-500)',
-  unhealthy: '#c0524b',
+  healthy: 'var(--success)',
+  unhealthy: 'var(--danger)',
   unknown: 'var(--text-muted)',
 }
 

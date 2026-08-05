@@ -71,7 +71,7 @@ function CreateKeyModal({ onClose, onCreated }: { onClose: () => void; onCreated
           )}
         </div>
         {error && (
-          <p className="text-sm" style={{ color: '#c0524b' }}>
+          <p className="text-sm" style={{ color: 'var(--danger)' }}>
             {error}
           </p>
         )}
@@ -108,7 +108,7 @@ function ShowKeyModal({ created, onClose }: { created: KeyCreatedResponse; onClo
       </p>
       <div
         className="font-mono text-xs rounded-md px-3 py-2 break-all mb-4"
-        style={{ background: 'var(--code-bg, var(--bg))', border: '1px solid var(--border)' }}
+        style={{ background: 'var(--code-bg)', border: '1px solid var(--border)' }}
       >
         {created.plaintext}
       </div>
@@ -145,7 +145,7 @@ export function Keys() {
       </div>
 
       {isLoading && <p style={{ color: 'var(--text-muted)' }}>Loading…</p>}
-      {isError && <p style={{ color: '#c0524b' }}>Could not load keys.</p>}
+      {isError && <p style={{ color: 'var(--danger)' }}>Could not load keys.</p>}
 
       {keys && keys.length === 0 && (
         <div className="card p-8 text-center">
@@ -194,7 +194,7 @@ export function Keys() {
                       type="button"
                       onClick={() => setEnabled.mutate({ id: key.id, enabled: !key.enabled })}
                       className="text-xs font-medium"
-                      style={{ color: key.enabled ? 'var(--color-teal-500)' : 'var(--text-muted)' }}
+                      style={{ color: key.enabled ? 'var(--success)' : 'var(--text-muted)' }}
                     >
                       {key.enabled ? 'Enabled' : 'Disabled'}
                     </button>
@@ -208,7 +208,7 @@ export function Keys() {
                         }
                       }}
                       className="text-xs"
-                      style={{ color: '#c0524b' }}
+                      style={{ color: 'var(--danger)' }}
                     >
                       Delete
                     </button>

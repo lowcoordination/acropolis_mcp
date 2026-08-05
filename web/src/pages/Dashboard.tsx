@@ -11,7 +11,7 @@ export function Dashboard() {
   }
 
   if (isError || !stats) {
-    return <p style={{ color: '#c0524b' }}>Could not load stats.</p>
+    return <p style={{ color: 'var(--danger)' }}>Could not load stats.</p>
   }
 
   return (

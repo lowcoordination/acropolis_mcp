@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useSettings, useUpdateSettings } from '../lib/useSettings'
+import { useTheme, type Theme } from '../lib/useTheme'
 
 export function Settings() {
   const { data: settings, isLoading } = useSettings()
   const update = useUpdateSettings()
+  const { theme, setTheme } = useTheme()
 
   const [authMode, setAuthMode] = useState<'open' | 'keyed'>('keyed')
   const [aggregateEnabled, setAggregateEnabled] = useState(true)
@@ -17,8 +19,40 @@ export function Settings() {
     }
   }, [settings])
 
+  const appearanceCard = (
+    <div className="card p-5 space-y-3">
+      <h2 className="text-sm font-semibold">Appearance</h2>
+      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+        A per-browser preference — it doesn't affect what other operators of this gateway see.
+      </p>
+      <div className="flex gap-2">
+        {(['system', 'latte', 'mocha'] as Theme[]).map((option) => (
+          <button
+            key={option}
+            type="button"
+            onClick={() => setTheme(option)}
+            className="rounded-md px-3 py-1.5 text-sm font-medium capitalize"
+            style={
+              theme === option
+                ? { background: 'var(--accent)', color: 'var(--accent-contrast)' }
+                : { border: '1px solid var(--border)', color: 'var(--text)' }
+            }
+          >
+            {option}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+
   if (isLoading || !settings) {
-    return <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
+    return (
+      <div className="space-y-6 max-w-xl">
+        <h1 className="text-xl font-semibold">Settings</h1>
+        {appearanceCard}
+        <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
+      </div>
+    )
   }
 
   const isDirty =
@@ -40,10 +74,12 @@ export function Settings() {
     <div className="space-y-6 max-w-xl">
       <h1 className="text-xl font-semibold">Settings</h1>
 
+      {appearanceCard}
+
       {isInsecure && (
         <div
           className="card p-4 text-sm"
-          style={{ borderColor: '#c0524b', background: 'color-mix(in srgb, #c0524b 8%, transparent)' }}
+          style={{ borderColor: 'var(--danger)', background: 'color-mix(in srgb, var(--danger) 8%, transparent)' }}
         >
           <strong>Open auth mode over plain HTTP.</strong> Anyone who can reach this instance can
           call your MCP servers without a key. If this is reachable beyond your own machine, put it

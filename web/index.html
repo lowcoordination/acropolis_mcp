@@ -5,6 +5,21 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Acropolis</title>
+    <script>
+      // Blocking, pre-mount: applies any stored theme before first paint so the page never
+      // flashes the system-default palette then swaps to the user's chosen one. Mirrors
+      // src/lib/useTheme.ts's read side — keep the storage key and value set in sync with it.
+      (function () {
+        try {
+          var stored = localStorage.getItem('acropolis-theme');
+          if (stored === 'latte' || stored === 'mocha') {
+            document.documentElement.dataset.theme = stored;
+          }
+        } catch (e) {
+          // localStorage unavailable (private mode, disabled storage) — fall back to system.
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
