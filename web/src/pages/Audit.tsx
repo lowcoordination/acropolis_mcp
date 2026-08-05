@@ -1,7 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useAuditQuery } from '../lib/useAuditQuery'
 import { useAuditTail } from '../lib/useAuditTail'
 import { useServers } from '../lib/useServers'
+import { useKeys } from '../lib/useKeys'
+import { auditApi } from '../api/audit'
 import { DecisionBadge } from '../components/DecisionBadge'
 import type { AuditEvent } from '../api/types'
 
@@ -42,15 +44,43 @@ function EventRow({ event }: { event: AuditEvent }) {
   )
 }
 
+// datetime-local inputs give "YYYY-MM-DDTHH:mm" in the browser's local time zone — convert to
+// a UTC ISO string for the API, which compares against `ts` (stored UTC) lexicographically.
+function localDateTimeToIso(value: string): string | undefined {
+  if (!value) return undefined
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString()
+}
+
 export function Audit() {
   const { data: servers } = useServers()
+  const { data: keys } = useKeys()
   const [serverFilter, setServerFilter] = useState('')
   const [decisionFilter, setDecisionFilter] = useState('')
+  const [apiKeyFilter, setApiKeyFilter] = useState('')
+  const [afterInput, setAfterInput] = useState('')
+  const [beforeInput, setBeforeInput] = useState('')
+  const [searchInput, setSearchInput] = useState('')
+  const [search, setSearch] = useState('')
   const [tailPaused, setTailPaused] = useState(false)
+
+  // Debounce the free-text search so every keystroke doesn't re-fire the query.
+  useEffect(() => {
+    const t = setTimeout(() => setSearch(searchInput), 300)
+    return () => clearTimeout(t)
+  }, [searchInput])
+
+  const after = localDateTimeToIso(afterInput)
+  const before = localDateTimeToIso(beforeInput)
+  const apiKeyId = apiKeyFilter ? Number(apiKeyFilter) : undefined
 
   const { data: history, isLoading } = useAuditQuery({
     server_slug: serverFilter || undefined,
     decision: decisionFilter || undefined,
+    api_key_id: apiKeyId,
+    after,
+    before,
+    search: search || undefined,
     limit: 100,
   })
 
@@ -61,23 +91,45 @@ export function Audit() {
   const filteredLive = liveEvents.filter((e) => {
     if (serverFilter && e.server_slug !== serverFilter) return false
     if (decisionFilter && e.decision !== decisionFilter) return false
+    if (apiKeyId !== undefined && e.api_key_id !== apiKeyId) return false
+    if (after && e.ts < after) return false
+    if (before && e.ts > before) return false
+    if (search) {
+      const term = search.toLowerCase()
+      const haystack = `${e.reason ?? ''} ${e.args_summary ?? ''} ${e.matched ?? ''}`.toLowerCase()
+      if (!haystack.includes(term)) return false
+    }
     return true
+  })
+
+  const exportHref = auditApi.exportCsvUrl({
+    server_slug: serverFilter || undefined,
+    decision: decisionFilter || undefined,
+    api_key_id: apiKeyId,
+    after,
+    before,
+    search: search || undefined,
   })
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">Audit Log</h1>
-        <button
-          type="button"
-          onClick={() => setTailPaused((p) => !p)}
-          className="btn-secondary rounded-md px-3 py-1.5 text-xs font-medium"
-        >
-          {tailPaused ? 'Resume live tail' : 'Pause live tail'}
-        </button>
+        <div className="flex items-center gap-2">
+          <a href={exportHref} download className="btn-secondary rounded-md px-3 py-1.5 text-xs font-medium">
+            Export CSV
+          </a>
+          <button
+            type="button"
+            onClick={() => setTailPaused((p) => !p)}
+            className="btn-secondary rounded-md px-3 py-1.5 text-xs font-medium"
+          >
+            {tailPaused ? 'Resume live tail' : 'Pause live tail'}
+          </button>
+        </div>
       </div>
 
-      <div className="flex gap-3">
+      <div className="flex flex-wrap gap-3">
         <select
           className="rounded-md px-3 py-2 text-sm"
           value={serverFilter}
@@ -101,6 +153,39 @@ export function Audit() {
           <option value="PASSTHROUGH">Passthrough</option>
           <option value="ERROR">Error</option>
         </select>
+        <select
+          className="rounded-md px-3 py-2 text-sm"
+          value={apiKeyFilter}
+          onChange={(e) => setApiKeyFilter(e.target.value)}
+        >
+          <option value="">All API keys</option>
+          {(keys ?? []).map((k) => (
+            <option key={k.id} value={k.id}>
+              {k.name} ({k.key_prefix})
+            </option>
+          ))}
+        </select>
+        <input
+          type="datetime-local"
+          className="rounded-md px-3 py-2 text-sm"
+          value={afterInput}
+          onChange={(e) => setAfterInput(e.target.value)}
+          aria-label="After"
+        />
+        <input
+          type="datetime-local"
+          className="rounded-md px-3 py-2 text-sm"
+          value={beforeInput}
+          onChange={(e) => setBeforeInput(e.target.value)}
+          aria-label="Before"
+        />
+        <input
+          type="search"
+          className="rounded-md px-3 py-2 text-sm flex-1 min-w-[12rem]"
+          placeholder="Search reason, args, matched rule…"
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+        />
       </div>
 
       <div className="card">

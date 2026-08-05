@@ -428,6 +428,27 @@ class TestF25SchemaVersionGuard:
         await again.connect()
         await again.close()
 
+    async def test_audit_db_applies_0004_and_still_guards_on_unknown_version(self, tmp_path):
+        """audit.db has its own independent migration list (_AUDIT_MIGRATIONS) and its own
+        schema_migrations table — this is the audit.db analogue of the two tests above, added
+        when 0004_audit_api_key_index.sql was appended for Item B's api_key_id filter."""
+        db = Database(tmp_path)
+        await db.connect()
+        cur = await db.audit.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_audit_api_key'"
+        )
+        assert await cur.fetchone() is not None
+        await db.audit.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (9999, "2026-01-01T00:00:00+00:00"),
+        )
+        await db.audit.commit()
+        await db.close()
+
+        fresh = Database(tmp_path)
+        with pytest.raises(SchemaTooNewError, match="9999"):
+            await fresh.connect()
+
 
 # ---------------------------------------------------------------------------
 # F25 — /metrics endpoint

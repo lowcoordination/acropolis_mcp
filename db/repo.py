@@ -447,10 +447,16 @@ class AuditRepo:
     async def query(
         self, server_slug: Optional[str] = None, decision: Optional[str] = None,
         tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
+        api_key_id: Optional[int] = None, after: Optional[str] = None,
+        before: Optional[str] = None, search: Optional[str] = None,
     ) -> list[dict]:
         """Newest-first. `before_id` is keyset pagination — pass the smallest `id` from the
         previous page to fetch the next (older) page, rather than an OFFSET (which re-scans
-        and can skip/duplicate rows under concurrent inserts)."""
+        and can skip/duplicate rows under concurrent inserts).
+
+        `after`/`before` are inclusive ISO-timestamp bounds on `ts`. `search` matches against
+        `reason`, `args_summary`, and `matched`; `%`/`_` in the term are escaped so a literal
+        search (e.g. "100%") isn't interpreted as a SQL LIKE wildcard."""
         clauses, params = [], []
         if server_slug:
             clauses.append("server_slug = ?")
@@ -464,6 +470,20 @@ class AuditRepo:
         if before_id is not None:
             clauses.append("id < ?")
             params.append(before_id)
+        if api_key_id is not None:
+            clauses.append("api_key_id = ?")
+            params.append(api_key_id)
+        if after:
+            clauses.append("ts >= ?")
+            params.append(after)
+        if before:
+            clauses.append("ts <= ?")
+            params.append(before)
+        if search:
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            clauses.append("(reason LIKE ? ESCAPE '\\' OR args_summary LIKE ? ESCAPE '\\' OR matched LIKE ? ESCAPE '\\')")
+            params.extend([like, like, like])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         cur = await self._conn.execute(
