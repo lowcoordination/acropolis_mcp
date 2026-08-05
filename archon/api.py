@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 from typing import Optional
 
@@ -328,12 +330,67 @@ def build_control_plane_router(
         async def query_audit(
             server_slug: Optional[str] = None, decision: Optional[str] = None,
             tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
+            api_key_id: Optional[int] = None, after: Optional[str] = None,
+            before: Optional[str] = None, search: Optional[str] = None,
         ):
             events = await audit_repo.query(
                 server_slug=server_slug, decision=decision, tool=tool,
                 before_id=before_id, limit=min(limit, 500),
+                api_key_id=api_key_id, after=after, before=before, search=search,
             )
             return [AuditEventResponse(**{**e, "bridged": bool(e["bridged"])}) for e in events]
+
+        @router.get("/audit/export.csv")
+        async def export_audit_csv(
+            server_slug: Optional[str] = None, decision: Optional[str] = None,
+            tool: Optional[str] = None, api_key_id: Optional[int] = None,
+            after: Optional[str] = None, before: Optional[str] = None,
+            search: Optional[str] = None,
+        ):
+            columns = [
+                "id", "ts", "server_slug", "api_key_id", "client_ip", "endpoint", "rpc_method",
+                "tool", "decision", "rule", "matched", "reason", "args_summary", "bridged",
+                "status_code", "latency_ms",
+            ]
+
+            def csv_safe(value: object) -> str:
+                # Formula-injection guard: `reason`/`args_summary`/`matched` can contain
+                # attacker-influenced tool arguments. A cell opening with =, +, -, or @ is
+                # executed as a formula by Excel/Sheets on open — prefix with a quote to defuse it.
+                text = "" if value is None else str(value)
+                if text and text[0] in ("=", "+", "-", "@"):
+                    return f"'{text}"
+                return text
+
+            async def rows():
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerow(columns)
+                yield buf.getvalue()
+
+                before_id: Optional[int] = None
+                while True:
+                    buf = io.StringIO()
+                    writer = csv.writer(buf)
+                    events = await audit_repo.query(
+                        server_slug=server_slug, decision=decision, tool=tool,
+                        before_id=before_id, limit=500, api_key_id=api_key_id,
+                        after=after, before=before, search=search,
+                    )
+                    if not events:
+                        break
+                    for e in events:
+                        writer.writerow([csv_safe(e[c]) for c in columns])
+                    yield buf.getvalue()
+                    before_id = events[-1]["id"]
+                    if len(events) < 500:
+                        break
+
+            filename = f"acropolis-audit-{utcnow().replace(':', '').split('.')[0]}.csv"
+            return StreamingResponse(
+                rows(), media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
 
         if audit_logger is not None:
             @router.get("/audit/tail")
