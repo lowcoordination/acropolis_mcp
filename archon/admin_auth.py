@@ -29,7 +29,10 @@ async def require_admin(
 
     if settings.admin_token and authorization and authorization.lower().startswith("bearer "):
         presented = authorization[len("Bearer "):]
-        if hmac.compare_digest(presented, settings.admin_token):
+        # §26 fix (review 2026-08-04): hmac.compare_digest raises TypeError on a `str` argument
+        # containing non-ASCII characters. `presented` is attacker-controlled (straight off the
+        # Authorization header) — a malformed token must fail closed, not crash the request.
+        if presented.isascii() and hmac.compare_digest(presented, settings.admin_token):
             return
 
     settings_repo: SettingsRepo = request.app.state.settings_repo

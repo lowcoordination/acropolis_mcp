@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from argus.policy import evaluate, tool_is_visible
+from argus.policy import evaluate, summarize_args, tool_is_visible
 from db.models import ParamRule, ServerPolicy
 
 
@@ -138,15 +138,15 @@ async def test_missing_param_not_checked():
 
 async def test_args_summary_truncates_long_values():
     policy = ServerPolicy(mode="passthrough")
-    decision = await evaluate("tool", {"secret": "x" * 200}, "srv", policy)
-    assert decision.args_summary["secret"].endswith("[truncated]")
-    assert len(decision.args_summary["secret"]) < 200
+    decision = await evaluate("tool", {"path": "x" * 200}, "srv", policy)
+    assert decision.args_summary["path"].endswith("[truncated]")
+    assert len(decision.args_summary["path"]) < 200
 
 
 async def test_args_summary_short_values_untouched():
     policy = ServerPolicy(mode="passthrough")
-    decision = await evaluate("tool", {"key": "short"}, "srv", policy)
-    assert decision.args_summary["key"] == "short"
+    decision = await evaluate("tool", {"path": "short"}, "srv", policy)
+    assert decision.args_summary["path"] == "short"
 
 
 @pytest.mark.parametrize(
@@ -279,3 +279,30 @@ async def test_policy_engine_does_not_fail_open_under_concurrent_redos_flood():
         f"{sum(1 for d in victim_decisions if d.blocked)}/10 — policy engine failed open "
         f"under concurrent ReDoS load"
     )
+
+
+# ---------------------------------------------------------------------------
+# §26 — summarize_args redacts by key name, not just length (review 2026-08-04)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "key", ["password", "api_key", "apiKey", "token", "access_token", "Authorization", "secret"]
+)
+def test_summarize_args_redacts_sensitive_keys_regardless_of_length(key):
+    """Regression: the old implementation only truncated by LENGTH ('value[:120]'), so a short
+    secret (an 8-character API key, a PIN) sailed straight into the audit log untouched. A
+    sensitive key name must be redacted outright, not merely left short enough to survive
+    truncation."""
+    summary = summarize_args({key: "shortsecret"})
+    assert summary[key] == "[redacted]"
+
+
+def test_summarize_args_still_truncates_long_non_sensitive_values():
+    long_value = "x" * 200
+    summary = summarize_args({"path": long_value})
+    assert summary["path"] == "x" * 120 + " [truncated]"
+
+
+def test_summarize_args_passes_through_short_non_sensitive_values():
+    summary = summarize_args({"path": "/tmp/file.txt"})
+    assert summary["path"] == "/tmp/file.txt"

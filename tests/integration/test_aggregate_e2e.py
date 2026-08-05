@@ -162,3 +162,67 @@ async def test_per_server_endpoint_still_works_alongside_aggregate(argus_client)
     )
     assert session_init.status_code == 200
     assert upstream_a.call_counter.get("echo") is None  # initialize alone doesn't call any tool
+
+
+async def test_aggregate_enabled_false_disables_the_endpoint(argus_client):
+    """F15 regression (review 2026-08-04): aggregate_enabled was stored, defaulted, returned by
+    GET /settings, written by PUT /settings, and rendered as a UI toggle — and NOTHING read it.
+    An operator who toggled the aggregate endpoint off got a 200 success response and a
+    persisted setting while POST /mcp stayed fully live, still exposing the merged cross-server
+    tool surface they believed they'd just closed."""
+    client, _, _, _, _ = argus_client
+
+    # Confirm it works by default first (matches archon/api.py's _SETTINGS_DEFAULTS).
+    resp = await client.post("/mcp", json=_rpc("tools/list", {}), headers=HEADERS)
+    assert resp.status_code == 200
+
+    settings_resp = await client.put("/api/v1/settings", json={"aggregate_enabled": False})
+    assert settings_resp.status_code == 200
+    assert settings_resp.json()["aggregate_enabled"] is False
+
+    resp = await client.post("/mcp", json=_rpc("tools/list", {}), headers=HEADERS)
+    assert resp.status_code == 404, (
+        f"aggregate endpoint should be disabled after aggregate_enabled=false, got {resp.status_code}"
+    )
+
+    # Direct per-server endpoints must be unaffected — this setting only gates /mcp.
+    per_server = await client.post(
+        "/mcp/server-a",
+        json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                         "clientInfo": {"name": "c", "version": "1"}}},
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+    )
+    assert per_server.status_code == 200
+
+    # Re-enabling takes effect immediately — no restart required (same DB-is-live pattern the
+    # rest of Settings already uses for auth_mode/audit_retention_days).
+    reenable = await client.put("/api/v1/settings", json={"aggregate_enabled": True})
+    assert reenable.status_code == 200
+    resp = await client.post("/mcp", json=_rpc("tools/list", {}), headers=HEADERS)
+    assert resp.status_code == 200
+
+
+async def test_aggregate_endpoint_rejects_oversized_body(tmp_path: Path):
+    """§26 fix (review 2026-08-04): AggregatePipeline.handle used to read the request body with
+    a bare `await request.body()` — no size guard at all, unlike the per-server path
+    (Pipeline._read_body_guarded), which enforces settings.max_body_bytes. An authenticated
+    caller could send an arbitrarily large body to /mcp and force it fully into memory before
+    the JSON-RPC parse even ran. Uses a small max_body_bytes so the oversized test payload
+    itself stays small and fast."""
+    settings = Settings(
+        data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False,
+        audit_retention_enabled=False, max_body_bytes=100,
+    )
+    db = Database(tmp_path)
+    await db.connect()
+    app = create_app(settings, db)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
+            oversized_params = {"padding": "x" * 1000}
+            resp = await client.post(
+                "/mcp", json=_rpc("tools/list", oversized_params), headers=HEADERS,
+            )
+            assert resp.status_code == 413
+    await db.close()

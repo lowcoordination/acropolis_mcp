@@ -44,7 +44,14 @@ class ApiKeyService:
     async def verify(self, plaintext: str) -> Optional[ApiKeyRecord]:
         """Constant-time-safe verify: we hash the presented key and look up by hash equality
         (SQLite equality on the hash column), rather than comparing plaintexts directly."""
-        if not plaintext or not hmac.compare_digest(plaintext[: len(KEY_PREFIX)], KEY_PREFIX):
+        # §26 fix (review 2026-08-04): hmac.compare_digest raises TypeError on a `str` argument
+        # containing non-ASCII characters — a bearer token with e.g. a stray unicode character
+        # (attacker-controlled, since this is straight off the Authorization header) used to
+        # crash this call outright rather than simply failing auth. A malformed/adversarial
+        # token must fail closed (401 via the None return below), not blow up the request.
+        if not plaintext or not plaintext[: len(KEY_PREFIX)].isascii():
+            return None
+        if not hmac.compare_digest(plaintext[: len(KEY_PREFIX)], KEY_PREFIX):
             return None
         key_hash = _hash_key(plaintext)
         record = await self._repo.get_by_hash(key_hash)

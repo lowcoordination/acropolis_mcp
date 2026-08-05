@@ -56,8 +56,17 @@ class AuditRetentionJob:
             # 0 or negative means "keep forever" — an explicit opt-out, not a bug.
             return 0
 
+        # §26 fix (review 2026-08-04): this used to format the cutoff as `...Z` while every
+        # stored ts value (db/database.py's utcnow(), used by AuditLogger) is
+        # datetime.isoformat() — `...+00:00`. audit_events.ts is a TEXT column compared via
+        # plain string `<` in SQL, so the two suffix styles are NOT guaranteed to sort the same
+        # as they compare chronologically: at the exact same instant, `+00:00` (ASCII '+' = 43)
+        # sorts before `Z` (ASCII 'Z' = 90), so a row stored at precisely the cutoff instant
+        # would incorrectly compare as "older than cutoff" and get pruned one tick early.
+        # Using the same isoformat() as utcnow() guarantees string order matches chronological
+        # order for every pair of timestamps this codebase produces.
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        cutoff_iso = cutoff.isoformat()
         deleted = await self._audit_repo.prune_older_than(cutoff_iso)
         if deleted:
             logger.info("audit retention: pruned %d event(s) older than %d day(s)", deleted, days)

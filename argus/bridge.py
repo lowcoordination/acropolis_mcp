@@ -15,7 +15,6 @@ logger = logging.getLogger("argus.bridge")
 META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
 META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
-META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 
 SUPPORTED_2026_VERSION = "2026-07-28"
 
@@ -52,7 +51,7 @@ class ProtocolBridge:
 
     async def bridge_call(
         self, server_id: int, upstream_url: str, rpc_method: str, rpc_id: Any, params: dict,
-        meta: Optional[dict] = None,
+        meta: Optional[dict] = None, upstream_auth_header: Optional[str] = None,
     ) -> tuple[int, dict]:
         """Returns (http_status, json_rpc_response_body) for a single bridged call."""
         meta = meta or {}
@@ -81,19 +80,6 @@ class ProtocolBridge:
                 ),
             )
 
-        try:
-            handshake = await self._handshakes.get_or_handshake(server_id, upstream_url)
-        except UpstreamHandshakeError as e:
-            raise BridgeError(502, rpc_error(rpc_id, f"upstream handshake failed: {e}"))
-
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "MCP-Protocol-Version": handshake.protocol_version,
-        }
-        if handshake.session_id:
-            headers["Mcp-Session-Id"] = handshake.session_id
-
         upstream_body = {
             "jsonrpc": "2.0",
             "id": sanitize_rpc_id(rpc_id) or 1,
@@ -101,15 +87,46 @@ class ProtocolBridge:
             "params": params,
         }
 
-        try:
-            resp = await self._client.post(upstream_url, json=upstream_body, headers=headers)
-        except httpx.HTTPError as e:
-            raise BridgeError(502, rpc_error(rpc_id, f"upstream request failed: {e}"))
+        # §26 fix (review 2026-08-04): a 404 (session expired/invalid upstream-side) used to
+        # invalidate the cached handshake and immediately surface a 502 telling the CALLER to
+        # retry — pushing a transient, gateway-recoverable hiccup out to the end client instead
+        # of just handling it. One re-handshake-and-resend, transparent to the caller, matches
+        # what a client-side MCP SDK does on session loss; only give up and surface an error if
+        # the retry ALSO fails, so a genuinely dead upstream doesn't retry forever.
+        for attempt in range(2):
+            try:
+                handshake = await self._handshakes.get_or_handshake(
+                    server_id, upstream_url, upstream_auth_header=upstream_auth_header
+                )
+            except UpstreamHandshakeError as e:
+                raise BridgeError(502, rpc_error(rpc_id, f"upstream handshake failed: {e}"))
 
-        if resp.status_code == 404:
-            # Session likely expired/invalid upstream-side — invalidate and let the caller retry.
-            self._handshakes.invalidate(server_id)
-            raise BridgeError(502, rpc_error(rpc_id, "upstream session invalid; retry"))
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": handshake.protocol_version,
+            }
+            if handshake.session_id:
+                headers["Mcp-Session-Id"] = handshake.session_id
+            # F23 fix (review 2026-08-04): the bridged path built a fresh header dict with NO
+            # Authorization at all — correct in that it never leaked the client's own credential
+            # (see argus/headers.py's F5 fix for the passthrough-path equivalent of that leak),
+            # but it also meant an upstream requiring its own auth could never be bridged. Inject
+            # the per-server configured credential here, same mechanism as the passthrough path.
+            if upstream_auth_header:
+                headers["Authorization"] = upstream_auth_header
+
+            try:
+                resp = await self._client.post(upstream_url, json=upstream_body, headers=headers)
+            except httpx.HTTPError as e:
+                raise BridgeError(502, rpc_error(rpc_id, f"upstream request failed: {e}"))
+
+            if resp.status_code == 404:
+                self._handshakes.invalidate(server_id)
+                if attempt == 0:
+                    continue
+                raise BridgeError(502, rpc_error(rpc_id, "upstream session invalid; retry"))
+            break
 
         content_type = resp.headers.get("content-type", "")
         if "text/event-stream" in content_type:
@@ -128,11 +145,3 @@ class ProtocolBridge:
         # Re-stamp the id with the ORIGINAL caller's id (we may have substituted one above).
         parsed["id"] = sanitize_rpc_id(rpc_id)
         return (200 if "error" not in parsed else resp.status_code, parsed)
-
-    def build_stateless_result_meta(self, server_info: Optional[dict]) -> dict:
-        """_meta block to attach to a bridged response's result, per SEP-2575: servers SHOULD
-        identify themselves in each result's _meta under the new stateless model."""
-        meta: dict[str, Any] = {META_PROTOCOL_VERSION: SUPPORTED_2026_VERSION}
-        if server_info:
-            meta[META_SERVER_INFO] = server_info
-        return meta

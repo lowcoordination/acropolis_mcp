@@ -48,7 +48,8 @@ class ToolsCache:
         return age_ms < ttl
 
     async def get_raw_tools(
-        self, server_id: int, upstream_url: str, force_refresh: bool = False
+        self, server_id: int, upstream_url: str, force_refresh: bool = False,
+        upstream_auth_header: Optional[str] = None,
     ) -> list[dict]:
         """Returns the server's full (unfiltered) tool list, from cache if fresh or by fetching."""
         rows = await self._cached_rows(server_id)
@@ -59,6 +60,7 @@ class ToolsCache:
             status, body = await self._bridge.bridge_call(
                 server_id=server_id, upstream_url=upstream_url, rpc_method="tools/list",
                 rpc_id="acropolis-toolslist", params={},
+                upstream_auth_header=upstream_auth_header,
             )
         except BridgeError:
             # Upstream unreachable (connection refused, handshake failed, etc.) — serve stale
@@ -112,8 +114,9 @@ class ToolsCache:
             await self._write.commit()
 
     async def get_filtered_tools(
-        self, server_id: int, upstream_url: str, policy: ServerPolicy
+        self, server_id: int, upstream_url: str, policy: ServerPolicy,
+        upstream_auth_header: Optional[str] = None,
     ) -> list[dict]:
         """Tool list with policy-denied tools removed — what a client is actually allowed to see."""
-        tools = await self.get_raw_tools(server_id, upstream_url)
+        tools = await self.get_raw_tools(server_id, upstream_url, upstream_auth_header=upstream_auth_header)
         return [t for t in tools if tool_is_visible(t["name"], policy)]

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Request, Response
 
@@ -14,8 +15,8 @@ from argus.audit import AuditLogger
 from argus.discover import synthesize_gateway_discover
 from argus.generation import ClientGeneration
 from argus.jsonrpc import rpc_error, sanitize_rpc_id
-from argus.pipeline import Pipeline, RoutingError
-from db.repo import ServerNotFoundError, ServerRepo
+from argus.pipeline import Pipeline, RoutingError, _client_ip
+from db.repo import ServerNotFoundError, ServerRepo, SettingsRepo
 
 logger = logging.getLogger("argus.aggregate_pipeline")
 
@@ -31,15 +32,45 @@ class AggregatePipeline:
     """
 
     def __init__(self, settings: Settings, server_repo: ServerRepo, api_keys: ApiKeyService,
-                 audit: AuditLogger, per_server_pipeline: Pipeline):
+                 audit: AuditLogger, per_server_pipeline: Pipeline,
+                 settings_repo: Optional[SettingsRepo] = None):
         self._settings = settings
         self._servers = server_repo
         self._api_keys = api_keys
         self._audit = audit
         self._per_server = per_server_pipeline
+        self._settings_repo = settings_repo
+
+    async def _aggregate_enabled(self) -> bool:
+        # F15 fix (review 2026-08-04): aggregate_enabled was stored, defaulted, returned by
+        # GET /settings, written by PUT /settings, and rendered as a UI toggle — and NOTHING
+        # read it. argus/app.py always registered this pipeline and argus/routes.py always
+        # registered POST /mcp unconditionally. An operator who toggled the aggregate endpoint
+        # off got a 200 from the API and a persisted setting while the endpoint stayed fully
+        # live — a control that silently no-ops is worse than an absent one, since it actively
+        # tells the operator the merged cross-server tool surface is closed when it isn't.
+        # Same DB-is-live pattern as Pipeline._current_auth_mode: read per request so a change
+        # via the Settings page takes effect immediately, matching what its save button implies.
+        if self._settings_repo is not None:
+            stored = await self._settings_repo.get("aggregate_enabled")
+            if stored is not None:
+                return stored == "true"
+        return True  # matches archon/api.py's _SETTINGS_DEFAULTS default
 
     async def handle(self, request: Request) -> Response:
         start = time.monotonic()
+        client_ip = _client_ip(request)
+
+        if not await self._aggregate_enabled():
+            await self._audit.log(
+                server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
+                status_code=404, reason="aggregate endpoint is disabled in settings",
+                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+            )
+            return Response(
+                content=rpc_error(None, "aggregate endpoint is disabled"),
+                status_code=404, media_type="application/json",
+            )
 
         # tools/call re-dispatches through Pipeline.handle(), which does its own (per-server-
         # scoped) auth check — but tools/list and server/discover are answered directly here
@@ -51,11 +82,25 @@ class AggregatePipeline:
             await self._audit.log(
                 server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
                 status_code=e.status_code, reason=e.body[:200],
-                latency_ms=int((time.monotonic() - start) * 1000),
+                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
             )
             return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
 
-        body_bytes = await request.body()
+        # §26 fix (review 2026-08-04): this used to be a bare `await request.body()` with no
+        # size limit at all — unlike the per-server path (Pipeline._read_body_guarded), which
+        # enforces settings.max_body_bytes. An authenticated-but-malicious (or just careless)
+        # caller could send an arbitrarily large body to this endpoint and force it fully into
+        # memory before the JSON-RPC parse even runs. Reuse the per-server pipeline's own guard
+        # rather than duplicating the content-length + actual-size check here.
+        try:
+            body_bytes = await self._per_server._read_body_guarded(request)
+        except RoutingError as e:
+            await self._audit.log(
+                server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
+                status_code=e.status_code, reason=e.body[:200],
+                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+            )
+            return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
 
         try:
             body_json = json.loads(body_bytes) if body_bytes else None
@@ -81,7 +126,7 @@ class AggregatePipeline:
         params = body_json.get("params", {}) or {}
 
         if rpc_method == "tools/list":
-            return await self._handle_tools_list(rpc_id)
+            return await self._handle_tools_list(rpc_id, start, client_ip)
         if rpc_method == "tools/call":
             return await self._handle_tools_call(request, body_json, rpc_id, params)
         if rpc_method == "server/discover":
@@ -90,7 +135,7 @@ class AggregatePipeline:
         await self._audit.log(
             server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
             rpc_method=rpc_method, reason=f"unsupported method on aggregate endpoint: {rpc_method}",
-            status_code=501, latency_ms=int((time.monotonic() - start) * 1000),
+            status_code=501, latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
         )
         return Response(
             content=rpc_error(rpc_id, f"'{rpc_method}' is not supported on the aggregate endpoint"),
@@ -105,25 +150,63 @@ class AggregatePipeline:
             status_code=200, media_type="application/json",
         )
 
-    async def _handle_tools_list(self, rpc_id: Any) -> Response:
-        servers = await self._servers.list()
-        merged: list[dict] = []
-        for server in servers:
-            if not server.enabled or not server.in_aggregate:
-                continue
-            policy = await self._servers.get_policy(server.id)
-            tools = await self._per_server.tools_cache.get_filtered_tools(
-                server.id, server.upstream_url, policy
+    # F14 fix (review 2026-08-04): each server's tool fetch (upstream handshake + tools/list
+    # round-trip on a cache miss) gets its own deadline well below the full
+    # upstream_timeout_seconds budget, so one slow/unreachable server can only ever cost this
+    # much wall time — never the full per-call timeout, and never serially stacked with every
+    # other server's cost (see the asyncio.gather fan-out below).
+    _PER_SERVER_DEADLINE_SECONDS = 10.0
+
+    async def _fetch_one_server(self, server, policy) -> list[dict]:
+        try:
+            tools = await asyncio.wait_for(
+                self._per_server.tools_cache.get_filtered_tools(
+                    server.id, server.upstream_url, policy,
+                    upstream_auth_header=server.upstream_auth_header,
+                ),
+                timeout=self._PER_SERVER_DEADLINE_SECONDS,
             )
-            for tool in tools:
-                namespaced = namespace_tool_definition(server.slug, tool)
-                if namespaced is not None:
-                    merged.append(namespaced)
-                else:
-                    logger.warning(
-                        "tool '%s' on server '%s' excluded from aggregate (name too long or invalid chars)",
-                        tool.get("name"), server.slug,
-                    )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "server '%s' timed out after %.0fs fetching tools for the aggregate endpoint "
+                "— excluded from this response, not blocking the others",
+                server.slug, self._PER_SERVER_DEADLINE_SECONDS,
+            )
+            return []
+
+        namespaced_tools = []
+        for tool in tools:
+            namespaced = namespace_tool_definition(server.slug, tool)
+            if namespaced is not None:
+                namespaced_tools.append(namespaced)
+            else:
+                logger.warning(
+                    "tool '%s' on server '%s' excluded from aggregate (name too long or invalid chars)",
+                    tool.get("name"), server.slug,
+                )
+        return namespaced_tools
+
+    async def _handle_tools_list(self, rpc_id: Any, start: float, client_ip=None) -> Response:
+        # F14 fix: this used to be a plain `for server in servers: await get_policy(...); await
+        # get_filtered_tools(...)` loop — every server's cost (a full upstream handshake plus a
+        # tools/list round-trip on a cache miss) was SUMMED, sequentially. With 8 registered
+        # servers, cold cache, and two slow/unreachable ones at the old 120s upstream timeout,
+        # one client tools/list call could block ~4 minutes — and agents typically call
+        # tools/list first, so this was the very first thing a user experienced. Also: the
+        # aggregate path never audited at all, unlike the per-server path.
+        servers = [s for s in (await self._servers.list()) if s.enabled and s.in_aggregate]
+        policies = await self._servers.get_policies_for([s.id for s in servers])
+
+        results = await asyncio.gather(
+            *(self._fetch_one_server(server, policies[server.id]) for server in servers)
+        )
+        merged: list[dict] = [tool for server_tools in results for tool in server_tools]
+
+        await self._audit.log(
+            server_slug=None, tool=None, decision="PASSTHROUGH", endpoint="aggregate",
+            rpc_method="tools/list", latency_ms=int((time.monotonic() - start) * 1000),
+            client_ip=client_ip,
+        )
 
         return Response(
             content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": {"tools": merged}}),

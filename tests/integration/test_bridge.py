@@ -99,9 +99,57 @@ async def test_bridge_reuses_session_across_calls(bridge, upstream):
     assert upstream.call_counter.get("echo") == 2
 
 
-async def test_build_stateless_result_meta():
-    async with httpx.AsyncClient() as client:
+async def test_bridge_transparently_re_handshakes_on_session_invalid():
+    """§26 fix (review 2026-08-04): a 404 on the bridged call (session expired/invalid
+    upstream-side) used to invalidate the cached handshake and immediately surface a 502 to the
+    CALLER, telling THEM to retry — pushing a transient, gateway-recoverable hiccup out to the
+    end client. Scripted via httpx.MockTransport (not a real FastMCP fixture — this needs precise
+    control over a 404-then-success sequence, which a real session manager won't reliably
+    reproduce): first initialize succeeds, first tools/call 404s, the re-handshake succeeds, the
+    retried tools/call succeeds. The caller should see a clean 200, never the 502."""
+    import json as _json
+
+    handshake_count = 0
+    call_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal handshake_count, call_attempts
+        payload = _json.loads(request.content)
+        method = payload.get("method")
+        if method == "initialize":
+            handshake_count += 1
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0", "id": "acropolis-handshake",
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {}, "serverInfo": {"name": "stub", "version": "0"},
+                    },
+                },
+                headers={"mcp-session-id": f"session-{handshake_count}"},
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(200, json={})
+        if method == "tools/call":
+            call_attempts += 1
+            if call_attempts == 1:
+                return httpx.Response(404, text="session not found")
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": {"content": []}},
+            )
+        raise AssertionError(f"unexpected method: {method}")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
         bridge = ProtocolBridge(client, UpstreamHandshakeCache(client))
-        meta = bridge.build_stateless_result_meta({"name": "x", "version": "1"})
-        assert meta[META_PROTOCOL_VERSION] == "2026-07-28"
-        assert meta["io.modelcontextprotocol/serverInfo"] == {"name": "x", "version": "1"}
+        status, body = await bridge.bridge_call(
+            server_id=99, upstream_url="http://stub.invalid/mcp", rpc_method="tools/call",
+            rpc_id=1, params={"name": "echo", "arguments": {}},
+        )
+
+    assert status == 200
+    assert "error" not in body
+    assert handshake_count == 2, "expected exactly one re-handshake after the 404"
+    assert call_attempts == 2, "expected exactly one retry of the failed call"

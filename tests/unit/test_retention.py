@@ -94,3 +94,94 @@ async def test_start_stop_lifecycle_does_not_hang():
             await job.stop()
         finally:
             await db.close()
+
+
+async def test_boundary_row_at_exact_cutoff_instant_is_not_pruned(db, monkeypatch):
+    """§26 fix (review 2026-08-04): run_once() used to format its cutoff as `...Z`
+    (strftime + manual suffix) while every real stored ts value comes from
+    db.database.utcnow() = datetime.isoformat() = `...+00:00`. audit_events.ts is a TEXT
+    column compared via plain string `<` in SQL — the two suffix styles don't sort the same as
+    they compare chronologically. At the EXACT same instant, '+00:00' (ASCII '+' = 43) sorts
+    before 'Z' (ASCII 'Z' = 90), so a row stored at precisely the cutoff instant used to
+    compare as "older than cutoff" and get incorrectly pruned.
+
+    Freezes stoa.retention's `datetime.now` to a fixed instant (rather than reading the real
+    clock, which previously made an equivalent test flaky — two real-clock reads a few
+    microseconds apart made the row LEGITIMATELY older than the cutoff, passing/failing for the
+    wrong reason). With the clock frozen, a row seeded at exactly retention_days ago (using
+    utcnow()'s own isoformat()) and the job's own freshly-computed cutoff are the SAME instant —
+    the only way to prove the fix without a race."""
+    import stoa.retention as retention_module
+
+    frozen_now = datetime(2026, 8, 4, 10, 0, 0, 0, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_now
+
+    monkeypatch.setattr(retention_module, "datetime", _FrozenDatetime)
+
+    audit_repo = AuditRepo(db)
+    settings_repo = SettingsRepo(db)
+    await settings_repo.set_many({"audit_retention_days": "7"})
+
+    boundary_instant = frozen_now - timedelta(days=7)
+    await audit_repo._conn.execute(
+        "INSERT INTO audit_events (ts, server_slug, decision) VALUES (?, ?, ?)",
+        (boundary_instant.isoformat(), "shell", "ALLOWED"),
+    )
+    await audit_repo._conn.commit()
+
+    job = AuditRetentionJob(audit_repo, settings_repo)
+    await job.run_once()
+
+    remaining = await audit_repo.query()
+    assert len(remaining) == 1, (
+        "a row stored at exactly the cutoff instant was incorrectly pruned — the retention "
+        "job's cutoff format doesn't string-sort the same as utcnow()'s stored format"
+    )
+
+
+async def test_prune_older_than_batches_large_deletes(db):
+    """§26 fix (review 2026-08-04): prune_older_than used to run a single unbounded DELETE —
+    on audit.db's single connection (AuditLogger's batched flush is its only normal writer),
+    a large backlog would hold one long-running transaction and block new events from being
+    persisted for however long the DELETE took.
+
+    Asserting only the end result (all rows gone) does NOT distinguish batched from unbatched —
+    a single unbounded DELETE satisfies that just as well, which is precisely why an earlier
+    version of this test passed against the pre-fix code by accident. The actual, distinguishing
+    behavior is that MULTIPLE DELETE statements run (one per batch) rather than one — confirmed
+    by counting DELETE executions via a spy on the connection."""
+    audit_repo = AuditRepo(db)
+
+    for _ in range(25):
+        await _seed_event(audit_repo, age_days=10)
+
+    delete_statement_count = 0
+    original_execute = audit_repo._conn.execute
+
+    async def counting_execute(sql, *args, **kwargs):
+        nonlocal delete_statement_count
+        if sql.strip().upper().startswith("DELETE"):
+            delete_statement_count += 1
+        return await original_execute(sql, *args, **kwargs)
+
+    audit_repo._conn.execute = counting_execute
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        deleted = await audit_repo.prune_older_than(cutoff, batch_size=10)
+    finally:
+        audit_repo._conn.execute = original_execute
+
+    assert deleted == 25
+    remaining = await audit_repo.query()
+    assert len(remaining) == 0
+    # 25 rows at batch_size=10 -> 3 DELETE statements (10, 10, 5-then-stop): the loop's own
+    # "deleted < batch_size" termination means it always runs one extra (empty or partial)
+    # DELETE to detect it's done, so 3 here, never 1.
+    assert delete_statement_count == 3, (
+        f"expected multiple batched DELETE statements (not one unbounded DELETE), "
+        f"got {delete_statement_count}"
+    )

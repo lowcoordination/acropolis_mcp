@@ -18,6 +18,19 @@ def _run_server() -> None:
     settings = Settings()
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
 
+    # §26 (review 2026-08-04): this builds the app (including db.connect(), which constructs
+    # asyncio.Lock/Queue instances) inside a THROWAWAY asyncio.run() loop, then hands the
+    # resulting app to uvicorn.run(), which creates a SEPARATE, second event loop to actually
+    # serve requests — a real cross-loop hazard in principle. Considered fixing via uvicorn's
+    # `factory=True`, but confirmed by reading uvicorn's Config.load() (self.loaded_app =
+    # self.loaded_app(), a plain synchronous call) that it does NOT support an async factory —
+    # it would call this and get back an unawaited coroutine object instead of an app, a worse
+    # bug than the one being fixed. Left as-is: Python 3.10+'s asyncio.Lock/Queue defer loop
+    # binding to first real use rather than construction, and nothing in the first loop here
+    # ever uses one of these primitives, so the cross-loop construction is currently safe in
+    # practice, just not guaranteed by the primitives' public contract. A real fix needs
+    # uvicorn's `Server` class driven directly inside one loop rather than `uvicorn.run()`,
+    # which is a bigger change than this cleanup pass warrants.
     async def _make_app():
         db = Database(Path(settings.data_dir))
         await db.connect()

@@ -25,12 +25,21 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
 
       containers:
         - name: acropolis
           # Replace with wherever you've pushed the built image (see the repo's Dockerfile).
           image: acropolis:latest
           imagePullPolicy: IfNotPresent
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
 
           envFrom:
             - configMapRef:
@@ -55,6 +64,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
 
           livenessProbe:
             httpGet:
@@ -86,3 +97,8 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: acropolis-data
+        # readOnlyRootFilesystem above needs a writable /tmp — the forkserver used for
+        # ReDoS-safe policy matching (argus/policy.py) allocates semaphores/sockets there, and
+        # uvicorn/stdlib internals assume it's writable even when the app itself never touches it.
+        - name: tmp
+          emptyDir: {}

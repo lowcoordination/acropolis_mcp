@@ -46,6 +46,14 @@ async def test_verify_rejects_empty_string(service):
     assert await service.verify("") is None
 
 
+async def test_verify_rejects_non_ascii_key_without_raising(service):
+    """§26 fix (review 2026-08-04): hmac.compare_digest raises TypeError on a str containing
+    non-ASCII characters. The presented key is attacker-controlled (straight off the
+    Authorization header), so a non-ASCII token must fail auth cleanly, not crash the request."""
+    record = await service.verify("acropolis_évil-token")
+    assert record is None
+
+
 async def test_disabled_key_fails_verify(service):
     generated = await service.create("test-key")
     await service.disable(generated.record.id)

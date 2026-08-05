@@ -29,6 +29,11 @@ async def probe_server(
     (health_status, upstream_protocol, discover_json_dict).
     """
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    # F23 fix (review 2026-08-04): a server with a configured upstream credential needs it on
+    # the health probe too, or every registered server requiring auth would show permanently
+    # unhealthy regardless of whether tools/call itself works.
+    if server.upstream_auth_header:
+        headers["Authorization"] = server.upstream_auth_header
     discover_body = {
         "jsonrpc": "2.0", "id": "acropolis-discover", "method": "server/discover",
         "params": {"clientInfo": CLIENT_INFO},
@@ -43,15 +48,31 @@ async def probe_server(
         return ("unhealthy", None, None)
 
     if resp.status_code == 200:
-        parsed = (
-            parse_sse_body(resp.text)
-            if "text/event-stream" in resp.headers.get("content-type", "")
-            else (json.loads(resp.text) if resp.text else None)
-        )
+        # F12 fix (review 2026-08-04): json.loads(resp.text) was unguarded — a 200 response
+        # with a non-JSON body (e.g. an auth proxy's HTML login page in front of a
+        # misconfigured upstream) raised JSONDecodeError here, which escaped probe_server ->
+        # _probe_and_store -> poll_once. poll_once iterated servers SERIALLY with no
+        # per-server try/except, so this one bad server aborted the whole poll cycle and every
+        # server after it in slug order got permanently stale health. Every other parse site
+        # in the codebase was already defended; this one wasn't.
+        try:
+            parsed = (
+                parse_sse_body(resp.text)
+                if "text/event-stream" in resp.headers.get("content-type", "")
+                else (json.loads(resp.text) if resp.text else None)
+            )
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.info("probe for '%s' returned an unparseable 200 response: %s", server.slug, e)
+            parsed = None
+
         if parsed and "result" in parsed:
             # A real server/discover response — this is a 2026-generation server.
             return ("healthy", "2026-07-28", parsed["result"])
-        if parsed and parsed.get("error", {}).get("message", "").lower().find("method") != -1:
+        # F12 fix, second half: parsed.get("error", {}) raised AttributeError when "error" was
+        # present but explicitly null (dict.get's default only applies when the KEY is absent,
+        # not when its value is None) — `(parsed.get("error") or {})` handles both cases.
+        error_message = (parsed.get("error") or {}).get("message", "") if parsed else ""
+        if "method" in error_message.lower():
             # Method-not-found-shaped error — fall through to the 2025 handshake below.
             pass
 
@@ -60,7 +81,8 @@ async def probe_server(
     # support and which also confirms the server is actually reachable and speaking MCP.
     try:
         handshake = await handshake_cache.get_or_handshake(
-            server.id, server.upstream_url, timeout=PROBE_TIMEOUT_SECONDS
+            server.id, server.upstream_url, timeout=PROBE_TIMEOUT_SECONDS,
+            upstream_auth_header=server.upstream_auth_header,
         )
     except UpstreamHandshakeError as e:
         logger.info("probe for '%s' failed initialize fallback: %s", server.slug, e)
@@ -112,11 +134,19 @@ class HealthPoller:
             self._task = None
 
     async def poll_once(self) -> None:
+        # F12 fix, third half: even with probe_server() itself now fully guarded, wrap each
+        # _probe_and_store call individually so a future exception in EITHER the probe or the
+        # set_health() write for one server can never abort the whole cycle and leave every
+        # server after it in slug order permanently stale — defense in depth on top of the
+        # parse-site fix above, not a substitute for it.
         servers = await self._repo.list()
         for server in servers:
             if not server.enabled:
                 continue
-            await self._probe_and_store(server)
+            try:
+                await self._probe_and_store(server)
+            except Exception:
+                logger.exception("health probe failed for server '%s'", server.slug)
 
     async def poll_one(self, slug: str) -> None:
         """Probe a single server immediately, outside the normal poll cycle — used right after

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Optional
 
 import aiosqlite
+from pydantic import ValidationError
 
 from .database import Database, utcnow
 from .models import ApiKeyRecord, ParamRule, ServerPolicy, ServerRecord
+
+logger = logging.getLogger("db.repo")
+
+_UNSET = object()  # sentinel: distinguishes "argument omitted" from "argument is None"
 
 
 class ServerNotFoundError(Exception):
@@ -32,6 +38,7 @@ def _row_to_server(row: aiosqlite.Row) -> ServerRecord:
         discover_json=row["discover_json"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        upstream_auth_header=row["upstream_auth_header"],
     )
 
 
@@ -59,9 +66,26 @@ class ServerRepo:
         return self._db.gateway
 
     async def list(self) -> list[ServerRecord]:
+        # F4 fix (review 2026-08-04): defense-in-depth half. The CREATE path now validates the
+        # slug (archon/schemas.py's _validate_slug) so a bad row shouldn't be writable anymore
+        # — but this is the method that used to turn any bad row already in the DB (from before
+        # the fix, or any path that bypasses the API validator) into a PERMANENT outage: every
+        # caller of list() (GET /servers, GET /stats, aggregate tools/list/discover, the health
+        # poller) would raise on the Pydantic ValidationError inside _row_to_server, with no way
+        # to even see the bad row to delete it. Skip-and-log instead of propagating, so one bad
+        # row degrades to "one server invisible" rather than "everything that calls list() is
+        # down."
         cur = await self._read.execute("SELECT * FROM servers ORDER BY slug")
         rows = await cur.fetchall()
-        return [_row_to_server(r) for r in rows]
+        result = []
+        for r in rows:
+            try:
+                result.append(_row_to_server(r))
+            except ValidationError as e:
+                logger.error(
+                    "skipping unparseable servers row id=%s slug=%r: %s", r["id"], r["slug"], e
+                )
+        return result
 
     async def get(self, slug: str) -> ServerRecord:
         cur = await self._read.execute("SELECT * FROM servers WHERE slug = ?", (slug,))
@@ -84,6 +108,7 @@ class ServerRepo:
         upstream_url: str,
         enabled: bool = True,
         in_aggregate: bool = True,
+        upstream_auth_header: Optional[str] = None,
     ) -> ServerRecord:
         # F7: two-table write (servers + server_policies) — serialize against other gateway.db
         # writers so a concurrent commit can't land between the INSERT and its paired policy row.
@@ -97,9 +122,11 @@ class ServerRepo:
                 now = utcnow()
                 cur = await self._write.execute(
                     """INSERT INTO servers
-                       (slug, name, upstream_url, enabled, in_aggregate, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (slug, name, upstream_url, int(enabled), int(in_aggregate), now, now),
+                       (slug, name, upstream_url, enabled, in_aggregate, upstream_auth_header,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (slug, name, upstream_url, int(enabled), int(in_aggregate),
+                     upstream_auth_header, now, now),
                 )
                 await self._write.execute(
                     "INSERT INTO server_policies (server_id, mode, updated_at) VALUES (?, 'passthrough', ?)",
@@ -118,6 +145,7 @@ class ServerRepo:
         upstream_url: Optional[str] = None,
         enabled: Optional[bool] = None,
         in_aggregate: Optional[bool] = None,
+        upstream_auth_header: object = _UNSET,
     ) -> ServerRecord:
         current = await self.get(slug)
         fields, values = [], []
@@ -133,6 +161,13 @@ class ServerRepo:
         if in_aggregate is not None:
             fields.append("in_aggregate = ?")
             values.append(int(in_aggregate))
+        if upstream_auth_header is not _UNSET:
+            # F23: unlike the other fields, None here is meaningful ("clear the configured
+            # credential"), so a sentinel distinguishes "field omitted, don't touch it" from
+            # "field explicitly set to null" — the None-means-omitted convention every other
+            # field on this method uses would make it impossible to ever clear a credential.
+            fields.append("upstream_auth_header = ?")
+            values.append(upstream_auth_header)
         if not fields:
             return current
         fields.append("updated_at = ?")
@@ -197,6 +232,59 @@ class ServerRepo:
         return ServerPolicy(
             mode=mode, rate_limit=rate_limit, allowed=allowed, denied=denied, param_rules=param_rules
         )
+
+    async def get_policies_for(self, server_ids: list[int]) -> dict[int, ServerPolicy]:
+        """F14 fix (review 2026-08-04): batched version of get_policy for the aggregate
+        endpoint, which used to call get_policy() once PER SERVER (3 round-trips each) inside
+        a loop — 3N queries for N registered servers. One query per table with
+        `WHERE server_id IN (...)`, grouped in Python, returns the same data in 3 queries
+        total regardless of how many servers are being fetched. Servers with no policy row yet
+        get the same passthrough/no-rate-limit default get_policy() returns."""
+        if not server_ids:
+            return {}
+        placeholders = ",".join("?" for _ in server_ids)
+
+        cur = await self._read.execute(
+            f"SELECT server_id, mode, rate_limit FROM server_policies WHERE server_id IN ({placeholders})",
+            server_ids,
+        )
+        policy_rows = {r["server_id"]: r for r in await cur.fetchall()}
+
+        cur = await self._read.execute(
+            f"SELECT server_id, tool_name, action FROM tool_policies WHERE server_id IN ({placeholders})",
+            server_ids,
+        )
+        allowed_by_id: dict[int, list[str]] = {sid: [] for sid in server_ids}
+        denied_by_id: dict[int, list[str]] = {sid: [] for sid in server_ids}
+        for r in await cur.fetchall():
+            (allowed_by_id if r["action"] == "allow" else denied_by_id)[r["server_id"]].append(r["tool_name"])
+
+        cur = await self._read.execute(
+            f"""SELECT server_id, tool_name, param_name, max_length, max_value, min_value, denied, block_patterns
+                FROM param_rules WHERE server_id IN ({placeholders})""",
+            server_ids,
+        )
+        param_rules_by_id: dict[int, dict[str, dict[str, ParamRule]]] = {sid: {} for sid in server_ids}
+        for r in await cur.fetchall():
+            param_rules_by_id[r["server_id"]].setdefault(r["tool_name"], {})[r["param_name"]] = ParamRule(
+                max_length=r["max_length"],
+                max_value=r["max_value"],
+                min_value=r["min_value"],
+                denied=bool(r["denied"]),
+                block_patterns=json.loads(r["block_patterns"]) if r["block_patterns"] else [],
+            )
+
+        result = {}
+        for sid in server_ids:
+            row = policy_rows.get(sid)
+            result[sid] = ServerPolicy(
+                mode=row["mode"] if row else "passthrough",
+                rate_limit=row["rate_limit"] if row else None,
+                allowed=allowed_by_id[sid],
+                denied=denied_by_id[sid],
+                param_rules=param_rules_by_id[sid],
+            )
+        return result
 
     async def set_policy(self, server_id: int, policy: ServerPolicy) -> None:
         # F7: this is the exact multi-statement write (DELETE-then-reinsert across three
@@ -395,10 +483,28 @@ class AuditRepo:
         row = await cur.fetchone()
         return row[0] if row else 0
 
-    async def prune_older_than(self, cutoff_iso: str) -> int:
-        cur = await self._conn.execute("DELETE FROM audit_events WHERE ts < ?", (cutoff_iso,))
-        await self._conn.commit()
-        return cur.rowcount if cur.rowcount is not None else 0
+    async def prune_older_than(self, cutoff_iso: str, batch_size: int = 5000) -> int:
+        # §26 fix (review 2026-08-04): a single unbounded DELETE here could touch an
+        # arbitrarily large number of rows in one transaction — e.g. after retention was
+        # disabled for a while and a large backlog built up. audit.db has a single connection
+        # (AuditLogger's batched flush is its only normal writer), and a long-running DELETE
+        # transaction would block that flush loop from persisting new events for however long
+        # the DELETE takes. SQLite has no native DELETE ... LIMIT, so batch via rowid subquery
+        # instead, committing between batches so the flush loop never waits longer than one
+        # batch's worth of work.
+        total_deleted = 0
+        while True:
+            cur = await self._conn.execute(
+                "DELETE FROM audit_events WHERE id IN "
+                "(SELECT id FROM audit_events WHERE ts < ? LIMIT ?)",
+                (cutoff_iso, batch_size),
+            )
+            await self._conn.commit()
+            deleted = cur.rowcount if cur.rowcount is not None else 0
+            total_deleted += deleted
+            if deleted < batch_size:
+                break
+        return total_deleted
 
 
 class SettingsRepo:

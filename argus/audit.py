@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from db.repo import AuditRepo
 
@@ -121,15 +121,3 @@ class AuditLogger:
                 await self._repo.insert_many(batch)
             except Exception:
                 logger.exception("failed to persist %d audit events", len(batch))
-
-
-def summarize_args_for_audit(args_summary: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Args are already truncated by policy.summarize_args before reaching here — this is a
-    defensive re-truncation in case a caller passes raw arguments directly."""
-    if args_summary is None:
-        return None
-    result = {}
-    for k, v in args_summary.items():
-        s = str(v)
-        result[k] = (s[:120] + " [truncated]") if len(s) > 120 else s
-    return result

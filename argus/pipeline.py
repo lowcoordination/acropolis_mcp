@@ -29,10 +29,20 @@ from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
 from argus.policy import evaluate
 from argus.rate_limiter import RateLimiterRegistry, server_key, tool_key
 from argus.toolslist import ToolsCache
-from db.models import ServerRecord
+from db.models import ServerPolicy, ServerRecord
 from db.repo import ServerRepo, SettingsRepo
 
 logger = logging.getLogger("argus.pipeline")
+
+
+def _client_ip(request: Request) -> Optional[str]:
+    """F22 fix (review 2026-08-04): client_ip is a parameter on AuditLogger.log() and a column
+    in audit_events — grep confirmed no call site anywhere ever passed it, so every audit
+    record had client_ip = NULL. For a gateway whose selling point is auditability, not being
+    able to attribute a blocked/allowed call to a source materially undercuts the feature for
+    incident response. request.client.host is available at every call site that has a Request
+    object; this small helper is threaded through instead of duplicating the None-check."""
+    return request.client.host if request.client else None
 
 
 class RoutingError(Exception):
@@ -115,6 +125,7 @@ class Pipeline:
                 status_code=e.status_code,
                 latency_ms=int((time.monotonic() - start) * 1000),
                 reason=e.body[:200],
+                client_ip=_client_ip(request),
             )
             return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
 
@@ -204,6 +215,7 @@ class Pipeline:
         rpc_id: Any = None
         rpc_method: str = ""
         tool_name: Optional[str] = None
+        client_ip = _client_ip(request)
 
         if request.method == "POST" and body_bytes:
             try:
@@ -239,6 +251,7 @@ class Pipeline:
                             endpoint="per-server", rpc_method=rpc_method,
                             api_key_id=api_key_id, reason="Mcp-Method/Mcp-Name header mismatch",
                             status_code=400, latency_ms=int((time.monotonic() - start) * 1000),
+                            client_ip=client_ip,
                         )
                         return mismatch_response
 
@@ -248,12 +261,12 @@ class Pipeline:
                     return self._handle_discover(server, rpc_id)
 
                 if rpc_method == "tools/list" and self._tools_cache is not None:
-                    return await self._handle_tools_list(server, rpc_id, api_key_id, start)
+                    return await self._handle_tools_list(server, rpc_id, api_key_id, start, client_ip)
 
                 if generation == ClientGeneration.GEN_2026 and self._bridge is not None:
                     return await self._handle_bridged(
                         server, rpc_method, rpc_id, params, body_json.get("_meta"),
-                        api_key_id, start,
+                        api_key_id, start, client_ip,
                     )
 
                 if rpc_method == "tools/call":
@@ -270,20 +283,20 @@ class Pipeline:
                             server_slug=server.slug, tool="<missing>", decision="BLOCKED",
                             endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
                             reason="tools/call missing required 'name' field", status_code=400,
-                            latency_ms=int((time.monotonic() - start) * 1000),
+                            latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
                         )
                         return Response(
                             content=rpc_error(rpc_id, "tools/call missing required 'name' field"),
                             status_code=400, media_type="application/json",
                         )
 
+                    policy = await self._servers.get_policy(server.id)
                     blocked_response = await self._check_rate_limits(
-                        server, tool_name, api_key_id, rpc_id, start
+                        server, policy, tool_name, api_key_id, rpc_id, start, client_ip
                     )
                     if blocked_response is not None:
                         return blocked_response
 
-                    policy = await self._servers.get_policy(server.id)
                     decision = await evaluate(tool_name, arguments, server.name, policy)
                     await self._audit.log(
                         server_slug=server.slug, tool=tool_name,
@@ -291,7 +304,7 @@ class Pipeline:
                         endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
                         rule=decision.rule, matched=decision.matched,
                         args_summary=decision.args_summary, reason=decision.reason,
-                        latency_ms=int((time.monotonic() - start) * 1000),
+                        latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
                     )
 
                     if decision.blocked:
@@ -306,7 +319,7 @@ class Pipeline:
                     await self._audit.log(
                         server_slug=server.slug, tool=body_name, decision="PASSTHROUGH",
                         endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
-                        latency_ms=int((time.monotonic() - start) * 1000),
+                        latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
                     )
 
         return await self._forward(request, server, path, body_bytes)
@@ -319,14 +332,17 @@ class Pipeline:
         )
 
     async def _handle_tools_list(
-        self, server: ServerRecord, rpc_id: Any, api_key_id: Optional[int], start: float
+        self, server: ServerRecord, rpc_id: Any, api_key_id: Optional[int], start: float,
+        client_ip: Optional[str] = None,
     ) -> Response:
         policy = await self._servers.get_policy(server.id)
-        tools = await self._tools_cache.get_filtered_tools(server.id, server.upstream_url, policy)
+        tools = await self._tools_cache.get_filtered_tools(
+            server.id, server.upstream_url, policy, upstream_auth_header=server.upstream_auth_header
+        )
         await self._audit.log(
             server_slug=server.slug, tool=None, decision="PASSTHROUGH",
             endpoint="per-server", rpc_method="tools/list", api_key_id=api_key_id,
-            latency_ms=int((time.monotonic() - start) * 1000),
+            latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
         )
         return Response(
             content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": {"tools": tools}}),
@@ -336,6 +352,7 @@ class Pipeline:
     async def _handle_bridged(
         self, server: ServerRecord, rpc_method: str, rpc_id: Any, params: dict,
         meta: Optional[dict], api_key_id: Optional[int], start: float,
+        client_ip: Optional[str] = None,
     ) -> Response:
         if rpc_method == "tools/call":
             tool_name = params.get("name")
@@ -347,17 +364,20 @@ class Pipeline:
                     endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
                     reason="tools/call missing required 'name' field", status_code=400,
                     latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
+                    client_ip=client_ip,
                 )
                 return Response(
                     content=rpc_error(rpc_id, "tools/call missing required 'name' field"),
                     status_code=400, media_type="application/json",
                 )
 
-            blocked_response = await self._check_rate_limits(server, tool_name, api_key_id, rpc_id, start)
+            policy = await self._servers.get_policy(server.id)
+            blocked_response = await self._check_rate_limits(
+                server, policy, tool_name, api_key_id, rpc_id, start, client_ip
+            )
             if blocked_response is not None:
                 return blocked_response
 
-            policy = await self._servers.get_policy(server.id)
             decision = await evaluate(tool_name, arguments, server.name, policy)
             await self._audit.log(
                 server_slug=server.slug, tool=tool_name,
@@ -366,6 +386,7 @@ class Pipeline:
                 rule=decision.rule, matched=decision.matched,
                 args_summary=decision.args_summary, reason=decision.reason,
                 latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
+                client_ip=client_ip,
             )
             if decision.blocked:
                 return Response(
@@ -380,19 +401,21 @@ class Pipeline:
                 server_slug=server.slug, tool=None, decision="PASSTHROUGH",
                 endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
                 latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
+                client_ip=client_ip,
             )
 
         try:
             status, body = await self._bridge.bridge_call(
                 server_id=server.id, upstream_url=server.upstream_url, rpc_method=rpc_method,
                 rpc_id=rpc_id, params=params, meta=meta,
+                upstream_auth_header=server.upstream_auth_header,
             )
         except BridgeError as e:
             await self._audit.log(
                 server_slug=server.slug, tool=None, decision="ERROR",
                 endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
                 reason=e.body[:200], status_code=e.status_code, bridged=True,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
             )
             return Response(content=e.body, status_code=e.status_code, media_type="application/json")
 
@@ -414,7 +437,9 @@ class Pipeline:
         return None
 
     async def _check_rate_limits(
-        self, server: ServerRecord, tool_name: str, api_key_id: Optional[int], rpc_id: Any, start: float
+        self, server: ServerRecord, policy: ServerPolicy, tool_name: str,
+        api_key_id: Optional[int], rpc_id: Any, start: float,
+        client_ip: Optional[str] = None,
     ) -> Optional[Response]:
         # F8 fix (review 2026-08-04): this used to be `if policy.rate_limit and not
         # is_registered(srv_key): register(...)` — a bucket was built ONCE per process and
@@ -443,7 +468,12 @@ class Pipeline:
         # scope for this fix. Removed the dead api_key_key construction rather than leave code
         # that LOOKED like it enforced a per-key limit while doing nothing; see F23-adjacent
         # design-gap note in the vault (03-reliability-and-ops.md) for where to land it.
-        policy = await self._servers.get_policy(server.id)
+        #
+        # §26 fix (review 2026-08-04): `policy` used to be fetched HERE via a fresh
+        # self._servers.get_policy(server.id) call, and the caller fetched it AGAIN
+        # immediately afterward to evaluate the tool decision — two DB reads of the same,
+        # request-scoped-immutable data per tools/call. Now the caller fetches once and passes
+        # it in.
         srv_key = server_key(server.slug)
         if policy.rate_limit:
             self._rate_limiter.ensure_current(srv_key, policy.rate_limit)
@@ -457,7 +487,7 @@ class Pipeline:
                 server_slug=server.slug, tool=tool_name, decision="BLOCKED",
                 endpoint="per-server", rpc_method="tools/call", api_key_id=api_key_id,
                 rule="rate_limit", reason="Rate limit exceeded",
-                latency_ms=int((time.monotonic() - start) * 1000),
+                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
             )
             return Response(
                 content=rpc_error(rpc_id, "Rate limit exceeded", data={"tool": tool_name}),
@@ -482,10 +512,32 @@ class Pipeline:
         )
         forward_headers = strip_hop_by_hop(request.headers.raw)
 
+        # F23 fix (review 2026-08-04): if this server has a configured upstream credential,
+        # inject it as the Authorization header sent to the upstream — this is the actual
+        # mechanism the design gap was about. Appended AFTER strip_hop_by_hop, and as a plain
+        # list append rather than a header-merge, so it always wins even though the client's
+        # own Authorization was already stripped (F5) — there should never be two.
+        if server.upstream_auth_header:
+            forward_headers = [
+                (k, v) for k, v in forward_headers if k.lower() != b"authorization"
+            ]
+            forward_headers.append((b"authorization", server.upstream_auth_header.encode()))
+
         upstream_req = self._client.build_request(
             method=request.method, url=upstream_url, content=body_bytes, headers=forward_headers,
         )
-        r = await self._client.send(upstream_req, stream=True)
+        # F3 fix (review 2026-08-04): self._client.send() had no exception handling — any httpx
+        # transport error (refused connection, DNS failure, TLS error) escaped as an unhandled
+        # exception, past Pipeline.handle's `except RoutingError` (the only thing that logs an
+        # audit event), all the way to Starlette as a bare 500 with a stack trace and a
+        # non-JSON-RPC body. This is the MOST LIKELY real-world event in a self-hosted
+        # deployment — an MCP server container restarting — and it broke in the ugliest
+        # possible way, with the gateway's own audit trail showing nothing happened. The
+        # bridged path (argus/bridge.py:106) already handled this correctly; matched here.
+        try:
+            r = await self._client.send(upstream_req, stream=True)
+        except httpx.HTTPError as e:
+            raise RoutingError(502, rpc_error(None, f"upstream request failed: {e}"))
 
         return StreamingResponse(
             r.aiter_raw(), status_code=r.status_code,

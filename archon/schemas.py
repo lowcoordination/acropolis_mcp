@@ -7,7 +7,29 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, field_validator
 
-from db.models import ParamRule, ServerPolicy
+from db.models import SLUG_RE, ParamRule, ServerPolicy
+
+
+def _validate_slug(slug: str) -> str:
+    """F4 fix (review 2026-08-04): ServerCreateRequest had no slug validator at all. The DB
+    CHECK constraint (`slug GLOB '[a-z0-9-]*'`) only constrains the FIRST character — GLOB `*`
+    matches any sequence of any characters — so 'a_b', 'ab__cd', 'a/../b', 'a b' all passed it.
+    ServerRepo.create then did `return await self.get(slug)`, which constructs a ServerRecord
+    whose Pydantic validator (db/models.py's SLUG_RE) rejects the same string — AFTER the row
+    was already committed. Every subsequent ServerRepo.list() call then raised, permanently
+    bricking GET /servers, /stats, aggregate tools/list/discover, and health polling, with no
+    way to delete the row via the API since every path that could select it also raised.
+    Validating here, before the row is ever written, is the actual fix — see db/repo.py's
+    ServerRepo.list() for the defense-in-depth half (skip-and-log instead of propagating, in
+    case a bad row exists from some other path).
+
+    This same [a-z0-9-]+ constraint also incidentally closes the '__' aggregate-namespace-
+    separator collision the review flagged (argus/aggregate.py's TOOL_NAME_SEPARATOR = '__') —
+    underscore was never in this character class, so a slug can never contain '__' once this
+    validator actually runs. No separate check needed."""
+    if not SLUG_RE.match(slug):
+        raise ValueError(f"slug must match [a-z0-9-]+: {slug!r}")
+    return slug
 
 
 def _validate_upstream_url(url: str) -> str:
@@ -55,6 +77,17 @@ class ServerCreateRequest(BaseModel):
     upstream_url: str
     enabled: bool = True
     in_aggregate: bool = True
+    # F23 fix (review 2026-08-04): a literal Authorization header value for THIS server's
+    # upstream, e.g. "Bearer sk-..." or "Basic <base64>". Optional — most homelab MCP servers
+    # are unauthenticated on a trusted network. Show-once semantics like API keys aren't
+    # practical here (the gateway needs the plaintext on every proxied call), so instead it's
+    # simply never returned by GET/list endpoints — see ServerResponse below.
+    upstream_auth_header: Optional[str] = None
+
+    @field_validator("slug")
+    @classmethod
+    def _check_slug(cls, v: str) -> str:
+        return _validate_slug(v)
 
     @field_validator("upstream_url")
     @classmethod
@@ -67,6 +100,12 @@ class ServerUpdateRequest(BaseModel):
     upstream_url: Optional[str] = None
     enabled: Optional[bool] = None
     in_aggregate: Optional[bool] = None
+    # F23: omitting this key from the JSON body means "don't touch it" (checked via
+    # `"upstream_auth_header" in body.model_fields_set` in archon/api.py's route handler, wired
+    # through to ServerRepo.update's _UNSET sentinel); an explicit `null` means "clear the
+    # configured credential". This is why it can't just default to None like the other
+    # Optional fields above — None is a meaningful value here, not "field omitted".
+    upstream_auth_header: Optional[str] = None
 
     @field_validator("upstream_url")
     @classmethod
@@ -85,6 +124,9 @@ class ServerResponse(BaseModel):
     last_seen_at: Optional[str]
     created_at: str
     updated_at: str
+    # F23: whether a credential is configured, WITHOUT ever exposing its value — lets the UI
+    # show "credential configured" state without a round-trip that could leak the secret.
+    has_upstream_auth_header: bool = False
 
 
 class PolicyResponse(BaseModel):

@@ -106,6 +106,24 @@ async def test_after_setup_control_plane_requires_auth(client, app_transport):
         assert resp.status_code == 401
 
 
+async def test_health_endpoint_reachable_unauthenticated_after_setup(client, app_transport):
+    """F21 regression (review 2026-08-04): /api/v1/health used to live behind require_admin.
+    Empirically confirmed against a real container: it returned 200 unauthenticated BEFORE
+    setup and 401 AFTER — exactly backwards from what the Dockerfile HEALTHCHECK and k8s
+    liveness/readiness probes need, since they run continuously and specifically need it to
+    keep working once the gateway is actually configured and in real use. The k8s
+    livenessProbe (periodSeconds=30, failureThreshold=3) kills the pod ~90s after setup
+    completes, and CrashLoopBackOffs indefinitely from there."""
+    await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
+    async with httpx.AsyncClient(transport=app_transport, base_url="http://argus.test") as fresh:
+        resp = await fresh.get("/api/v1/health")
+        assert resp.status_code == 200, (
+            f"health check must stay reachable with NO credentials even after setup "
+            f"completes, got {resp.status_code}"
+        )
+        assert resp.json() == {"status": "ok"}
+
+
 async def test_session_cookie_grants_access_after_setup(client):
     setup_resp = await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
     assert setup_resp.status_code == 200

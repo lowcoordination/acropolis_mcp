@@ -9,7 +9,9 @@ import aiosqlite
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
-_GATEWAY_MIGRATIONS = ["0001_init.sql"]
+_GATEWAY_MIGRATIONS = [
+    "0001_init.sql", "0002_tighten_slug_check.sql", "0003_add_upstream_credential.sql",
+]
 _AUDIT_MIGRATIONS = ["0001_init_audit.sql"]
 
 
@@ -42,8 +44,27 @@ def _version_from_filename(filename: str) -> int:
     return int(m.group(1))
 
 
-async def _apply_migrations(conn: aiosqlite.Connection, filenames: list[str]) -> None:
+class SchemaTooNewError(Exception):
+    """Raised when the on-disk database has migrations applied that this binary doesn't know
+    about — e.g. an operator rolled back to an older image after a newer one already migrated
+    the data. Running anyway risks the old code silently misinterpreting (or dropping writes
+    into) columns/tables it was never taught about; refusing to start is the safe failure mode
+    (review finding F25, 2026-08-04)."""
+
+
+async def _apply_migrations(conn: aiosqlite.Connection, filenames: list[str], db_name: str) -> None:
     applied = await _applied_versions(conn)
+    known_versions = {_version_from_filename(f) for f in filenames}
+    unknown = applied - known_versions
+    if unknown:
+        raise SchemaTooNewError(
+            f"{db_name}: database has migration version(s) {sorted(unknown)} applied that this "
+            f"binary does not recognize (it knows up to {max(known_versions, default=0)}). This "
+            f"usually means the data directory was used by a newer version of Acropolis. "
+            f"Upgrade the binary/image to match, or restore from a backup taken before the "
+            f"newer version ran — do not downgrade against a migrated database."
+        )
+
     for filename in filenames:
         version = _version_from_filename(filename)
         if version in applied:
@@ -99,8 +120,8 @@ class Database:
         self.gateway = await _connect(self.data_dir / "gateway.db")
         self.gateway_read = await _connect(self.data_dir / "gateway.db")
         self.audit = await _connect(self.data_dir / "audit.db")
-        await _apply_migrations(self.gateway, _GATEWAY_MIGRATIONS)
-        await _apply_migrations(self.audit, _AUDIT_MIGRATIONS)
+        await _apply_migrations(self.gateway, _GATEWAY_MIGRATIONS, "gateway.db")
+        await _apply_migrations(self.audit, _AUDIT_MIGRATIONS, "audit.db")
 
     async def close(self) -> None:
         if self.gateway is not None:

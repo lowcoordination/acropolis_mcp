@@ -5,6 +5,7 @@ import enum
 import logging
 import multiprocessing
 import queue
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -62,6 +63,15 @@ _regex_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REGEX_CHECKS)
 _wait_executor = ThreadPoolExecutor(
     max_workers=_MAX_CONCURRENT_REGEX_CHECKS, thread_name_prefix="policy-regex-wait"
 )
+# §26 (review 2026-08-04): considered adding an explicit shutdown() for this executor, called
+# from the app lifespan, to avoid a benign "Event loop is closed" warning from a worker thread
+# finishing after atexit tears things down. Reverted: _wait_executor is a MODULE-level
+# singleton, so any one app's shutdown would permanently poison it for every other app sharing
+# the process — true of the test suite (many create_app() calls per pytest process) and not
+# safely ruled out for any future multi-app-per-process use. The warning is cosmetic
+# (interpreter-shutdown-only, no test or request ever failed because of it); a correctness
+# regression to silence it is the wrong trade. Left as process-lifetime + atexit, as it always
+# was, until this executor is made per-app-instance rather than global.
 
 
 class MatchOutcome(enum.Enum):
@@ -140,10 +150,22 @@ class Decision:
     args_summary: Optional[dict] = None
 
 
+# §26 fix (review 2026-08-04): summarize_args's docstring claimed it avoided logging secrets
+# verbatim, but it only truncated by LENGTH — a short secret (an 8-character API key, a PIN)
+# sailed straight into the audit log untouched. Redact by key name first; length-truncation
+# alone was never sufficient for this purpose.
+_SENSITIVE_ARG_KEY_RE = re.compile(
+    r"(token|password|passwd|secret|key|authorization|credential|api[_-]?key)", re.IGNORECASE
+)
+
+
 def summarize_args(arguments: dict) -> dict:
-    """Truncate argument values for the audit log — avoid logging secrets verbatim."""
+    """Redact-then-truncate argument values for the audit log — avoid logging secrets verbatim."""
     summary = {}
     for k, v in arguments.items():
+        if _SENSITIVE_ARG_KEY_RE.search(k):
+            summary[k] = "[redacted]"
+            continue
         s = str(v)
         summary[k] = (s[:120] + " [truncated]") if len(s) > 120 else s
     return summary

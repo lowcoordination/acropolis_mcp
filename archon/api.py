@@ -29,7 +29,7 @@ from argus.rate_limiter import RateLimiterRegistry, server_key
 from argus.toolslist import ToolsCache
 from db.database import utcnow
 from db.repo import AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
-from stoa.health import HealthPoller
+from stoa.health import PROBE_TIMEOUT_SECONDS, HealthPoller
 
 # Settings keys + defaults, applied when a key is absent from the settings table.
 _SETTINGS_DEFAULTS = {
@@ -46,6 +46,7 @@ def _server_to_response(server) -> ServerResponse:
         enabled=server.enabled, in_aggregate=server.in_aggregate,
         upstream_protocol=server.upstream_protocol, health_status=server.health_status,
         last_seen_at=server.last_seen_at, created_at=server.created_at, updated_at=server.updated_at,
+        has_upstream_auth_header=server.upstream_auth_header is not None,
     )
 
 
@@ -73,9 +74,13 @@ def build_control_plane_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
-    @router.get("/health")
-    async def health():
-        return {"status": "ok"}
+    # F21 fix (review 2026-08-04): /api/v1/health used to live HERE, behind require_admin —
+    # but both the Dockerfile HEALTHCHECK and the k8s liveness/readiness probes target it
+    # unauthenticated. Once first-run setup completes, they started getting 401s: the k8s pod
+    # entered a restart loop (livenessProbe failureThreshold=3 * periodSeconds=30 ≈ pod killed
+    # ~90s after setup) and the compose container reported permanently unhealthy. Moved to
+    # archon/setup.py's router, which is deliberately never behind require_admin — see that
+    # module for the actual route.
 
     @router.get("/servers", response_model=list[ServerResponse])
     async def list_servers():
@@ -88,6 +93,7 @@ def build_control_plane_router(
             server = await server_repo.create(
                 slug=body.slug, name=body.name, upstream_url=body.upstream_url,
                 enabled=body.enabled, in_aggregate=body.in_aggregate,
+                upstream_auth_header=body.upstream_auth_header,
             )
         except SlugConflictError:
             raise HTTPException(status_code=409, detail=f"server slug '{body.slug}' already exists")
@@ -116,7 +122,27 @@ def build_control_plane_router(
             if tools_cache is not None:
                 # A manual re-probe is also the natural moment to refresh the tool catalog —
                 # e.g. after the operator adds a new tool to their own MCP server.
-                await tools_cache.get_raw_tools(server.id, server.upstream_url, force_refresh=True)
+                #
+                # §26 fix (review 2026-08-04): get_raw_tools has no timeout of its own — it
+                # rides the shared http client's default (settings.upstream_timeout_seconds,
+                # 120s), sized for a real tool call, not a quick "did the probe work" check.
+                # poll_one() above is already bounded to PROBE_TIMEOUT_SECONDS (10s), but this
+                # follow-up tools/list call was not, so this endpoint — meant to feel like an
+                # instant re-probe click in the UI — could hang the HTTP request for up to
+                # ~130s total against a slow/hung upstream. Bound it to the same probe budget;
+                # a timed-out tools refresh just means the operator sees the OLD cached tool
+                # list a little longer, which is a fine degradation for what's meant to be a
+                # quick health check, not a hard failure.
+                try:
+                    await asyncio.wait_for(
+                        tools_cache.get_raw_tools(
+                            server.id, server.upstream_url, force_refresh=True,
+                            upstream_auth_header=server.upstream_auth_header,
+                        ),
+                        timeout=PROBE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    pass
         return _server_to_response(await server_repo.get(slug))
 
     @router.get("/servers/{slug}", response_model=ServerResponse)
@@ -129,10 +155,19 @@ def build_control_plane_router(
 
     @router.put("/servers/{slug}", response_model=ServerResponse)
     async def update_server(slug: str, body: ServerUpdateRequest):
+        # F23: upstream_auth_header needs three states (unset/set-to-value/cleared-to-null),
+        # which a plain `Optional[str] = None` field can't distinguish on its own — checking
+        # model_fields_set tells us whether the key was present in the request body at all.
+        from db.repo import _UNSET
+
+        auth_header_update = (
+            body.upstream_auth_header if "upstream_auth_header" in body.model_fields_set else _UNSET
+        )
         try:
             server = await server_repo.update(
                 slug, name=body.name, upstream_url=body.upstream_url,
                 enabled=body.enabled, in_aggregate=body.in_aggregate,
+                upstream_auth_header=auth_header_update,
             )
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
@@ -162,7 +197,9 @@ def build_control_plane_router(
         if tools_cache is None:
             return []
 
-        tools = await tools_cache.get_raw_tools(server.id, server.upstream_url)
+        tools = await tools_cache.get_raw_tools(
+            server.id, server.upstream_url, upstream_auth_header=server.upstream_auth_header
+        )
         result = []
         for tool in tools:
             name = tool.get("name", "")

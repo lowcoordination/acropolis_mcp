@@ -2,6 +2,8 @@
 name = "acropolis"
 version = "0.1.0"
 description = "Acropolis (Argus/Archon/Stoa) — a self-hostable MCP gateway, policy engine, and registration hub"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
@@ -32,6 +34,15 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["argus*", "archon*", "stoa*", "db*"]
+
+[tool.setuptools.package-data]
+# db/database.py resolves MIGRATIONS_DIR relative to its own file location (not
+# importlib.resources), so the .sql files must land on disk next to database.py for ANY install
+# method — not just the Docker image, where `COPY db/ ./db/` happens to preserve them by copying
+# the raw source tree rather than building a wheel. Without this, `pip install .` (e.g. the
+# `acropolis` console-script entry point installed from a real wheel/sdist) silently drops every
+# migration file, and the first `db.connect()` call 500s with FileNotFoundError.
+db = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

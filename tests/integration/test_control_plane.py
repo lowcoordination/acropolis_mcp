@@ -256,3 +256,29 @@ async def test_admin_auth_enforced_when_token_set(tmp_path: Path):
             )
             assert authed.status_code == 200
     await db.close()
+
+
+async def test_admin_auth_rejects_non_ascii_bearer_token_without_crashing(tmp_path: Path):
+    """§26 fix (review 2026-08-04): hmac.compare_digest raises TypeError on a str containing
+    non-ASCII characters. The presented token is attacker-controlled (straight off the
+    Authorization header), so a non-ASCII token must fail auth cleanly (401), not 500.
+
+    Sent as raw bytes rather than a plain str header — httpx itself refuses to encode a non-ASCII
+    str as a header value client-side (UnicodeEncodeError before the request is even sent), which
+    isn't the real attack surface: a real ASGI server decodes incoming header BYTES as latin-1
+    into a str, so a client sending UTF-8-encoded non-ASCII bytes on the wire is exactly what
+    reaches require_admin as a non-ASCII str. httpx passes bytes headers through unvalidated,
+    reproducing that path."""
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", admin_token="secret123", health_poll_enabled=False, audit_retention_enabled=False)
+    db = Database(tmp_path)
+    await db.connect()
+    app = create_app(settings, db)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
+            resp = await client.get(
+                "/api/v1/servers",
+                headers={"Authorization": "Bearer évil-token".encode("utf-8")},
+            )
+            assert resp.status_code == 401
+    await db.close()

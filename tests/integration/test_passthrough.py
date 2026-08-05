@@ -207,6 +207,39 @@ async def test_blocked_call_is_persisted_to_audit_log(argus_client):
     assert events[0]["rule"] == "allowlist"
 
 
+async def test_audit_log_records_client_ip(argus_client):
+    """F22 regression (review 2026-08-04): client_ip is a parameter on AuditLogger.log() and a
+    column in audit_events — grep confirmed no call site anywhere ever passed it, so every
+    record had client_ip = NULL. The test fixture's ASGITransport reports a fixed client
+    ('127.0.0.1', 123) unless overridden — this asserts the real value actually lands in the
+    persisted row, not just that the column exists.
+
+    Deliberately uses a BLOCKED call (never reaches the upstream) rather than a real
+    passthrough tools/call: a real call goes through _forward's StreamingResponse against the
+    live FastMCP fixture, and a real session handshake + streamed body right before this
+    fixture tears down was observed to destabilize the NEXT test's own, unrelated FastMCP
+    fixture (RemoteProtocolError) — a pre-existing streaming-teardown fragility in the test
+    fixtures, not something this test needs to exercise to prove client_ip is recorded."""
+    client, server_repo, _, db = argus_client
+    server = await server_repo.get("test-server")
+    await server_repo.set_policy(server.id, ServerPolicy(mode="allowlist", allowed=["echo"]))
+
+    resp = await client.post(
+        "/mcp/test-server", json=_tool_call_body("write_file", {"path": "/x", "content": "y"}),
+        headers=MCP_HEADERS,
+    )
+    assert resp.status_code == 403
+
+    await asyncio.sleep(0.3)
+
+    audit_repo = AuditRepo(db)
+    events = await audit_repo.query(server_slug="test-server", decision="BLOCKED")
+    assert len(events) >= 1
+    assert events[-1]["client_ip"] == "127.0.0.1", (
+        f"expected client_ip to be recorded, got {events[-1]['client_ip']!r}"
+    )
+
+
 async def test_slow_tool_streams_through(argus_client):
     client, _, upstream, _ = argus_client
     headers = await _initialized_session_headers(client)
@@ -284,3 +317,39 @@ async def test_header_match_allowed_through(argus_client):
     )
     assert resp.status_code == 200
     assert upstream.call_counter.get("echo") == 1
+
+
+async def test_tools_call_fetches_policy_only_once(argus_client, monkeypatch):
+    """§26 fix (review 2026-08-04): a single tools/call used to fetch the server's policy
+    TWICE — once inside _check_rate_limits (to read policy.rate_limit) and again immediately
+    afterward by the caller (to evaluate the tool decision) — two DB reads of the same,
+    request-scoped-immutable data per call. Now the caller fetches once and passes it through.
+
+    Patches the ServerRepo CLASS method (not the fixture's own server_repo instance) — the
+    running app's Pipeline holds a SEPARATE ServerRepo instance constructed internally by
+    create_app(), not the one this test's fixture uses to seed the server, so an instance-level
+    monkeypatch on the fixture's object would silently miss every call the app actually makes."""
+    client, _, upstream, _ = argus_client
+    # Deliberately NOT using the Mcp-Method/Mcp-Name headers here (see
+    # test_header_match_allowed_through) — their presence flips detect_client_generation to
+    # GEN_2026, routing through _handle_bridged instead of the plain-2025 tools/call branch.
+    # This test targets the passthrough branch specifically; the bridged branch has its own
+    # equivalent fix and is covered separately.
+    headers = await _initialized_session_headers(client)
+
+    call_count = 0
+    original_get_policy = ServerRepo.get_policy
+
+    async def counting_get_policy(self, server_id):
+        nonlocal call_count
+        call_count += 1
+        return await original_get_policy(self, server_id)
+
+    monkeypatch.setattr(ServerRepo, "get_policy", counting_get_policy)
+
+    resp = await client.post(
+        "/mcp/test-server", json=_tool_call_body("echo", {"message": "hi"}), headers=headers,
+    )
+
+    assert resp.status_code == 200
+    assert call_count == 1, f"expected exactly 1 get_policy() call per tools/call, got {call_count}"

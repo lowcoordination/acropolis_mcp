@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import socket
 import sqlite3
 from pathlib import Path
@@ -321,6 +322,72 @@ class TestF19ResponseHeadersFiltered:
 
 
 # ---------------------------------------------------------------------------
+# F23 (Plan 3 scope) — a configured upstream credential is actually sent to the upstream
+# ---------------------------------------------------------------------------
+
+class TestF23UpstreamCredentialInjected:
+    async def test_configured_credential_is_sent_on_passthrough(self, tmp_path):
+        """F23 design gap (review 2026-08-04): the servers table had no auth column at all, so
+        no MCP server requiring its own credentials could be fronted by Acropolis. Confirms the
+        per-server upstream_auth_header is actually injected as Authorization on the real
+        outbound request — not just accepted by the API and silently dropped."""
+        upstream = _HeaderCapturingUpstream()
+        await upstream.start()
+        try:
+            async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
+                server_repo = ServerRepo(db)
+                await server_repo.create(
+                    slug="test-server", name="Test", upstream_url=upstream.url,
+                    upstream_auth_header="Bearer upstream-secret-token",
+                )
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    r = await client.get("/mcp/test-server/mcp")
+                    assert r.status_code == 200
+        finally:
+            await upstream.stop()
+
+        assert upstream.received_headers.get("authorization") == "Bearer upstream-secret-token"
+
+    async def test_no_credential_configured_sends_no_authorization(self, tmp_path):
+        """Regression guard: a server with NO configured credential must not send an
+        Authorization header at all (confirms this feature doesn't regress F5's fix — the
+        client's own header must still never leak, and no injected header should appear
+        when none was configured)."""
+        upstream = _HeaderCapturingUpstream()
+        await upstream.start()
+        try:
+            async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
+                server_repo = ServerRepo(db)
+                await server_repo.create(slug="test-server", name="Test", upstream_url=upstream.url)
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    r = await client.get(
+                        "/mcp/test-server/mcp", headers={"Authorization": "Bearer client-key-must-not-leak"},
+                    )
+                    assert r.status_code == 200
+        finally:
+            await upstream.stop()
+
+        assert "authorization" not in upstream.received_headers
+
+    async def test_configured_credential_never_exposed_via_get_server(self, tmp_path):
+        """The credential must never round-trip back out through the API that a UI would use to
+        display server details — only a boolean 'is one configured' flag."""
+        async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
+            server_repo = ServerRepo(db)
+            await server_repo.create(
+                slug="test-server", name="Test", upstream_url="http://127.0.0.1:1/mcp",
+                upstream_auth_header="Bearer upstream-secret-token",
+            )
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                r = await client.get("/api/v1/servers/test-server")
+                assert r.status_code == 200
+                body = r.json()
+                assert "upstream_auth_header" not in body
+                assert "upstream-secret-token" not in json.dumps(body)
+                assert body.get("has_upstream_auth_header") is True
+
+
+# ---------------------------------------------------------------------------
 # F11 (Plan 2 scope) — spec-legal JSON-RPC bodies must not crash the pipeline
 # ---------------------------------------------------------------------------
 
@@ -383,3 +450,31 @@ class TestSpecLegalBodiesDoNotCrash:
                 assert r.status_code != 500
                 # Non-dict body should get the same clean 400 as an unparseable body, not a 500.
                 assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# §26 — SPA catch-all must 404 on an /api/* miss, not serve index.html
+# ---------------------------------------------------------------------------
+
+class TestF26SpaFallback404sOnApiMiss:
+    async def test_unknown_api_path_returns_404_not_spa_html(self, tmp_path, dist_dir):
+        """The SPA catch-all route (argus/app.py's spa_fallback) is registered LAST specifically
+        so it never shadows a REGISTERED /api/* or /mcp/* route — but a MISS on those prefixes
+        (a typo'd path, an old client hitting a removed endpoint) used to fall through to this
+        catch-all anyway and get served the SPA's index.html with a 200. An API client has no
+        use for HTML and every reason to want an honest 404."""
+        async with run_acropolis_server(tmp_path, auth_mode="open") as (port, _db):
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                resp = await client.get("/api/v1/this-endpoint-does-not-exist")
+                assert resp.status_code == 404
+                assert b"<html" not in resp.content.lower()
+
+    async def test_real_browser_route_still_gets_spa_html(self, tmp_path, dist_dir):
+        """Regression guard: the /api/* 404 fix must not break normal SPA navigation — a
+        client-side React Router path like /servers/some-slug still has no file on disk and
+        must still fall through to index.html, unchanged."""
+        async with run_acropolis_server(tmp_path, auth_mode="open") as (port, _db):
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                resp = await client.get("/servers/some-slug")
+                assert resp.status_code == 200
+                assert b"<html" in resp.content.lower() or b"<!doctype" in resp.content.lower()

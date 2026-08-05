@@ -55,6 +55,17 @@ def build_setup_router(
     break; every real deployment via create_app() passes the shared RateLimiterRegistry."""
     router = APIRouter(prefix="/api/v1")
 
+    @router.get("/health")
+    async def health():
+        # F21 fix (review 2026-08-04): moved here from archon/api.py's control-plane router,
+        # which sits behind require_admin — both the Dockerfile HEALTHCHECK and the k8s
+        # liveness/readiness probes need this reachable with no credentials, at every point in
+        # the app's lifecycle (before AND after first-run setup completes). Deliberately just a
+        # liveness check (the process is up and answering HTTP), not a readiness/dependency
+        # check — it must stay this simple to be trustworthy as the thing a probe kills the
+        # pod over.
+        return {"status": "ok"}
+
     @router.get("/setup/status", response_model=SetupStatusResponse)
     async def setup_status():
         admin_password_hash = await settings_repo.get("admin_password_hash")

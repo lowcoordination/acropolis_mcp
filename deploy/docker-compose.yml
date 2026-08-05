@@ -10,6 +10,15 @@ services:
       - "8000:8000"
     volumes:
       - acropolis-data:/data
+    read_only: true
+    tmpfs:
+      # forkserver (argus/policy.py's ReDoS-safe regex matching) and general Python/uvicorn
+      # internals expect a writable /tmp even though the app itself never writes there.
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       # Optional: a bearer-token override for the /api/v1 control plane, for scripts/CI that
       # shouldn't go through the browser login flow. Leave unset for normal use — visiting the
