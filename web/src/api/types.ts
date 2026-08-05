@@ -117,3 +117,8 @@ export interface ServerTool {
   status: 'allowed' | 'denied'
   has_param_rules: boolean
 }
+
+export interface ServerToolsResponse {
+  fetched_at: string | null
+  tools: ServerTool[]
+}

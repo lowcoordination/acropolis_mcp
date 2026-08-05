@@ -19,6 +19,8 @@ from archon.schemas import (
     ServerCreateRequest,
     ServerHealthSummary,
     ServerResponse,
+    ServerToolResponse,
+    ServerToolsResponse,
     ServerUpdateRequest,
     SettingsResponse,
     SettingsUpdateRequest,
@@ -185,8 +187,8 @@ def build_control_plane_router(
             # bucket (and its old consumed-token state) must not still be registered under it.
             rate_limiter.unregister(server_key(slug))
 
-    @router.get("/servers/{slug}/tools")
-    async def get_server_tools(slug: str):
+    @router.get("/servers/{slug}/tools", response_model=ServerToolsResponse)
+    async def get_server_tools(slug: str, force_refresh: bool = False):
         try:
             server = await server_repo.get(slug)
         except ServerNotFoundError:
@@ -195,10 +197,11 @@ def build_control_plane_router(
         policy = await server_repo.get_policy(server.id)
 
         if tools_cache is None:
-            return []
+            return ServerToolsResponse(fetched_at=None, tools=[])
 
         tools = await tools_cache.get_raw_tools(
-            server.id, server.upstream_url, upstream_auth_header=server.upstream_auth_header
+            server.id, server.upstream_url, force_refresh=force_refresh,
+            upstream_auth_header=server.upstream_auth_header,
         )
         result = []
         for tool in tools:
@@ -209,13 +212,14 @@ def build_control_plane_router(
                 status = "denied" if name in policy.denied else "allowed"
             else:
                 status = "allowed"  # passthrough
-            result.append({
-                "name": name,
-                "description": tool.get("description"),
-                "status": status,
-                "has_param_rules": name in policy.param_rules,
-            })
-        return result
+            result.append(ServerToolResponse(
+                name=name,
+                description=tool.get("description"),
+                status=status,
+                has_param_rules=name in policy.param_rules,
+            ))
+        fetched_at = await tools_cache.fetched_at(server.id)
+        return ServerToolsResponse(fetched_at=fetched_at, tools=result)
 
     @router.get("/servers/{slug}/policy", response_model=PolicyResponse)
     async def get_policy(slug: str):

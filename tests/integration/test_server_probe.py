@@ -76,5 +76,5 @@ async def test_manual_probe_also_refreshes_tools_cache(client, upstream):
     assert resp.status_code == 200
 
     tools_resp = await client.get("/api/v1/servers/s/tools")
-    names = {t["name"] for t in tools_resp.json()}
+    names = {t["name"] for t in tools_resp.json()["tools"]}
     assert "echo" in names
