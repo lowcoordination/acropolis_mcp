@@ -34,6 +34,14 @@ export function useServerTools(slug: string) {
   })
 }
 
+export function useRefreshServerTools(slug: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => serversApi.getTools(slug, { force_refresh: true }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['servers', slug, 'tools'] }),
+  })
+}
+
 export function useCreateServer() {
   const queryClient = useQueryClient()
   return useMutation({

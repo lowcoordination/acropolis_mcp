@@ -3,9 +3,26 @@ import { Link, useParams } from 'react-router'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ApiError } from '../api/client'
 import { serversApi } from '../api/servers'
-import { useProbeServer, useServer, useServerPolicy, useServerTools } from '../lib/useServers'
+import {
+  useProbeServer,
+  useRefreshServerTools,
+  useServer,
+  useServerPolicy,
+  useServerTools,
+} from '../lib/useServers'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
 import type { ParamRule, PolicyMode, PolicyResponse } from '../api/types'
+
+function relativeTime(isoTimestamp: string): string {
+  const seconds = Math.max(0, (Date.now() - new Date(isoTimestamp).getTime()) / 1000)
+  if (seconds < 60) return 'just now'
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
 
 function CopyableEndpoint({ slug }: { slug: string }) {
   const [copied, setCopied] = useState(false)
@@ -124,8 +141,10 @@ export function ServerDetail() {
 
   const { data: server } = useServer(slug ?? '')
   const { data: policy, isLoading: policyLoading } = useServerPolicy(slug ?? '')
-  const { data: tools, isLoading: toolsLoading } = useServerTools(slug ?? '')
+  const { data: toolsResponse, isLoading: toolsLoading } = useServerTools(slug ?? '')
+  const tools = toolsResponse?.tools
   const probeServer = useProbeServer(slug ?? '')
+  const refreshTools = useRefreshServerTools(slug ?? '')
 
   const [draft, setDraft] = useState<PolicyResponse | null>(null)
   const [expandedTool, setExpandedTool] = useState<string | null>(null)
@@ -292,8 +311,25 @@ export function ServerDetail() {
       </div>
 
       <div className="card">
-        <div className="px-4 py-3 border-b" style={{ borderColor: 'var(--border)' }}>
-          <h2 className="text-sm font-semibold">Tools</h2>
+        <div className="px-4 py-3 border-b flex items-center justify-between gap-3" style={{ borderColor: 'var(--border)' }}>
+          <div className="flex items-center gap-3">
+            <h2 className="text-sm font-semibold">Tools</h2>
+            {toolsResponse?.fetched_at && (
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                Updated {relativeTime(toolsResponse.fetched_at)}
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => refreshTools.mutate()}
+            disabled={refreshTools.isPending}
+            className="text-xs font-medium disabled:opacity-60"
+            style={{ color: 'var(--accent)' }}
+            title="Re-fetch the tool list from the upstream, bypassing the cache"
+          >
+            {refreshTools.isPending ? 'Refreshing…' : 'Refresh from upstream'}
+          </button>
         </div>
         {toolsLoading && (
           <p className="p-4 text-sm" style={{ color: 'var(--text-muted)' }}>

@@ -113,10 +113,23 @@ class ToolsCache:
             await self._write.execute("DELETE FROM tools_cache WHERE server_id = ?", (server_id,))
             await self._write.commit()
 
+    async def fetched_at(self, server_id: int) -> Optional[str]:
+        """Roadmap #6: the most recent fetched_at across this server's cached tools, so the UI
+        can show "updated <relative time>" — or None if nothing has been fetched yet."""
+        cur = await self._read.execute(
+            "SELECT MAX(fetched_at) AS fetched_at FROM tools_cache WHERE server_id = ?",
+            (server_id,),
+        )
+        row = await cur.fetchone()
+        return row["fetched_at"] if row else None
+
     async def get_filtered_tools(
         self, server_id: int, upstream_url: str, policy: ServerPolicy,
-        upstream_auth_header: Optional[str] = None,
+        upstream_auth_header: Optional[str] = None, force_refresh: bool = False,
     ) -> list[dict]:
         """Tool list with policy-denied tools removed — what a client is actually allowed to see."""
-        tools = await self.get_raw_tools(server_id, upstream_url, upstream_auth_header=upstream_auth_header)
+        tools = await self.get_raw_tools(
+            server_id, upstream_url, force_refresh=force_refresh,
+            upstream_auth_header=upstream_auth_header,
+        )
         return [t for t in tools if tool_is_visible(t["name"], policy)]

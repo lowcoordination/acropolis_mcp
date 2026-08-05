@@ -141,6 +141,21 @@ class PolicyUpdateRequest(ServerPolicy):
     pass
 
 
+class ServerToolResponse(BaseModel):
+    name: str
+    description: Optional[str]
+    status: str  # "allowed" | "denied"
+    has_param_rules: bool
+
+
+class ServerToolsResponse(BaseModel):
+    # Roadmap #6: the tools cache was invisible from the UI — this exposes when it was last
+    # refreshed (None if nothing has been fetched yet) alongside the tool list itself, replacing
+    # the endpoint's old untyped bare-list response.
+    fetched_at: Optional[str]
+    tools: list[ServerToolResponse]
+
+
 class KeyCreateRequest(BaseModel):
     name: str
     server_scopes: Optional[list[str]] = None
