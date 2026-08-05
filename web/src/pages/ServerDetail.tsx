@@ -4,6 +4,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ApiError } from '../api/client'
 import { serversApi } from '../api/servers'
 import { useProbeServer, useServer, useServerPolicy, useServerTools } from '../lib/useServers'
+import { POLICY_PRESETS } from '../lib/policyPresets'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
 import type { ParamRule, PolicyMode, PolicyResponse } from '../api/types'
 
@@ -130,6 +131,7 @@ export function ServerDetail() {
   const [draft, setDraft] = useState<PolicyResponse | null>(null)
   const [expandedTool, setExpandedTool] = useState<string | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [selectedPresetId, setSelectedPresetId] = useState('')
 
   useEffect(() => {
     if (policy) setDraft(policy)
@@ -202,7 +204,15 @@ export function ServerDetail() {
     setDraft((d) => (d ? { ...d, rate_limit: value || null } : d))
   }
 
+  function applyPreset(presetId: string) {
+    setSelectedPresetId(presetId)
+    const preset = POLICY_PRESETS.find((p) => p.id === presetId)
+    if (!preset) return
+    setDraft((d) => (d ? preset.apply(d, tools ?? []) : d))
+  }
+
   const isDirty = JSON.stringify(draft) !== JSON.stringify(policy)
+  const selectedPreset = POLICY_PRESETS.find((p) => p.id === selectedPresetId)
 
   return (
     <div className="space-y-6">
@@ -236,6 +246,30 @@ export function ServerDetail() {
 
       <div className="card p-5 space-y-4">
         <h2 className="text-sm font-semibold">Policy</h2>
+
+        <div>
+          <label className="block text-sm font-medium mb-1" htmlFor="policy-preset">
+            Start from a preset…
+          </label>
+          <select
+            id="policy-preset"
+            className="rounded-md px-3 py-2 text-sm w-full"
+            value={selectedPresetId}
+            onChange={(e) => applyPreset(e.target.value)}
+          >
+            <option value="">— choose a preset —</option>
+            {POLICY_PRESETS.map((preset) => (
+              <option key={preset.id} value={preset.id}>
+                {preset.label}
+              </option>
+            ))}
+          </select>
+          {selectedPreset && (
+            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+              {selectedPreset.description}
+            </p>
+          )}
+        </div>
 
         <div>
           <label className="block text-sm font-medium mb-1">Mode</label>
