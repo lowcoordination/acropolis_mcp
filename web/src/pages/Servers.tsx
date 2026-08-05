@@ -88,7 +88,7 @@ function AddServerModal({ onClose }: { onClose: () => void }) {
           />
         </div>
         {error && (
-          <p className="text-sm" style={{ color: '#c0524b' }}>
+          <p className="text-sm" style={{ color: 'var(--danger)' }}>
             {error}
           </p>
         )}
@@ -127,7 +127,7 @@ export function Servers() {
       </div>
 
       {isLoading && <p style={{ color: 'var(--text-muted)' }}>Loading…</p>}
-      {isError && <p style={{ color: '#c0524b' }}>Could not load servers.</p>}
+      {isError && <p style={{ color: 'var(--danger)' }}>Could not load servers.</p>}
 
       {servers && servers.length === 0 && (
         <div className="card p-8 text-center">

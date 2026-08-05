@@ -1,6 +1,6 @@
 const COLORS: Record<string, string> = {
-  ALLOWED: 'var(--color-teal-500)',
-  BLOCKED: '#c0524b',
+  ALLOWED: 'var(--success)',
+  BLOCKED: 'var(--danger)',
   PASSTHROUGH: 'var(--text-muted)',
   ERROR: 'var(--gold)',
 }

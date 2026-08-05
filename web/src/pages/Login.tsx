@@ -54,7 +54,7 @@ export function Login() {
             />
           </div>
           {error && (
-            <p className="text-sm" style={{ color: '#c0524b' }}>
+            <p className="text-sm" style={{ color: 'var(--danger)' }}>
               {error}
             </p>
           )}

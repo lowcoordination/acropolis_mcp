@@ -19,6 +19,47 @@
   --color-teal-400: #4fb3a9;
   --color-teal-500: #2f8f86;
   --color-teal-600: #21716a;
+
+  /* Catppuccin Latte (light) — https://github.com/catppuccin/catppuccin */
+  --color-ctp-latte-base: #eff1f5;
+  --color-ctp-latte-mantle: #e6e9ef;
+  --color-ctp-latte-crust: #dce0e8;
+  --color-ctp-latte-surface0: #ccd0da;
+  --color-ctp-latte-surface1: #bcc0cc;
+  --color-ctp-latte-surface2: #acb0be;
+  --color-ctp-latte-overlay0: #9ca0b0;
+  --color-ctp-latte-text: #4c4f69;
+  --color-ctp-latte-subtext0: #6c6f85;
+  --color-ctp-latte-subtext1: #5c5f77;
+  --color-ctp-latte-teal: #179299;
+  --color-ctp-latte-mauve: #8839ef;
+  --color-ctp-latte-red: #d20f39;
+  --color-ctp-latte-yellow: #df8e1d;
+  --color-ctp-latte-green: #40a02b;
+  /* Latte's own accent hexes are pastel-tuned for use as backgrounds/tinted chips, not as solid
+   * text on `base` — teal/yellow/green all land under 3.5:1 there (checked against WCAG AA's
+   * 4.5:1). These darkened variants exist ONLY for foreground-text roles (badge dots/labels,
+   * button-on-accent text) in Latte; Mocha's accents already clear AA as-is and need no analog. */
+  --color-ctp-latte-teal-text: #13787d;
+  --color-ctp-latte-yellow-text: #986114;
+  --color-ctp-latte-green-text: #327d22;
+
+  /* Catppuccin Mocha (dark) */
+  --color-ctp-mocha-base: #1e1e2e;
+  --color-ctp-mocha-mantle: #181825;
+  --color-ctp-mocha-crust: #11111b;
+  --color-ctp-mocha-surface0: #313244;
+  --color-ctp-mocha-surface1: #45475a;
+  --color-ctp-mocha-surface2: #585b70;
+  --color-ctp-mocha-overlay0: #6c7086;
+  --color-ctp-mocha-text: #cdd6f4;
+  --color-ctp-mocha-subtext0: #a6adc8;
+  --color-ctp-mocha-subtext1: #bac2de;
+  --color-ctp-mocha-teal: #94e2d5;
+  --color-ctp-mocha-mauve: #cba6f7;
+  --color-ctp-mocha-red: #f38ba8;
+  --color-ctp-mocha-yellow: #f9e2af;
+  --color-ctp-mocha-green: #a6e3a1;
 }
 
 :root {
@@ -31,6 +72,10 @@
   --accent: var(--color-teal-600);
   --accent-contrast: #ffffff;
   --gold: var(--color-gold-600);
+  --danger: #c0524b;
+  --success: var(--color-teal-500);
+  --code-bg: var(--color-marble-100);
+  --overlay: rgba(0, 0, 0, 0.4);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -44,7 +89,49 @@
     --accent: var(--color-teal-400);
     --accent-contrast: #0a1a18;
     --gold: var(--color-gold-400);
+    --danger: #d97468;
+    --success: var(--color-teal-400);
+    --code-bg: #1f1f24;
+    --overlay: rgba(0, 0, 0, 0.6);
   }
+}
+
+/* Catppuccin flavours — explicit user choice always wins over prefers-color-scheme, which is
+ * why these are plain attribute selectors rather than nested in @media. */
+:root[data-theme="latte"] {
+  color-scheme: light;
+  --bg: var(--color-ctp-latte-base);
+  --bg-elevated: var(--color-ctp-latte-mantle);
+  --border: var(--color-ctp-latte-surface1);
+  --text: var(--color-ctp-latte-text);
+  --text-muted: var(--color-ctp-latte-subtext1);
+  /* teal/yellow/green use the darkened -text variants, not Latte's own accent hexes — every
+   * call site treats these as solid text or button-background-with-light-text, and the
+   * official Latte accents (tuned as background/tint colors) fail WCAG AA (4.5:1) in both
+   * roles: verified teal 3.31:1, yellow 2.31:1, green 2.96:1 on `base` before darkening. */
+  --accent: var(--color-ctp-latte-teal-text);
+  --accent-contrast: var(--color-ctp-latte-base);
+  --gold: var(--color-ctp-latte-yellow-text);
+  --danger: var(--color-ctp-latte-red);
+  --success: var(--color-ctp-latte-green-text);
+  --code-bg: var(--color-ctp-latte-mantle);
+  --overlay: color-mix(in srgb, var(--color-ctp-latte-crust) 60%, transparent);
+}
+
+:root[data-theme="mocha"] {
+  color-scheme: dark;
+  --bg: var(--color-ctp-mocha-base);
+  --bg-elevated: var(--color-ctp-mocha-surface0);
+  --border: var(--color-ctp-mocha-surface1);
+  --text: var(--color-ctp-mocha-text);
+  --text-muted: var(--color-ctp-mocha-subtext0);
+  --accent: var(--color-ctp-mocha-teal);
+  --accent-contrast: var(--color-ctp-mocha-base);
+  --gold: var(--color-ctp-mocha-yellow);
+  --danger: var(--color-ctp-mocha-red);
+  --success: var(--color-ctp-mocha-green);
+  --code-bg: var(--color-ctp-mocha-mantle);
+  --overlay: color-mix(in srgb, var(--color-ctp-mocha-crust) 60%, transparent);
 }
 
 body {
@@ -102,6 +189,6 @@ input, select, textarea {
   color: var(--text);
 }
 
-.badge-healthy { color: var(--color-teal-500); }
-.badge-unhealthy { color: #c0524b; }
+.badge-healthy { color: var(--success); }
+.badge-unhealthy { color: var(--danger); }
 .badge-unknown { color: var(--text-muted); }

@@ -40,7 +40,7 @@ function CopyableEndpoint({ slug }: { slug: string }) {
       type="button"
       onClick={handleCopy}
       className="font-mono text-xs rounded px-2 py-1 text-left"
-      style={{ background: 'var(--code-bg, var(--bg))', border: '1px solid var(--border)' }}
+      style={{ background: 'var(--code-bg)', border: '1px solid var(--border)' }}
       title="Click to copy"
     >
       {copied ? 'Copied!' : url}
@@ -79,7 +79,7 @@ function ParamRuleEditor({
         <div key={name} className="text-xs space-y-1">
           <div className="flex items-center justify-between">
             <span className="font-mono font-medium">{name}</span>
-            <button type="button" onClick={() => removeParam(name)} style={{ color: '#c0524b' }}>
+            <button type="button" onClick={() => removeParam(name)} style={{ color: 'var(--danger)' }}>
               remove
             </button>
           </div>
@@ -319,7 +319,7 @@ export function ServerDetail() {
         {isDirty && (
           <div className="space-y-2">
             {saveError && (
-              <p className="text-sm" style={{ color: '#c0524b' }}>
+              <p className="text-sm" style={{ color: 'var(--danger)' }}>
                 {saveError}
               </p>
             )}

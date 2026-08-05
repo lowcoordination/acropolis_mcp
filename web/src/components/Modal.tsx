@@ -10,7 +10,7 @@ export function Modal({ title, onClose, children }: ModalProps) {
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
-      style={{ background: 'rgba(0,0,0,0.4)' }}
+      style={{ background: 'var(--overlay)' }}
       onClick={onClose}
     >
       <div
