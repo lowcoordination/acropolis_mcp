@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { SettingsResponse, SetupStatusResponse } from './types'
+import type { ConfigImportResponse, SettingsResponse, SetupStatusResponse } from './types'
 
 export interface SettingsUpdateRequest {
   auth_mode?: 'open' | 'keyed'
@@ -11,6 +11,15 @@ export interface SettingsUpdateRequest {
 export const settingsApi = {
   get: () => api.get<SettingsResponse>('/settings'),
   update: (body: SettingsUpdateRequest) => api.put<SettingsResponse>('/settings', body),
+}
+
+export const configApi = {
+  // Plain href, not a fetch — let the browser handle the download and its
+  // Content-Disposition, same approach as the audit CSV export.
+  exportUrl: (includeCredentials = false) =>
+    `/api/v1/config/export${includeCredentials ? '?include_credentials=true' : ''}`,
+  import: (yamlText: string, apply: boolean) =>
+    api.post<ConfigImportResponse>('/config/import', { yaml: yamlText, apply }),
 }
 
 export const setupApi = {

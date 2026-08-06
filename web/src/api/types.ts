@@ -147,3 +147,18 @@ export interface ServerToolsResponse {
   fetched_at: string | null
   tools: ServerTool[]
 }
+
+export interface ConfigImportAction {
+  kind: 'create' | 'update' | 'unchanged'
+  target: string
+  detail: string
+  description: string
+}
+
+export interface ConfigImportResponse {
+  applied: boolean
+  ok: boolean
+  actions: ConfigImportAction[]
+  warnings: string[]
+  errors: string[]
+}

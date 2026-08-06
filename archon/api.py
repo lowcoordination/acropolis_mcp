@@ -7,13 +7,17 @@ import json
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from archon.admin_auth import require_admin
 from archon.auth.apikeys import ApiKeyService
+from archon.config_io import export_config, plan_import
 from archon.schemas import (
     AuditEventResponse,
+    ConfigImportAction,
+    ConfigImportRequest,
+    ConfigImportResponse,
     KeyCreatedResponse,
     KeyCreateRequest,
     KeyResponse,
@@ -365,6 +369,40 @@ def build_control_plane_router(
                 updates["audit_retention_days"] = str(body.audit_retention_days)
             await settings_repo.set_many(updates)
             return await get_settings()
+
+        @router.get("/config/export")
+        async def export_configuration(include_credentials: bool = False):
+            result = await export_config(
+                server_repo, settings_repo, include_credentials=include_credentials
+            )
+            filename = f"acropolis-config-{utcnow().replace(':', '').split('.')[0]}.yaml"
+            headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+            if result.warnings:
+                # Surfaced as a header as well as inside the file, so a CLI/curl user piping
+                # straight to disk still has a way to see it without opening the file.
+                headers["X-Acropolis-Export-Warnings"] = " | ".join(result.warnings)
+            return Response(
+                content=result.to_yaml(), media_type="application/x-yaml", headers=headers
+            )
+
+        @router.post("/config/import", response_model=ConfigImportResponse)
+        async def import_configuration(body: ConfigImportRequest):
+            plan = await plan_import(server_repo, settings_repo, body.yaml, apply=body.apply)
+            return ConfigImportResponse(
+                # `applied` reflects what ACTUALLY happened, not what was asked for: a file with
+                # errors is rejected wholesale, so apply=true + errors still means nothing wrote.
+                applied=body.apply and plan.ok,
+                ok=plan.ok,
+                actions=[
+                    ConfigImportAction(
+                        kind=a.kind, target=a.target, detail=a.detail,
+                        description=a.describe(applied=body.apply and plan.ok),
+                    )
+                    for a in plan.actions
+                ],
+                warnings=plan.warnings,
+                errors=plan.errors,
+            )
 
     if audit_repo is not None:
         @router.get("/stats", response_model=StatsResponse)

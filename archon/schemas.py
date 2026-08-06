@@ -248,6 +248,28 @@ class AuditEventResponse(BaseModel):
     origin: Optional[str] = None  # None (normal traffic) | "test" (admin Try-it call)
 
 
+class ConfigImportRequest(BaseModel):
+    yaml: str
+    # Defaults to False so the destructive path is never the accidental one — a client that
+    # forgets the flag gets a preview, not a write.
+    apply: bool = False
+
+
+class ConfigImportAction(BaseModel):
+    kind: str  # "create" | "update" | "unchanged"
+    target: str
+    detail: str = ""
+    description: str
+
+
+class ConfigImportResponse(BaseModel):
+    applied: bool
+    ok: bool
+    actions: list[ConfigImportAction]
+    warnings: list[str] = []
+    errors: list[str] = []
+
+
 class SetupStatusResponse(BaseModel):
     setup_complete: bool
 
