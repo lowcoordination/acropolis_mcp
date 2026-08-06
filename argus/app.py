@@ -161,7 +161,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.include_router(build_setup_router(settings_repo, rate_limiter))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
-        rate_limiter,
+        rate_limiter, pipeline,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo))

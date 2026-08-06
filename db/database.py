@@ -12,7 +12,7 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _GATEWAY_MIGRATIONS = [
     "0001_init.sql", "0002_tighten_slug_check.sql", "0003_add_upstream_credential.sql",
 ]
-_AUDIT_MIGRATIONS = ["0001_init_audit.sql", "0004_audit_api_key_index.sql"]
+_AUDIT_MIGRATIONS = ["0001_init_audit.sql", "0004_audit_api_key_index.sql", "0005_audit_origin.sql"]
 
 
 def utcnow() -> str:

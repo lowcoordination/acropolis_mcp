@@ -21,14 +21,17 @@ async def _seed(repo: AuditRepo, **overrides) -> None:
         "client_ip": None, "endpoint": None, "rpc_method": None, "tool": None,
         "decision": "ALLOWED", "rule": None, "matched": None, "reason": None,
         "args_summary": None, "bridged": 0, "status_code": None, "latency_ms": None,
+        "origin": None,
     }
     row.update(overrides)
     await repo._conn.execute(
         """INSERT INTO audit_events
            (ts, server_slug, api_key_id, client_ip, endpoint, rpc_method, tool,
-            decision, rule, matched, reason, args_summary, bridged, status_code, latency_ms)
+            decision, rule, matched, reason, args_summary, bridged, status_code, latency_ms,
+            origin)
            VALUES (:ts, :server_slug, :api_key_id, :client_ip, :endpoint, :rpc_method, :tool,
-                   :decision, :rule, :matched, :reason, :args_summary, :bridged, :status_code, :latency_ms)""",
+                   :decision, :rule, :matched, :reason, :args_summary, :bridged, :status_code,
+                   :latency_ms, :origin)""",
         row,
     )
     await repo._conn.commit()
@@ -160,3 +163,44 @@ async def test_query_combines_multiple_new_filters(db):
     )
     assert len(events) == 1
     assert events[0]["tool"] == "match"
+
+
+async def test_query_origin_unfiltered_by_default_returns_both(db):
+    repo = AuditRepo(db)
+    await _seed(repo, tool="real", origin=None)
+    await _seed(repo, tool="tested", origin="test")
+
+    events = await repo.query()
+    assert {e["tool"] for e in events} == {"real", "tested"}
+
+
+async def test_query_origin_none_returns_only_normal_traffic(db):
+    """`origin=None` is a real filter value ('only rows where origin IS NULL'), distinct from
+    the default (`_UNSET`, meaning 'don't filter on origin at all') — this is the case that
+    /stats and the Audit page's default view rely on to hide Try-it test calls."""
+    repo = AuditRepo(db)
+    await _seed(repo, tool="real", origin=None)
+    await _seed(repo, tool="tested", origin="test")
+
+    events = await repo.query(origin=None)
+    assert {e["tool"] for e in events} == {"real"}
+
+
+async def test_query_origin_explicit_value_returns_only_that_origin(db):
+    repo = AuditRepo(db)
+    await _seed(repo, tool="real", origin=None)
+    await _seed(repo, tool="tested", origin="test")
+
+    events = await repo.query(origin="test")
+    assert {e["tool"] for e in events} == {"tested"}
+
+
+async def test_count_since_excludes_test_traffic(db):
+    repo = AuditRepo(db)
+    since = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    await _seed(repo, decision="BLOCKED", origin=None)
+    await _seed(repo, decision="BLOCKED", origin="test")
+    await _seed(repo, decision="BLOCKED", origin="test")
+
+    count = await repo.count_since(since, decision="BLOCKED")
+    assert count == 1

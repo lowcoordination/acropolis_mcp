@@ -92,6 +92,7 @@ class Pipeline:
     async def handle(
         self, request: Request, slug: str, path: str, body_override: Optional[bytes] = None,
         force_generation: Optional[ClientGeneration] = None,
+        skip_api_key_auth: bool = False, origin: Optional[str] = None,
     ) -> Response:
         """`body_override` lets a caller (the aggregate pipeline) substitute a rewritten body
         — e.g. a de-namespaced tool name — without touching Starlette's internal body cache.
@@ -102,18 +103,29 @@ class Pipeline:
         it must always be bridged, not accidentally fall back to 2025 raw passthrough (which
         forwards headers the real upstream may reject, e.g. a bare `Accept: application/json`
         that FastMCP 406s on because it expects `application/json, text/event-stream`).
+
+        `skip_api_key_auth` + `origin` exist for feature #1 (the in-UI tool tester): an
+        admin-session "Try it" call must run through REAL rate limiting, policy evaluation, and
+        audit logging — a simulated evaluator could drift from the one actually enforcing — but
+        it explicitly bypasses the data plane's *API-key* auth (the operator is already
+        authenticated as admin) and tags its audit row `origin='test'` so it never pollutes
+        /stats or looks like real client traffic. Only the control plane's test-call route may
+        set these; nothing on the data plane ever does.
         """
         start = time.monotonic()
         server: Optional[ServerRecord] = None
         try:
             server = await self._resolve_server(slug)
-            api_key_id = await self._authenticate(request, slug)
+            api_key_id = (
+                None if skip_api_key_auth else await self._authenticate(request, slug)
+            )
             body_bytes = (
                 self._guard_body_size(body_override) if body_override is not None
                 else await self._read_body_guarded(request)
             )
             response = await self._process(
-                request, server, path, body_bytes, api_key_id, force_generation=force_generation
+                request, server, path, body_bytes, api_key_id,
+                force_generation=force_generation, origin=origin,
             )
             return response
         except RoutingError as e:
@@ -126,6 +138,7 @@ class Pipeline:
                 latency_ms=int((time.monotonic() - start) * 1000),
                 reason=e.body[:200],
                 client_ip=_client_ip(request),
+                origin=origin,
             )
             return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
 
@@ -210,6 +223,7 @@ class Pipeline:
         body_bytes: bytes,
         api_key_id: Optional[int],
         force_generation: Optional[ClientGeneration] = None,
+        origin: Optional[str] = None,
     ) -> Response:
         start = time.monotonic()
         rpc_id: Any = None
@@ -266,7 +280,7 @@ class Pipeline:
                 if generation == ClientGeneration.GEN_2026 and self._bridge is not None:
                     return await self._handle_bridged(
                         server, rpc_method, rpc_id, params, body_json.get("_meta"),
-                        api_key_id, start, client_ip,
+                        api_key_id, start, client_ip, origin=origin,
                     )
 
                 if rpc_method == "tools/call":
@@ -352,7 +366,7 @@ class Pipeline:
     async def _handle_bridged(
         self, server: ServerRecord, rpc_method: str, rpc_id: Any, params: dict,
         meta: Optional[dict], api_key_id: Optional[int], start: float,
-        client_ip: Optional[str] = None,
+        client_ip: Optional[str] = None, origin: Optional[str] = None,
     ) -> Response:
         if rpc_method == "tools/call":
             tool_name = params.get("name")
@@ -364,7 +378,7 @@ class Pipeline:
                     endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
                     reason="tools/call missing required 'name' field", status_code=400,
                     latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
-                    client_ip=client_ip,
+                    client_ip=client_ip, origin=origin,
                 )
                 return Response(
                     content=rpc_error(rpc_id, "tools/call missing required 'name' field"),
@@ -386,7 +400,7 @@ class Pipeline:
                 rule=decision.rule, matched=decision.matched,
                 args_summary=decision.args_summary, reason=decision.reason,
                 latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
-                client_ip=client_ip,
+                client_ip=client_ip, origin=origin,
             )
             if decision.blocked:
                 return Response(
@@ -401,7 +415,7 @@ class Pipeline:
                 server_slug=server.slug, tool=None, decision="PASSTHROUGH",
                 endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
                 latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
-                client_ip=client_ip,
+                client_ip=client_ip, origin=origin,
             )
 
         try:
@@ -416,6 +430,7 @@ class Pipeline:
                 endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
                 reason=e.body[:200], status_code=e.status_code, bridged=True,
                 latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+                origin=origin,
             )
             return Response(content=e.body, status_code=e.status_code, media_type="application/json")
 

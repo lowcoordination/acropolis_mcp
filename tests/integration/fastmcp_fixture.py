@@ -11,6 +11,7 @@ import socket
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from sse_starlette.sse import AppStatus
 
 
 def _free_port() -> int:
@@ -68,6 +69,21 @@ async def run_fastmcp_server():
     every time the upstream actually executes a tool — used to prove blocked calls never
     reach the upstream.
     """
+    # sse_starlette signals "the server is shutting down, drain every SSE stream" through a
+    # CLASS-LEVEL global (AppStatus.should_exit) rather than per-app state, and it never resets
+    # it. FastMCP's streamable-http transport answers every request with an SSE frame, so once
+    # ANY uvicorn server in this process has shut down once, every subsequent FastMCP fixture
+    # starts up already believing it should drain — it accepts the connection, then closes it
+    # mid-response. httpx surfaces that as RemoteProtocolError("peer closed connection without
+    # sending complete message body"), which ToolsCache.get_raw_tools then degrades to an empty
+    # tool list, and the handshake path turns into UpstreamHandshakeError.
+    #
+    # The failure is invisible until a single pytest process gets past THREE server lifecycles,
+    # which is why it went unnoticed: no one file used to cross that line. Confirmed by direct
+    # bisection down to pure httpx + this fixture with zero Acropolis code involved — servers
+    # 1-3 succeed, server 4 onward fails 100%, and resetting this flag makes all of them pass.
+    AppStatus.should_exit = False
+
     port = _free_port()
     call_counter: dict[str, int] = {}
     mcp = build_test_server(call_counter)

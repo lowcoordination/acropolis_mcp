@@ -5,6 +5,7 @@ import type {
   ServerResponse,
   ServerToolsResponse,
   ServerUpdateRequest,
+  ToolTestResponse,
 } from './types'
 
 export const serversApi = {
@@ -20,4 +21,6 @@ export const serversApi = {
       `/servers/${slug}/tools${opts?.force_refresh ? '?force_refresh=true' : ''}`,
     ),
   probe: (slug: string) => api.post<ServerResponse>(`/servers/${slug}/probe`),
+  testCall: (slug: string, tool: string, args: Record<string, unknown>) =>
+    api.post<ToolTestResponse>(`/servers/${slug}/test-call`, { tool, arguments: args }),
 }

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -134,9 +135,14 @@ class UpstreamHandshakeCache:
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         if upstream_auth_header:
             headers["Authorization"] = upstream_auth_header
+        # Unique id per handshake rather than a fixed literal. JSON-RPC ids exist to correlate
+        # a response with its request, and an upstream may legitimately be handling more than
+        # one Acropolis-originated request concurrently (the health poller and a bridged call
+        # can overlap on the same server), so a shared constant is the wrong shape regardless
+        # of whether any particular upstream happens to tolerate it.
         init_body = {
             "jsonrpc": "2.0",
-            "id": "acropolis-handshake",
+            "id": f"acropolis-handshake-{uuid.uuid4()}",
             "method": "initialize",
             "params": {
                 "protocolVersion": MCP_2025_VERSION,
