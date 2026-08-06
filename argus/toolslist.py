@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -57,9 +58,11 @@ class ToolsCache:
             return [json.loads(r["definition_json"]) for r in rows]
 
         try:
+            # Unique id per call, not a fixed literal — see argus/upstream.py's _handshake for
+            # the reasoning (concurrent Acropolis-originated requests to one upstream).
             status, body = await self._bridge.bridge_call(
                 server_id=server_id, upstream_url=upstream_url, rpc_method="tools/list",
-                rpc_id="acropolis-toolslist", params={},
+                rpc_id=f"acropolis-toolslist-{uuid.uuid4()}", params={},
                 upstream_auth_header=upstream_auth_header,
             )
         except BridgeError:

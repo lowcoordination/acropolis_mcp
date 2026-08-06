@@ -437,9 +437,11 @@ class AuditRepo:
         await self._conn.executemany(
             """INSERT INTO audit_events
                (ts, server_slug, api_key_id, client_ip, endpoint, rpc_method, tool,
-                decision, rule, matched, reason, args_summary, bridged, status_code, latency_ms)
+                decision, rule, matched, reason, args_summary, bridged, status_code, latency_ms,
+                origin)
                VALUES (:ts, :server_slug, :api_key_id, :client_ip, :endpoint, :rpc_method, :tool,
-                       :decision, :rule, :matched, :reason, :args_summary, :bridged, :status_code, :latency_ms)""",
+                       :decision, :rule, :matched, :reason, :args_summary, :bridged, :status_code,
+                       :latency_ms, :origin)""",
             events,
         )
         await self._conn.commit()
@@ -449,6 +451,7 @@ class AuditRepo:
         tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
         api_key_id: Optional[int] = None, after: Optional[str] = None,
         before: Optional[str] = None, search: Optional[str] = None,
+        origin: object = _UNSET,
     ) -> list[dict]:
         """Newest-first. `before_id` is keyset pagination — pass the smallest `id` from the
         previous page to fetch the next (older) page, rather than an OFFSET (which re-scans
@@ -456,7 +459,12 @@ class AuditRepo:
 
         `after`/`before` are inclusive ISO-timestamp bounds on `ts`. `search` matches against
         `reason`, `args_summary`, and `matched`; `%`/`_` in the term are escaped so a literal
-        search (e.g. "100%") isn't interpreted as a SQL LIKE wildcard."""
+        search (e.g. "100%") isn't interpreted as a SQL LIKE wildcard.
+
+        `origin` uses the `_UNSET` sentinel (like `ServerRepo.update`'s `upstream_auth_header`)
+        because `None` is a meaningful value here — "give me only normal traffic" — distinct from
+        "don't filter on origin at all" (the default, returning both normal and 'test' rows).
+        A plain `Optional[str] = None` couldn't express the first case."""
         clauses, params = [], []
         if server_slug:
             clauses.append("server_slug = ?")
@@ -484,6 +492,12 @@ class AuditRepo:
             like = f"%{escaped}%"
             clauses.append("(reason LIKE ? ESCAPE '\\' OR args_summary LIKE ? ESCAPE '\\' OR matched LIKE ? ESCAPE '\\')")
             params.extend([like, like, like])
+        if origin is not _UNSET:
+            if origin is None:
+                clauses.append("origin IS NULL")
+            else:
+                clauses.append("origin = ?")
+                params.append(origin)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         cur = await self._conn.execute(
@@ -493,7 +507,9 @@ class AuditRepo:
         return [dict(r) for r in rows]
 
     async def count_since(self, since_iso: str, decision: Optional[str] = None) -> int:
-        clauses, params = ["ts >= ?"], [since_iso]
+        # Always excludes origin='test' (Try-it calls) — this backs /stats, and a dashboard
+        # counter that moves every time an operator tests their own policy would be useless.
+        clauses, params = ["ts >= ?", "origin IS NULL"], [since_iso]
         if decision:
             clauses.append("decision = ?")
             params.append(decision)

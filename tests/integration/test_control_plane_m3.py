@@ -159,7 +159,7 @@ async def test_audit_export_csv_empty(api_client):
     assert resp.headers["content-type"].startswith("text/csv")
     assert "attachment; filename=" in resp.headers["content-disposition"]
     lines = resp.text.strip("\r\n").split("\r\n")
-    assert lines == ["id,ts,server_slug,api_key_id,client_ip,endpoint,rpc_method,tool,decision,rule,matched,reason,args_summary,bridged,status_code,latency_ms"]
+    assert lines == ["id,ts,server_slug,api_key_id,client_ip,endpoint,rpc_method,tool,decision,rule,matched,reason,args_summary,bridged,status_code,latency_ms,origin"]
 
 
 async def test_audit_export_csv_includes_matching_rows_and_respects_filters(api_client):

@@ -146,6 +146,7 @@ class ServerToolResponse(BaseModel):
     description: Optional[str]
     status: str  # "allowed" | "denied"
     has_param_rules: bool
+    input_schema: Optional[dict] = None
 
 
 class ServerToolsResponse(BaseModel):
@@ -154,6 +155,23 @@ class ServerToolsResponse(BaseModel):
     # the endpoint's old untyped bare-list response.
     fetched_at: Optional[str]
     tools: list[ServerToolResponse]
+
+
+class ToolTestRequest(BaseModel):
+    tool: str
+    arguments: dict = {}
+
+
+class ToolTestResponse(BaseModel):
+    # Feature #1 (in-UI tool tester): mirrors the fields on a real audit row, since the whole
+    # point is that this call went through the SAME pipeline a real client's call would.
+    decision: str  # ALLOWED | BLOCKED | ERROR
+    rule: Optional[str]
+    matched: Optional[str]
+    reason: Optional[str]
+    status_code: Optional[int]
+    latency_ms: Optional[int]
+    upstream_response: Optional[dict] = None
 
 
 class KeyCreateRequest(BaseModel):
@@ -227,6 +245,7 @@ class AuditEventResponse(BaseModel):
     bridged: bool
     status_code: Optional[int]
     latency_ms: Optional[int]
+    origin: Optional[str] = None  # None (normal traffic) | "test" (admin Try-it call)
 
 
 class SetupStatusResponse(BaseModel):

@@ -58,6 +58,7 @@ class AuditLogger:
         bridged: bool = False,
         status_code: Optional[int] = None,
         latency_ms: Optional[int] = None,
+        origin: Optional[str] = None,  # None (normal traffic) | "test" (admin Try-it call)
     ) -> None:
         event = {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -75,6 +76,7 @@ class AuditLogger:
             "bridged": int(bridged),
             "status_code": status_code,
             "latency_ms": latency_ms,
+            "origin": origin,
         }
 
         level = logging.WARNING if decision == "BLOCKED" else logging.INFO

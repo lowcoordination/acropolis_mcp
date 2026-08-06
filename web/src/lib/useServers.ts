@@ -88,3 +88,15 @@ export function useProbeServer(slug: string) {
     },
   })
 }
+
+export function useTestCall(slug: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ tool, args }: { tool: string; args: Record<string, unknown> }) =>
+      serversApi.testCall(slug, tool, args),
+    // A Try-it call writes a real (origin='test') audit row, so the live Audit page should
+    // pick it up if the operator switches over — but /stats deliberately ignores test traffic,
+    // so there's nothing to invalidate there.
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['audit'] }),
+  })
+}

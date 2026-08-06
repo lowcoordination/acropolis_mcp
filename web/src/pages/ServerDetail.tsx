@@ -12,6 +12,7 @@ import {
 } from '../lib/useServers'
 import { POLICY_PRESETS } from '../lib/policyPresets'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
+import { ToolTester } from '../components/ToolTester'
 import type { ParamRule, PolicyMode, PolicyResponse } from '../api/types'
 
 function relativeTime(isoTimestamp: string): string {
@@ -149,6 +150,7 @@ export function ServerDetail() {
 
   const [draft, setDraft] = useState<PolicyResponse | null>(null)
   const [expandedTool, setExpandedTool] = useState<string | null>(null)
+  const [testingTool, setTestingTool] = useState<string | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [selectedPresetId, setSelectedPresetId] = useState('')
 
@@ -401,6 +403,14 @@ export function ServerDetail() {
                     <div className="flex items-center gap-3 shrink-0">
                       <button
                         type="button"
+                        onClick={() => setTestingTool(testingTool === tool.name ? null : tool.name)}
+                        className="text-xs"
+                        style={{ color: 'var(--accent)' }}
+                      >
+                        {testingTool === tool.name ? 'hide test' : 'try it'}
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => setExpandedTool(expandedTool === tool.name ? null : tool.name)}
                         className="text-xs"
                         style={{ color: 'var(--accent)' }}
@@ -424,6 +434,11 @@ export function ServerDetail() {
                         rules={rules}
                         onChange={(r) => setParamRules(tool.name, r)}
                       />
+                    </div>
+                  )}
+                  {testingTool === tool.name && (
+                    <div className="px-4 pb-3">
+                      <ToolTester slug={slug} tool={tool.name} schema={tool.input_schema} />
                     </div>
                   )}
                 </li>

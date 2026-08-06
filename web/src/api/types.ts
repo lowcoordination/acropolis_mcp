@@ -111,11 +111,36 @@ export interface SetupStatusResponse {
   setup_complete: boolean
 }
 
+export interface JsonSchemaProperty {
+  type?: string
+  title?: string
+  description?: string
+  default?: unknown
+  enum?: unknown[]
+}
+
+export interface JsonSchema {
+  type?: string
+  properties?: Record<string, JsonSchemaProperty>
+  required?: string[]
+}
+
 export interface ServerTool {
   name: string
   description: string | null
   status: 'allowed' | 'denied'
   has_param_rules: boolean
+  input_schema: JsonSchema | null
+}
+
+export interface ToolTestResponse {
+  decision: string
+  rule: string | null
+  matched: string | null
+  reason: string | null
+  status_code: number | null
+  latency_ms: number | null
+  upstream_response: Record<string, unknown> | null
 }
 
 export interface ServerToolsResponse {

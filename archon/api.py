@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import json
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -27,12 +28,16 @@ from archon.schemas import (
     SettingsResponse,
     SettingsUpdateRequest,
     StatsResponse,
+    ToolTestRequest,
+    ToolTestResponse,
 )
 from argus.audit import AuditLogger
+from argus.generation import ClientGeneration
+from argus.pipeline import Pipeline
 from argus.rate_limiter import RateLimiterRegistry, server_key
 from argus.toolslist import ToolsCache
 from db.database import utcnow
-from db.repo import AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
+from db.repo import _UNSET, AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
 from stoa.health import PROBE_TIMEOUT_SECONDS, HealthPoller
 
 # Settings keys + defaults, applied when a key is absent from the settings table.
@@ -75,6 +80,7 @@ def build_control_plane_router(
     audit_logger: Optional[AuditLogger] = None,
     health_poller: Optional[HealthPoller] = None,
     rate_limiter: Optional[RateLimiterRegistry] = None,
+    pipeline: Optional[Pipeline] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
@@ -162,8 +168,6 @@ def build_control_plane_router(
         # F23: upstream_auth_header needs three states (unset/set-to-value/cleared-to-null),
         # which a plain `Optional[str] = None` field can't distinguish on its own — checking
         # model_fields_set tells us whether the key was present in the request body at all.
-        from db.repo import _UNSET
-
         auth_header_update = (
             body.upstream_auth_header if "upstream_auth_header" in body.model_fields_set else _UNSET
         )
@@ -219,9 +223,68 @@ def build_control_plane_router(
                 description=tool.get("description"),
                 status=status,
                 has_param_rules=name in policy.param_rules,
+                # Feature #1 (tool tester): the raw upstream tool definition already carries its
+                # JSON Schema under this key (MCP spec) — it was just never passed through before.
+                input_schema=tool.get("inputSchema"),
             ))
         fetched_at = await tools_cache.fetched_at(server.id)
         return ServerToolsResponse(fetched_at=fetched_at, tools=result)
+
+    if pipeline is not None:
+        @router.post("/servers/{slug}/test-call", response_model=ToolTestResponse)
+        async def test_call(slug: str, request: Request, body: ToolTestRequest):
+            # Feature #1 (in-UI tool tester): dispatches through the REAL pipeline — real rate
+            # limiting, real policy evaluation, real audit logging — rather than a second
+            # evaluator that could drift from the one actually enforcing. `skip_api_key_auth`
+            # bypasses only the data plane's bearer-token check (the operator is already
+            # authenticated as admin via require_admin on this whole router); `force_generation`
+            # forces the bridged path so this always goes through the same evaluate() call a
+            # real 2026-generation client's tools/call would. `origin="test"` tags the resulting
+            # audit row so it never counts toward /stats or the default Audit page view.
+            try:
+                await server_repo.get(slug)
+            except ServerNotFoundError:
+                raise HTTPException(status_code=404, detail="server not found")
+
+            rpc_body = json.dumps({
+                # Unique id per call — see argus/upstream.py's _handshake for the reasoning.
+                "jsonrpc": "2.0", "id": f"acropolis-test-call-{uuid.uuid4()}", "method": "tools/call",
+                "params": {"name": body.tool, "arguments": body.arguments},
+            }).encode("utf-8")
+
+            captured: list[dict] = []
+            audit_queue = audit_logger.subscribe() if audit_logger is not None else None
+            try:
+                response = await pipeline.handle(
+                    request, slug, "", body_override=rpc_body,
+                    force_generation=ClientGeneration.GEN_2026,
+                    skip_api_key_auth=True, origin="test",
+                )
+                # The audit event for THIS call was broadcast synchronously inside handle(),
+                # before it returned — drain whatever's already queued rather than waiting,
+                # since nothing else will arrive after this call returns.
+                if audit_queue is not None:
+                    while not audit_queue.empty():
+                        captured.append(audit_queue.get_nowait())
+            finally:
+                if audit_queue is not None:
+                    audit_logger.unsubscribe(audit_queue)
+
+            event = captured[-1] if captured else {}
+            try:
+                upstream_response = json.loads(response.body) if response.body else None
+            except json.JSONDecodeError:
+                upstream_response = None
+
+            return ToolTestResponse(
+                decision=event.get("decision", "ERROR"),
+                rule=event.get("rule"),
+                matched=event.get("matched"),
+                reason=event.get("reason"),
+                status_code=event.get("status_code") or response.status_code,
+                latency_ms=event.get("latency_ms"),
+                upstream_response=upstream_response,
+            )
 
     @router.get("/servers/{slug}/policy", response_model=PolicyResponse)
     async def get_policy(slug: str):
@@ -312,7 +375,9 @@ def build_control_plane_router(
             requests_24h = await audit_repo.count_since(since)
             blocked_24h = await audit_repo.count_since(since, decision="BLOCKED")
             allowed_24h = await audit_repo.count_since(since, decision="ALLOWED")
-            recent_blocked = await audit_repo.query(decision="BLOCKED", limit=10)
+            # Excludes origin='test' for the same reason count_since does — the dashboard
+            # shouldn't surface an operator's own Try-it calls as if they were real traffic.
+            recent_blocked = await audit_repo.query(decision="BLOCKED", limit=10, origin=None)
 
             servers = await server_repo.list()
             healthy = sum(1 for s in servers if s.health_status == "healthy")
@@ -336,11 +401,17 @@ def build_control_plane_router(
             tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
             api_key_id: Optional[int] = None, after: Optional[str] = None,
             before: Optional[str] = None, search: Optional[str] = None,
+            include_test: bool = False,
         ):
+            # Feature #1 (tool tester): Try-it calls are tagged origin='test' and excluded from
+            # the default history view, same as they're excluded from /stats — an operator
+            # testing their own policy shouldn't see it appear as if it were real traffic unless
+            # they explicitly ask to (include_test=true).
             events = await audit_repo.query(
                 server_slug=server_slug, decision=decision, tool=tool,
                 before_id=before_id, limit=min(limit, 500),
                 api_key_id=api_key_id, after=after, before=before, search=search,
+                origin=_UNSET if include_test else None,
             )
             return [AuditEventResponse(**{**e, "bridged": bool(e["bridged"])}) for e in events]
 
@@ -349,12 +420,12 @@ def build_control_plane_router(
             server_slug: Optional[str] = None, decision: Optional[str] = None,
             tool: Optional[str] = None, api_key_id: Optional[int] = None,
             after: Optional[str] = None, before: Optional[str] = None,
-            search: Optional[str] = None,
+            search: Optional[str] = None, include_test: bool = False,
         ):
             columns = [
                 "id", "ts", "server_slug", "api_key_id", "client_ip", "endpoint", "rpc_method",
                 "tool", "decision", "rule", "matched", "reason", "args_summary", "bridged",
-                "status_code", "latency_ms",
+                "status_code", "latency_ms", "origin",
             ]
 
             def csv_safe(value: object) -> str:
@@ -380,6 +451,7 @@ def build_control_plane_router(
                         server_slug=server_slug, decision=decision, tool=tool,
                         before_id=before_id, limit=500, api_key_id=api_key_id,
                         after=after, before=before, search=search,
+                        origin=_UNSET if include_test else None,
                     )
                     if not events:
                         break
