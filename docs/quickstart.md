@@ -108,3 +108,6 @@ of one per server.
   MCP server talks to a new-generation client, and what's intentionally not supported yet.
 - [TLS and reverse proxy setup](tls-and-reverse-proxy.md) — do this before exposing Acropolis
   beyond your own machine.
+- [Webhook alerts](webhook-alerts.md) — get notified when a tool call is blocked or a server
+  goes unhealthy, instead of watching the Audit page. Read this one before enabling it — it's
+  the one feature in Acropolis that makes outbound requests to a URL you supply.

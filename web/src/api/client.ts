@@ -22,7 +22,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     let detail = resp.statusText
     try {
       const body = await resp.json()
-      detail = body.detail ?? detail
+      // FastAPI's OWN validation errors (raised by a pydantic field/model_validator, as
+      // opposed to a route's explicit HTTPException(detail="string")) shape `detail` as an
+      // array of {msg, loc, ...} objects, not a string. Until now every 4xx in this app came
+      // from an explicit HTTPException, so `body.detail` was always already a string — the
+      // webhook_url model_validator (archon/schemas.py's SettingsUpdateRequest) is the first
+      // validator error that can reach a client an operator actually looks at, and rendering
+      // the raw object gave a literal "[object Object]" instead of the message.
+      if (Array.isArray(body.detail)) {
+        detail = body.detail.map((e: { msg?: string }) => e.msg ?? JSON.stringify(e)).join('; ')
+      } else {
+        detail = body.detail ?? detail
+      }
     } catch {
       // body wasn't JSON — keep statusText
     }

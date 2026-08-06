@@ -1,16 +1,24 @@
 import { api } from './client'
-import type { SettingsResponse, SetupStatusResponse } from './types'
+import type { SettingsResponse, SetupStatusResponse, WebhookTestResponse } from './types'
 
 export interface SettingsUpdateRequest {
   auth_mode?: 'open' | 'keyed'
   aggregate_enabled?: boolean
   default_ttl_ms?: number
   audit_retention_days?: number
+  webhook_url?: string
+  webhook_enabled?: boolean
+  webhook_events?: string[]
+  webhook_allow_private?: boolean
 }
 
 export const settingsApi = {
   get: () => api.get<SettingsResponse>('/settings'),
   update: (body: SettingsUpdateRequest) => api.put<SettingsResponse>('/settings', body),
+}
+
+export const webhooksApi = {
+  test: () => api.post<WebhookTestResponse>('/webhooks/test'),
 }
 
 export const setupApi = {
