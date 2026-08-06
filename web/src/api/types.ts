@@ -69,6 +69,17 @@ export interface SettingsResponse {
   default_ttl_ms: number
   audit_retention_days: number
   setup_complete: boolean
+  webhook_url: string | null
+  webhook_enabled: boolean
+  webhook_events: string[]
+  webhook_allow_private: boolean
+  has_webhook_secret: boolean
+}
+
+export interface WebhookTestResponse {
+  ok: boolean
+  status_code: number | null
+  error: string | null
 }
 
 export interface ServerHealthSummary {

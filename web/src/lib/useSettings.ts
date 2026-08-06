@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { settingsApi, type SettingsUpdateRequest } from '../api/settings'
+import { settingsApi, webhooksApi, type SettingsUpdateRequest } from '../api/settings'
 
 export function useSettings() {
   return useQuery({
@@ -13,5 +13,11 @@ export function useUpdateSettings() {
   return useMutation({
     mutationFn: (body: SettingsUpdateRequest) => settingsApi.update(body),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
+  })
+}
+
+export function useSendTestWebhook() {
+  return useMutation({
+    mutationFn: () => webhooksApi.test(),
   })
 }

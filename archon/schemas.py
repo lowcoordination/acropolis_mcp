@@ -5,7 +5,7 @@ import socket
 from typing import Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from db.models import SLUG_RE, ParamRule, ServerPolicy
 
@@ -32,6 +32,21 @@ def _validate_slug(slug: str) -> str:
     return slug
 
 
+def _resolve_host_ips(hostname: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Shared by both URL validators: a literal IP is used as-is; a hostname is resolved so
+    neither validator can be routed around by DNS pointing a friendly name at a blocked range.
+    Returns [] when unresolvable at validation time — callers let a later health probe / send
+    attempt surface that failure instead of rejecting registration on a transient DNS blip."""
+    try:
+        return [ipaddress.ip_address(hostname)]
+    except ValueError:
+        pass
+    try:
+        return [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, None)]
+    except (socket.gaierror, ValueError):
+        return []
+
+
 def _validate_upstream_url(url: str) -> str:
     """F17 fix (review 2026-08-04): the HTTP API had NO scheme/host validation on
     upstream_url at all — archon/importer.py validates it for YAML imports, the API path
@@ -45,28 +60,56 @@ def _validate_upstream_url(url: str) -> str:
     (169.254.169.254) and the rest of the link-local range (169.254.0.0/16) — there is no
     legitimate homelab reason to register one of those, and it's the textbook SSRF payload for
     exfiltrating cloud instance credentials on any deployment that happens to run on EC2/GCE/
-    Azure. A hostname that RESOLVES into that range is blocked too, not just a literal IP."""
+    Azure. A hostname that RESOLVES into that range is blocked too, not just a literal IP.
+
+    NOTE: this reasoning does NOT transfer to webhook targets — see _validate_webhook_url below,
+    which applies a stricter policy for a fundamentally different trust relationship."""
     parsed = urlparse(url.rstrip("/"))
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError(f"upstream_url must be a valid http/https URL, got {url!r}")
 
     hostname = parsed.hostname
     if hostname:
-        try:
-            candidates = [ipaddress.ip_address(hostname)]
-        except ValueError:
-            # Not a literal IP — resolve it so a hostname can't be used to route around the
-            # link-local check (DNS pointing a friendly name at 169.254.169.254).
-            try:
-                candidates = [
-                    ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, None)
-                ]
-            except (socket.gaierror, ValueError):
-                candidates = []  # unresolvable at validation time — let the health poller report it
+        candidates = _resolve_host_ips(hostname)
         if any(ip.is_link_local for ip in candidates):
             raise ValueError(
                 f"upstream_url resolves to a link-local address ({url!r}) — cloud metadata "
                 f"endpoints and other 169.254.0.0/16 targets are not permitted"
+            )
+    return url
+
+
+def _validate_webhook_url(url: str, *, allow_private: bool = False) -> str:
+    """Item 3 (features_08_05_26): deliberately STRICTER than _validate_upstream_url above, and
+    the two must not be conflated. An upstream is a thing the operator is knowingly fronting —
+    private-LAN is its primary use case. A webhook target is a thing the gateway will POST audit
+    data to, unattended, forever; the operator naming a URL once at settings time is a much
+    weaker signal than "I registered this MCP server." Default posture: https only, and reject
+    loopback/link-local/private/reserved/multicast — i.e. everything ipaddress flags as not a
+    normal public unicast address. `allow_private=True` is the explicit opt-in for operators
+    genuinely posting to a LAN collector (e.g. their own Slack-compatible relay on the homelab).
+
+    This is pre-flight validation only — it does not close the DNS-rebinding gap (a hostname
+    that resolves to a public IP now can resolve to 169.254.169.254 at send time). The dispatcher
+    that actually fires requests must also set follow_redirects=False, since a 302 defeats any
+    IP check made before the request is sent."""
+    parsed = urlparse(url.rstrip("/"))
+    if parsed.scheme != "https":
+        raise ValueError(f"webhook_url must be https, got {url!r}")
+    if not parsed.netloc:
+        raise ValueError(f"webhook_url must be a valid https URL, got {url!r}")
+
+    hostname = parsed.hostname
+    if hostname and not allow_private:
+        candidates = _resolve_host_ips(hostname)
+        if any(
+            ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved or ip.is_multicast
+            for ip in candidates
+        ):
+            raise ValueError(
+                f"webhook_url resolves to a non-public address ({url!r}) — loopback, "
+                f"link-local, private (RFC1918), reserved, and multicast targets are blocked by "
+                f"default; opt in explicitly if you're posting to a LAN collector"
             )
     return url
 
@@ -202,6 +245,13 @@ class SettingsResponse(BaseModel):
     default_ttl_ms: int
     audit_retention_days: int
     setup_complete: bool
+    webhook_url: Optional[str]
+    webhook_enabled: bool
+    webhook_events: list[str]
+    webhook_allow_private: bool
+    # Whether a signing secret exists — never the secret itself, same has_x pattern as F23's
+    # has_upstream_auth_header.
+    has_webhook_secret: bool
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -209,6 +259,30 @@ class SettingsUpdateRequest(BaseModel):
     aggregate_enabled: Optional[bool] = None
     default_ttl_ms: Optional[int] = None
     audit_retention_days: Optional[int] = None
+    # None means "don't touch"; "" means "clear it" (disables webhooks with a dangling URL from
+    # ever firing again, since webhook_enabled alone can't be trusted to always be flipped off
+    # first). webhook_events is validated against the fixed vocabulary in archon/api.py, not here,
+    # so the 400 error message can name the exact bad value. webhook_allow_private is the
+    # explicit opt-in named in the plan for operators genuinely posting to a LAN collector — it
+    # must be set BEFORE (or in the same request as) a private webhook_url, since validation
+    # reads it from the incoming body, not the DB, precisely so it can't be flipped on silently
+    # after the fact to justify a URL that was rejected a moment earlier.
+    webhook_url: Optional[str] = None
+    webhook_enabled: Optional[bool] = None
+    webhook_events: Optional[list[str]] = None
+    webhook_allow_private: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _check_webhook_url(self) -> "SettingsUpdateRequest":
+        if self.webhook_url:
+            _validate_webhook_url(self.webhook_url, allow_private=bool(self.webhook_allow_private))
+        return self
+
+
+class WebhookTestResponse(BaseModel):
+    ok: bool
+    status_code: Optional[int] = None
+    error: Optional[str] = None
 
 
 class ServerHealthSummary(BaseModel):

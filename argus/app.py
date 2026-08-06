@@ -26,6 +26,7 @@ from db.database import Database
 from db.repo import ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo
 from stoa.health import HealthPoller
 from stoa.retention import AuditRetentionJob
+from stoa.webhooks import WebhookDispatcher
 
 
 # F20 fix (review 2026-08-04): no Content-Security-Policy, X-Frame-Options, or
@@ -101,9 +102,11 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     handshake_cache = UpstreamHandshakeCache(http_client)
     bridge = ProtocolBridge(http_client, handshake_cache)
     tools_cache = ToolsCache(db, bridge)
+    webhook_dispatcher = WebhookDispatcher(audit, settings_repo)
     health_poller = HealthPoller(
         server_repo, http_client, handshake_cache,
         interval_seconds=settings.health_poll_interval_seconds,
+        webhook_dispatcher=webhook_dispatcher,
     )
     retention_job = AuditRetentionJob(
         audit_repo, settings_repo,
@@ -129,6 +132,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         audit.start()
+        webhook_dispatcher.start()
         if settings.health_poll_enabled:
             health_poller.start()
         if settings.audit_retention_enabled:
@@ -138,6 +142,9 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         finally:
             await retention_job.stop()
             await health_poller.stop()
+            # Stop the dispatcher before audit — it unsubscribe()s from the SAME AuditLogger it
+            # subscribed to in start(), and that logger must still be alive to accept the call.
+            await webhook_dispatcher.stop()
             await audit.stop()
             await http_client.aclose()
 
@@ -157,11 +164,12 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.tools_cache = tools_cache
     app.state.health_poller = health_poller
     app.state.retention_job = retention_job
+    app.state.webhook_dispatcher = webhook_dispatcher
 
     app.include_router(build_setup_router(settings_repo, rate_limiter))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
-        rate_limiter, pipeline,
+        rate_limiter, pipeline, webhook_dispatcher,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo))

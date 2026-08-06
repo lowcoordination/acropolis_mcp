@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useSettings, useUpdateSettings } from '../lib/useSettings'
 import { ConfigurationCard } from '../components/ConfigurationCard'
+import { AlertsCard } from '../components/AlertsCard'
 import { useTheme, type Theme } from '../lib/useTheme'
 
 export function Settings() {
@@ -140,6 +141,7 @@ export function Settings() {
       </div>
 
       <ConfigurationCard />
+      <AlertsCard />
     </div>
   )
 }

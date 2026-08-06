@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import Optional
 
 import httpx
 
 from argus.upstream import CLIENT_INFO, UpstreamHandshakeCache, UpstreamHandshakeError, parse_sse_body
 from db.models import ServerRecord
 from db.repo import ServerNotFoundError, ServerRepo
+from stoa.webhooks import WebhookDispatcher
 
 logger = logging.getLogger("stoa.health")
 
@@ -106,12 +108,14 @@ class HealthPoller:
         client: httpx.AsyncClient,
         handshake_cache: UpstreamHandshakeCache,
         interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        webhook_dispatcher: Optional[WebhookDispatcher] = None,
     ):
         self._repo = server_repo
         self._client = client
         self._handshakes = handshake_cache
         self._interval = interval_seconds
         self._task: asyncio.Task | None = None
+        self._webhooks = webhook_dispatcher
 
     def start(self) -> None:
         if self._task is None:
@@ -167,6 +171,12 @@ class HealthPoller:
             server.slug, health_status=health_status, upstream_protocol=protocol,
             discover_json=json.dumps(discover_json) if discover_json else None,
         )
+        # Item 3 (features_08_05_26): fire only on the EDGE (healthy/unknown -> unhealthy), using
+        # the status this same ServerRecord carried going INTO this probe — never on every poll
+        # tick while a server stays down, which would turn a single outage into one webhook per
+        # interval for as long as it lasts.
+        if self._webhooks is not None and server.health_status != "unhealthy" and health_status == "unhealthy":
+            await self._webhooks.notify_unhealthy(server.slug)
 
     async def _loop(self) -> None:
         while True:

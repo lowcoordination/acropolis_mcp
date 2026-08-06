@@ -1,11 +1,20 @@
 import { api } from './client'
-import type { ConfigImportResponse, SettingsResponse, SetupStatusResponse } from './types'
+import type {
+  ConfigImportResponse,
+  SettingsResponse,
+  SetupStatusResponse,
+  WebhookTestResponse,
+} from './types'
 
 export interface SettingsUpdateRequest {
   auth_mode?: 'open' | 'keyed'
   aggregate_enabled?: boolean
   default_ttl_ms?: number
   audit_retention_days?: number
+  webhook_url?: string
+  webhook_enabled?: boolean
+  webhook_events?: string[]
+  webhook_allow_private?: boolean
 }
 
 export const settingsApi = {
@@ -20,6 +29,10 @@ export const configApi = {
     `/api/v1/config/export${includeCredentials ? '?include_credentials=true' : ''}`,
   import: (yamlText: string, apply: boolean) =>
     api.post<ConfigImportResponse>('/config/import', { yaml: yamlText, apply }),
+}
+
+export const webhooksApi = {
+  test: () => api.post<WebhookTestResponse>('/webhooks/test'),
 }
 
 export const setupApi = {

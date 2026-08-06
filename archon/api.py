@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import json
+import secrets
 import uuid
 from typing import Optional
 
@@ -34,6 +35,7 @@ from archon.schemas import (
     StatsResponse,
     ToolTestRequest,
     ToolTestResponse,
+    WebhookTestResponse,
 )
 from argus.audit import AuditLogger
 from argus.generation import ClientGeneration
@@ -43,6 +45,7 @@ from argus.toolslist import ToolsCache
 from db.database import utcnow
 from db.repo import _UNSET, AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
 from stoa.health import PROBE_TIMEOUT_SECONDS, HealthPoller
+from stoa.webhooks import VALID_EVENTS, WebhookDispatcher
 
 # Settings keys + defaults, applied when a key is absent from the settings table.
 _SETTINGS_DEFAULTS = {
@@ -50,6 +53,8 @@ _SETTINGS_DEFAULTS = {
     "aggregate_enabled": "true",
     "default_ttl_ms": "300000",
     "audit_retention_days": "30",
+    "webhook_enabled": "false",
+    "webhook_events": "blocked,unhealthy",
 }
 
 
@@ -85,6 +90,7 @@ def build_control_plane_router(
     health_poller: Optional[HealthPoller] = None,
     rate_limiter: Optional[RateLimiterRegistry] = None,
     pipeline: Optional[Pipeline] = None,
+    webhook_dispatcher: Optional[WebhookDispatcher] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
@@ -352,6 +358,11 @@ def build_control_plane_router(
                 default_ttl_ms=int(values["default_ttl_ms"]),
                 audit_retention_days=int(values["audit_retention_days"]),
                 setup_complete=await settings_repo.get("admin_password_hash") is not None,
+                webhook_url=values.get("webhook_url"),
+                webhook_enabled=values["webhook_enabled"] == "true",
+                webhook_events=values["webhook_events"].split(","),
+                webhook_allow_private=values.get("webhook_allow_private") == "true",
+                has_webhook_secret=bool(values.get("webhook_secret")),
             )
 
         @router.put("/settings", response_model=SettingsResponse)
@@ -367,6 +378,27 @@ def build_control_plane_router(
                 updates["default_ttl_ms"] = str(body.default_ttl_ms)
             if body.audit_retention_days is not None:
                 updates["audit_retention_days"] = str(body.audit_retention_days)
+            if body.webhook_allow_private is not None:
+                updates["webhook_allow_private"] = "true" if body.webhook_allow_private else "false"
+            if body.webhook_url is not None:
+                # "" clears it — SettingsUpdateRequest's field validator already ran
+                # _validate_webhook_url on a truthy value, so anything non-empty here is safe.
+                updates["webhook_url"] = body.webhook_url
+                if body.webhook_url and await settings_repo.get("webhook_secret") is None:
+                    # Generate the HMAC signing secret lazily, on first real URL, rather than at
+                    # app startup — no reason to mint a secret nobody will ever use on an
+                    # instance that never configures a webhook.
+                    updates["webhook_secret"] = secrets.token_hex(32)
+            if body.webhook_enabled is not None:
+                updates["webhook_enabled"] = "true" if body.webhook_enabled else "false"
+            if body.webhook_events is not None:
+                bad = [e for e in body.webhook_events if e not in VALID_EVENTS]
+                if bad:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"webhook_events contains unsupported value(s): {bad}",
+                    )
+                updates["webhook_events"] = ",".join(body.webhook_events)
             await settings_repo.set_many(updates)
             return await get_settings()
 
@@ -403,6 +435,12 @@ def build_control_plane_router(
                 warnings=plan.warnings,
                 errors=plan.errors,
             )
+
+    if webhook_dispatcher is not None:
+        @router.post("/webhooks/test", response_model=WebhookTestResponse)
+        async def test_webhook():
+            ok, status_code, error = await webhook_dispatcher.send_test()
+            return WebhookTestResponse(ok=ok, status_code=status_code, error=error)
 
     if audit_repo is not None:
         @router.get("/stats", response_model=StatsResponse)
