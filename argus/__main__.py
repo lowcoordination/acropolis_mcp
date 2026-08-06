@@ -7,11 +7,12 @@ from pathlib import Path
 
 import uvicorn
 
+from archon.config_io import export_config, plan_import
 from archon.importer import apply_import, parse_guard_config
 from archon.settings import Settings
 from argus.app import create_app
 from db.database import Database
-from db.repo import ServerRepo
+from db.repo import ServerRepo, SettingsRepo
 
 
 def _run_server() -> None:
@@ -65,6 +66,54 @@ async def _run_import(path: str, dry_run: bool) -> None:
         await db.close()
 
 
+async def _run_export(path: str | None, include_credentials: bool) -> None:
+    settings = Settings()
+    db = Database(Path(settings.data_dir))
+    await db.connect()
+    try:
+        result = await export_config(
+            ServerRepo(db), SettingsRepo(db), include_credentials=include_credentials
+        )
+        # Warnings go to stderr so `argus export > config.yaml` still produces a clean file
+        # while the operator sees that credentials were withheld.
+        for warning in result.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        text = result.to_yaml()
+        if path:
+            Path(path).write_text(text)
+            print(f"wrote {path}", file=sys.stderr)
+        else:
+            print(text, end="")
+    finally:
+        await db.close()
+
+
+async def _run_import_config(path: str, apply: bool) -> None:
+    settings = Settings()
+    db = Database(Path(settings.data_dir))
+    await db.connect()
+    try:
+        plan = await plan_import(
+            ServerRepo(db), SettingsRepo(db), Path(path).read_text(), apply=apply
+        )
+        for error in plan.errors:
+            print(f"error: {error}", file=sys.stderr)
+        for warning in plan.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        for action in plan.actions:
+            print(action.describe(applied=apply))
+
+        if not plan.ok:
+            print("\nnothing was written (file rejected)", file=sys.stderr)
+            raise SystemExit(1)
+        if apply:
+            print(f"\napplied {len(plan.actions)} action(s)")
+        else:
+            print("\n(dry run — nothing written; re-run with --apply)")
+    finally:
+        await db.close()
+
+
 def cli() -> None:
     parser = argparse.ArgumentParser(prog="argus")
     subparsers = parser.add_subparsers(dest="command")
@@ -73,10 +122,30 @@ def cli() -> None:
     import_parser.add_argument("path", help="Path to guard-config.yml")
     import_parser.add_argument("--dry-run", action="store_true", help="Parse and print without writing")
 
+    export_parser = subparsers.add_parser("export", help="Export this gateway's config as YAML")
+    export_parser.add_argument("-o", "--output", help="Write to a file instead of stdout")
+    export_parser.add_argument(
+        "--include-credentials", action="store_true",
+        help="Include plaintext upstream credentials (the file becomes a secret)",
+    )
+
+    import_config_parser = subparsers.add_parser(
+        "import-config", help="Import an Acropolis config export (dry run unless --apply)"
+    )
+    import_config_parser.add_argument("path", help="Path to an exported YAML file")
+    # Mirrors the HTTP API: preview is the default, writing is the explicit opt-in.
+    import_config_parser.add_argument(
+        "--apply", action="store_true", help="Actually write the changes (default: dry run)"
+    )
+
     args = parser.parse_args()
 
     if args.command == "import":
         asyncio.run(_run_import(args.path, args.dry_run))
+    elif args.command == "export":
+        asyncio.run(_run_export(args.output, args.include_credentials))
+    elif args.command == "import-config":
+        asyncio.run(_run_import_config(args.path, args.apply))
     else:
         _run_server()
 
