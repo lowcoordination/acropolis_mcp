@@ -24,6 +24,7 @@ from argus.toolslist import ToolsCache
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
 from db.repo import AdminEventRepo, ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo
+from stoa.gitops import ConfigSource
 from stoa.health import HealthPoller
 from stoa.retention import AuditRetentionJob
 from stoa.webhooks import WebhookDispatcher
@@ -112,6 +113,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         audit_repo, settings_repo,
         check_interval_seconds=settings.audit_retention_check_interval_seconds,
     )
+    config_source = ConfigSource(server_repo, settings_repo)
+    config_source.set_webhook_dispatcher(webhook_dispatcher)
 
     pipeline = Pipeline(
         settings=settings,
@@ -137,9 +140,12 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
             health_poller.start()
         if settings.audit_retention_enabled:
             retention_job.start()
+        # GitOps polling is opt-in via gitops_enabled setting
+        await config_source.start()
         try:
             yield
         finally:
+            await config_source.stop()
             await retention_job.stop()
             await health_poller.stop()
             # Stop the dispatcher before audit — it unsubscribe()s from the SAME AuditLogger it
@@ -169,10 +175,10 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.include_router(build_setup_router(settings_repo, rate_limiter))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
-        rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db),
+        rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
-    app.include_router(build_metrics_router(server_repo, audit_repo))
+    app.include_router(build_metrics_router(server_repo, audit_repo, config_source))
 
     _mount_web_ui(app)
 

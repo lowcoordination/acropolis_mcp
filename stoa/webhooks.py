@@ -25,7 +25,7 @@ DEBOUNCE_WINDOW_SECONDS = 60.0
 CAP_WINDOW_SECONDS = 3600.0
 CAP_MAX_PER_WINDOW = 20
 
-VALID_EVENTS = ("blocked", "unhealthy")
+VALID_EVENTS = ("blocked", "unhealthy", "drift")
 
 
 @dataclass
@@ -76,6 +76,38 @@ class WebhookDispatcher:
         self._task: Optional[asyncio.Task] = None
         self._debounce: dict[tuple[str, str], _DebounceEntry] = {}
         self._cap = _CapState()
+
+    async def fire(self, event_type: str, payload: dict) -> None:
+        """Fire a webhook event of the given type. Generic entry point for non-audit events
+        (e.g. GitOps drift detection). Debounced and capped the same as audit-driven events."""
+        config = await self._load_config()
+        if config is None or event_type not in config["events"]:
+            return
+
+        key = (event_type, payload.get("status", ""))
+        now = time.monotonic()
+        entry = self._debounce.get(key)
+        if entry is not None and now - entry.first_seen < DEBOUNCE_WINDOW_SECONDS:
+            entry.count += 1
+            return
+
+        entry = _DebounceEntry(first_seen=now, count=1)
+        self._debounce[key] = entry
+        entry.task = asyncio.create_task(self._debounced_send_generic(key, event_type, payload, config))
+
+    async def _debounced_send_generic(
+        self, key: tuple[str, str], event_type: str, payload: dict, config: dict
+    ) -> None:
+        """Wait out the debounce window, then send with the final count."""
+        await asyncio.sleep(DEBOUNCE_WINDOW_SECONDS)
+        entry = self._debounce.pop(key, None)
+        if entry is None:
+            return
+        await self._send_if_under_cap(config, {
+            "event": event_type,
+            "count": entry.count,
+            **payload,
+        })
 
     def start(self) -> None:
         if self._task is None:

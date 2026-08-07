@@ -55,6 +55,17 @@ class ExportResult:
         body = yaml.safe_dump(self.data, sort_keys=False, default_flow_style=False)
         return "\n".join(header) + "\n\n" + body
 
+    def to_stable_yaml(self) -> str:
+        """Export without the exported_at timestamp — for committed exports that should be
+        byte-identical when the config hasn't changed. Used by GitOps drift detection."""
+        data = dict(self.data)
+        data.pop("exported_at", None)
+        header = [f"# Acropolis configuration export (version {EXPORT_VERSION})", f"# {_NO_API_KEYS_NOTE}"]
+        if any(w.startswith("WARNING:") for w in self.warnings):
+            header.append(f"#\n# {_CREDENTIALS_WARNING}")
+        body = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+        return "\n".join(header) + "\n\n" + body
+
 
 @dataclass
 class ImportAction:

@@ -335,6 +335,22 @@ class AdminEventResponse(BaseModel):
     summary: str
 
 
+class DriftActionResponse(BaseModel):
+    kind: str
+    target: str
+    detail: str
+    description: str
+
+
+class DriftStatusResponse(BaseModel):
+    status: str  # "in_sync" | "drifted" | "unknown" | "error"
+    last_check: Optional[float] = None
+    last_error: Optional[str] = None
+    actions: Optional[list[DriftActionResponse]] = None
+    warnings: Optional[list[str]] = None
+    errors: Optional[list[str]] = None
+
+
 class ConfigImportRequest(BaseModel):
     yaml: str
     # Defaults to False so the destructive path is never the accidental one — a client that
