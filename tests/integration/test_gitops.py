@@ -253,8 +253,8 @@ async def test_ssrf_validation_rejects_private_url(client):
     assert resp.status_code in (200, 400, 422)
 
 
-async def test_reconcile_writes_admin_event_with_commit_sha(client):
-    """POST /config/reconcile writes one admin event with the commit SHA."""
+async def test_reconcile_endpoint_returns_400_with_no_pending_plan(client):
+    """POST /config/reconcile returns 400 (not 404) when there's no drift to apply."""
     await _setup_admin(client)
 
     # Enable gitops and set a URL (will fail to fetch, but that's ok for this test)
@@ -268,6 +268,81 @@ async def test_reconcile_writes_admin_event_with_commit_sha(client):
     # Should get 400 (no pending plan) not 404 (endpoint missing)
     assert resp.status_code == 400
     assert "no pending plan" in resp.json()["detail"].lower()
+
+
+async def test_reconcile_applies_plan_and_writes_admin_event(client, app_transport, monkeypatch):
+    """A successful reconcile() actually applies the drift AND writes one admin event.
+
+    Exercises the real happy path end-to-end through the actual HTTP routes and the app's own
+    wired ConfigSource/AdminEventRepo: live state (empty) drifts against a fetched config (one
+    new server), GET /config/drift shows it, POST /config/reconcile applies it and records a
+    `config.reconcile` admin event — the behavior the PR description claimed but the old
+    version of this test never actually checked (it only asserted a 400 "no pending plan").
+    """
+    await _setup_admin(client)
+
+    from db.repo import AdminEventRepo, ServerRepo, SettingsRepo
+
+    app = app_transport.app
+    db = app.state.db
+    server_repo = ServerRepo(db)
+    admin_event_repo = AdminEventRepo(db)
+    settings_repo = SettingsRepo(db)
+
+    # gitops_enabled/gitops_url aren't exposed on SettingsUpdateRequest (PUT /api/v1/settings)
+    # — same as the other regression tests in this file, write them directly via SettingsRepo.
+    await settings_repo.set("gitops_enabled", "true")
+    await settings_repo.set("gitops_url", "https://example.com/config.yaml")
+
+    drift_yaml = """version: 1
+servers:
+  - slug: from-git
+    name: From Git
+    upstream_url: http://localhost:9000/mcp
+    enabled: true
+    in_aggregate: true
+settings: {}
+"""
+
+    class _FakeResponse:
+        content = drift_yaml.encode("utf-8")
+        def raise_for_status(self):
+            pass
+
+    async def _fake_get(url):
+        return _FakeResponse()
+
+    config_source = app.state.config_source
+    monkeypatch.setattr(config_source._http, "get", _fake_get)
+
+    # Drive one check directly on the app's real ConfigSource (exposed via app.state), rather
+    # than waiting on the background poll loop (default interval 300s — the loop's first
+    # iteration already ran at startup, before gitops_enabled was set, so waiting for its next
+    # iteration here would be both slow and flaky).
+    state = await config_source.check_once()
+    assert state.status == "drifted"
+    assert state.plan is not None
+
+    # GET /config/drift reflects the same cached state via the real route.
+    drift_resp = await client.get("/api/v1/config/drift")
+    assert drift_resp.json()["status"] == "drifted"
+
+    reconcile_resp = await client.post("/api/v1/config/reconcile")
+    assert reconcile_resp.status_code == 200
+    body = reconcile_resp.json()
+    assert body["applied"] is True
+    assert any("from-git" in a or "created" in a.lower() for a in body["actions"])
+
+    # The drift is actually applied to live state, not just planned.
+    server = await server_repo.get("from-git")
+    assert server is not None
+    assert server.upstream_url == "http://localhost:9000/mcp"
+
+    # And exactly one admin event records the reconcile.
+    events = await admin_event_repo.query(action="config.reconcile", limit=10)
+    assert len(events) == 1
+    assert events[0].action == "config.reconcile"
+    assert events[0].actor == "gitops"
 
 
 # Security regression tests (found by /security-scan 2026-08-07)

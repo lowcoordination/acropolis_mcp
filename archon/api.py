@@ -587,7 +587,7 @@ def build_control_plane_router(
                     action="settings.update",
                     summary=summary,
                     # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                    actor="admin-session",
                     target_type="settings",
                     before=before_filtered,
                     after=after_filtered,
