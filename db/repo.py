@@ -6,7 +6,7 @@ import time
 from typing import Optional
 
 import aiosqlite
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .database import Database, utcnow
 from .models import ApiKeyRecord, ParamRule, ServerPolicy, ServerRecord
@@ -599,3 +599,113 @@ class SettingsRepo:
             except BaseException:
                 await self._write.rollback()
                 raise
+
+
+class AdminEventRecord(BaseModel):
+    id: int
+    ts: str
+    actor: Optional[str] = None  # NULL until identity milestone; 'admin-session' | 'admin-token' | 'cli'
+    action: str  # server.create | server.update | server.delete | policy.update | key.create | key.disable | key.delete | settings.update | config.import
+    target_type: Optional[str] = None  # 'server' | 'key' | 'settings' | 'config'
+    target_id: Optional[str] = None  # slug, key id, or NULL
+    before: Optional[str] = None  # JSON, allowlisted fields only, NULL on create
+    after: Optional[str] = None  # JSON, allowlisted fields only, NULL on delete
+    client_ip: Optional[str] = None
+    summary: str  # human-readable, e.g. "mode: allowlist -> passthrough"
+
+
+class AdminEventRepo:
+    """Control-plane audit log — records administrative actions (server CRUD, policy changes,
+    key mint/revoke, settings changes, config imports).
+
+    Distinct from AuditRepo (data-plane traffic log): these are low-volume, high-value events
+    that must survive long-term. Stored in gateway.db (not audit.db) so a config restore brings
+    its own change history. NEVER pruned by AuditRetentionJob — that job only touches audit.db.
+    """
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    @property
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
+        assert self._db.gateway is not None
+        self._db.gateway.row_factory = aiosqlite.Row
+        return self._db.gateway
+
+    async def insert(
+        self,
+        *,
+        action: str,
+        summary: str,
+        actor: Optional[str] = None,
+        target_type: Optional[str] = None,
+        target_id: Optional[str] = None,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
+        client_ip: Optional[str] = None,
+    ) -> int:
+        """Insert one admin event. Returns the new row id."""
+        async with self._db.gateway_write_lock:
+            cur = await self._write.execute(
+                """INSERT INTO admin_events (ts, actor, action, target_type, target_id, before, after, client_ip, summary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (utcnow(), actor, action, target_type, target_id, before, after, client_ip, summary),
+            )
+            await self._write.commit()
+            return cur.lastrowid
+
+    async def query(
+        self,
+        *,
+        action: Optional[str] = None,
+        target_type: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: int = 500,
+    ) -> list[AdminEventRecord]:
+        """Query admin events with optional filters. Follows AuditRepo.query conventions."""
+        clauses = []
+        params: list = []
+
+        if action is not None:
+            clauses.append("action = ?")
+            params.append(action)
+        if target_type is not None:
+            clauses.append("target_type = ?")
+            params.append(target_type)
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(since)
+
+        where = " AND ".join(clauses) if clauses else "1=1"
+        limit = min(limit, 500)
+
+        cur = await self._read.execute(
+            f"""SELECT id, ts, actor, action, target_type, target_id, before, after, client_ip, summary
+                FROM admin_events
+                WHERE {where}
+                ORDER BY ts DESC
+                LIMIT ?""",
+            (*params, limit),
+        )
+        rows = await cur.fetchall()
+        return [
+            AdminEventRecord(
+                id=row["id"],
+                ts=row["ts"],
+                actor=row["actor"],
+                action=row["action"],
+                target_type=row["target_type"],
+                target_id=row["target_id"],
+                before=row["before"],
+                after=row["after"],
+                client_ip=row["client_ip"],
+                summary=row["summary"],
+            )
+            for row in rows
+        ]

@@ -12,6 +12,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from archon.admin_auth import require_admin
+from archon.admin_audit import (
+    _filter_server_fields,
+    _filter_settings_keys,
+    record,
+    record_config_import,
+    record_policy_change,
+)
 from archon.auth.apikeys import ApiKeyService
 from archon.config_io import export_config, plan_import
 from archon.schemas import (
@@ -43,7 +50,7 @@ from argus.pipeline import Pipeline
 from argus.rate_limiter import RateLimiterRegistry, server_key
 from argus.toolslist import ToolsCache
 from db.database import utcnow
-from db.repo import _UNSET, AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
+from db.repo import _UNSET, AdminEventRepo, AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
 from stoa.health import PROBE_TIMEOUT_SECONDS, HealthPoller
 from stoa.webhooks import VALID_EVENTS, WebhookDispatcher
 
@@ -91,6 +98,7 @@ def build_control_plane_router(
     rate_limiter: Optional[RateLimiterRegistry] = None,
     pipeline: Optional[Pipeline] = None,
     webhook_dispatcher: Optional[WebhookDispatcher] = None,
+    admin_event_repo: Optional[AdminEventRepo] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
@@ -108,7 +116,7 @@ def build_control_plane_router(
         return [_server_to_response(s) for s in servers]
 
     @router.post("/servers", response_model=ServerResponse, status_code=201)
-    async def create_server(body: ServerCreateRequest):
+    async def create_server(body: ServerCreateRequest, request: Request):
         try:
             server = await server_repo.create(
                 slug=body.slug, name=body.name, upstream_url=body.upstream_url,
@@ -117,6 +125,24 @@ def build_control_plane_router(
             )
         except SlugConflictError:
             raise HTTPException(status_code=409, detail=f"server slug '{body.slug}' already exists")
+
+        if admin_event_repo is not None:
+            await record(
+                admin_event_repo,
+                action="server.create",
+                summary=f"created server '{body.slug}'",
+                actor="admin-session",
+                target_type="server",
+                target_id=body.slug,
+                after=_filter_server_fields({
+                    "slug": body.slug,
+                    "name": body.name,
+                    "upstream_url": body.upstream_url,
+                    "enabled": body.enabled,
+                    "in_aggregate": body.in_aggregate,
+                }),
+                client_ip=request.client.host if request.client else None,
+            )
 
         if health_poller is not None:
             # Probe immediately rather than leaving the server at "unknown" for up to a full
@@ -174,7 +200,7 @@ def build_control_plane_router(
         return _server_to_response(server)
 
     @router.put("/servers/{slug}", response_model=ServerResponse)
-    async def update_server(slug: str, body: ServerUpdateRequest):
+    async def update_server(slug: str, body: ServerUpdateRequest, request: Request):
         # F23: upstream_auth_header needs three states (unset/set-to-value/cleared-to-null),
         # which a plain `Optional[str] = None` field can't distinguish on its own — checking
         # model_fields_set tells us whether the key was present in the request body at all.
@@ -182,6 +208,16 @@ def build_control_plane_router(
             body.upstream_auth_header if "upstream_auth_header" in body.model_fields_set else _UNSET
         )
         try:
+            # Fetch before state for audit diff
+            before_server = await server_repo.get(slug)
+            before_dict = _filter_server_fields({
+                "slug": before_server.slug,
+                "name": before_server.name,
+                "upstream_url": before_server.upstream_url,
+                "enabled": before_server.enabled,
+                "in_aggregate": before_server.in_aggregate,
+            })
+
             server = await server_repo.update(
                 slug, name=body.name, upstream_url=body.upstream_url,
                 enabled=body.enabled, in_aggregate=body.in_aggregate,
@@ -189,14 +225,64 @@ def build_control_plane_router(
             )
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
+
+        if admin_event_repo is not None:
+            after_dict = _filter_server_fields({
+                "slug": server.slug,
+                "name": server.name,
+                "upstream_url": server.upstream_url,
+                "enabled": server.enabled,
+                "in_aggregate": server.in_aggregate,
+            })
+            changes = []
+            for key in before_dict:
+                if before_dict[key] != after_dict.get(key):
+                    changes.append(f"{key}: {before_dict[key]} -> {after_dict.get(key)}")
+            summary = f"updated server '{slug}'" + (f" ({'; '.join(changes)})" if changes else "")
+
+            await record(
+                admin_event_repo,
+                action="server.update",
+                summary=summary,
+                actor="admin-session",
+                target_type="server",
+                target_id=slug,
+                before=before_dict,
+                after=after_dict,
+                client_ip=request.client.host if request.client else None,
+            )
+
         return _server_to_response(server)
 
     @router.delete("/servers/{slug}", status_code=204)
-    async def delete_server(slug: str):
+    async def delete_server(slug: str, request: Request):
         try:
+            # Fetch before state for audit
+            server = await server_repo.get(slug)
+            before_dict = _filter_server_fields({
+                "slug": server.slug,
+                "name": server.name,
+                "upstream_url": server.upstream_url,
+                "enabled": server.enabled,
+                "in_aggregate": server.in_aggregate,
+            })
+
             await server_repo.delete(slug)
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
+
+        if admin_event_repo is not None:
+            await record(
+                admin_event_repo,
+                action="server.delete",
+                summary=f"deleted server '{slug}'",
+                actor="admin-session",
+                target_type="server",
+                target_id=slug,
+                before=before_dict,
+                client_ip=request.client.host if request.client else None,
+            )
+
         if rate_limiter is not None:
             # F8: the rate-limit bucket is keyed on the slug STRING, not the server's DB id —
             # if this slug is deleted and later recreated with a different rate_limit, the old
@@ -306,18 +392,35 @@ def build_control_plane_router(
         return PolicyResponse(**policy.model_dump())
 
     @router.put("/servers/{slug}/policy", response_model=PolicyResponse)
-    async def set_policy(slug: str, body: PolicyUpdateRequest):
+    async def set_policy(slug: str, body: PolicyUpdateRequest, request: Request):
         try:
             server = await server_repo.get(slug)
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
+
+        # Fetch before state for audit diff
+        before_policy = await server_repo.get_policy(server.id)
+
         await server_repo.set_policy(server.id, body)
         if tools_cache is not None:
             # A stale filtered tools/list would otherwise show a tool that was just denied,
             # or hide one that was just allowed, until the TTL naturally expires.
             await tools_cache.invalidate(server.id)
-        policy = await server_repo.get_policy(server.id)
-        return PolicyResponse(**policy.model_dump())
+
+        # Fetch after state for audit diff
+        after_policy = await server_repo.get_policy(server.id)
+
+        if admin_event_repo is not None:
+            await record_policy_change(
+                admin_event_repo,
+                server_slug=slug,
+                current=before_policy,
+                incoming=after_policy,
+                actor="admin-session",
+                client_ip=request.client.host if request.client else None,
+            )
+
+        return PolicyResponse(**after_policy.model_dump())
 
     @router.get("/keys", response_model=list[KeyResponse])
     async def list_keys():
@@ -325,28 +428,77 @@ def build_control_plane_router(
         return [_key_to_response(k) for k in keys]
 
     @router.post("/keys", response_model=KeyCreatedResponse, status_code=201)
-    async def create_key(body: KeyCreateRequest):
+    async def create_key(body: KeyCreateRequest, request: Request):
         generated = await api_keys.create(name=body.name, server_scopes=body.server_scopes)
+
+        if admin_event_repo is not None:
+            await record(
+                admin_event_repo,
+                action="key.create",
+                summary=f"created API key '{body.name}'",
+                actor="admin-session",
+                target_type="key",
+                target_id=str(generated.record.id),
+                after={"name": body.name, "key_prefix": generated.record.key_prefix, "server_scopes": body.server_scopes},
+                client_ip=request.client.host if request.client else None,
+            )
+
         return KeyCreatedResponse(
             id=generated.record.id, name=generated.record.name,
             key_prefix=generated.record.key_prefix, plaintext=generated.plaintext,
         )
 
     @router.patch("/keys/{key_id}", response_model=KeyResponse)
-    async def patch_key(key_id: int, enabled: bool):
+    async def patch_key(key_id: int, enabled: bool, request: Request):
+        # Fetch before state for audit
+        keys_before = await api_keys.list()
+        key_before = next((k for k in keys_before if k.id == key_id), None)
+
         if enabled:
             await api_keys.enable(key_id)
         else:
             await api_keys.disable(key_id)
+
         keys = await api_keys.list()
         match = next((k for k in keys if k.id == key_id), None)
         if match is None:
             raise HTTPException(status_code=404, detail="key not found")
+
+        if admin_event_repo is not None and key_before is not None:
+            action = "key.enable" if enabled else "key.disable"
+            await record(
+                admin_event_repo,
+                action=action,
+                summary=f"{'enabled' if enabled else 'disabled'} API key '{match.name}'",
+                actor="admin-session",
+                target_type="key",
+                target_id=str(key_id),
+                before={"enabled": key_before.enabled},
+                after={"enabled": enabled},
+                client_ip=request.client.host if request.client else None,
+            )
+
         return _key_to_response(match)
 
     @router.delete("/keys/{key_id}", status_code=204)
-    async def delete_key(key_id: int):
+    async def delete_key(key_id: int, request: Request):
+        # Fetch before state for audit
+        keys_before = await api_keys.list()
+        key_before = next((k for k in keys_before if k.id == key_id), None)
+
         await api_keys.delete(key_id)
+
+        if admin_event_repo is not None and key_before is not None:
+            await record(
+                admin_event_repo,
+                action="key.delete",
+                summary=f"deleted API key '{key_before.name}'",
+                actor="admin-session",
+                target_type="key",
+                target_id=str(key_id),
+                before={"name": key_before.name, "key_prefix": key_before.key_prefix},
+                client_ip=request.client.host if request.client else None,
+            )
 
     if settings_repo is not None:
         @router.get("/settings", response_model=SettingsResponse)
@@ -366,7 +518,11 @@ def build_control_plane_router(
             )
 
         @router.put("/settings", response_model=SettingsResponse)
-        async def update_settings(body: SettingsUpdateRequest):
+        async def update_settings(body: SettingsUpdateRequest, request: Request):
+            # Fetch before state for audit diff
+            before_settings = await _get_settings_with_defaults(settings_repo)
+            before_filtered = _filter_settings_keys(before_settings)
+
             updates: dict[str, str] = {}
             if body.auth_mode is not None:
                 if body.auth_mode not in ("open", "keyed"):
@@ -400,6 +556,29 @@ def build_control_plane_router(
                     )
                 updates["webhook_events"] = ",".join(body.webhook_events)
             await settings_repo.set_many(updates)
+
+            # Fetch after state for audit diff
+            after_settings = await _get_settings_with_defaults(settings_repo)
+            after_filtered = _filter_settings_keys(after_settings)
+
+            if admin_event_repo is not None:
+                changes = []
+                for key in before_filtered:
+                    if before_filtered[key] != after_filtered.get(key):
+                        changes.append(f"{key}: {before_filtered[key]} -> {after_filtered.get(key)}")
+                summary = "updated settings" + (f" ({'; '.join(changes)})" if changes else "")
+
+                await record(
+                    admin_event_repo,
+                    action="settings.update",
+                    summary=summary,
+                    actor="admin-session",
+                    target_type="settings",
+                    before=before_filtered,
+                    after=after_filtered,
+                    client_ip=request.client.host if request.client else None,
+                )
+
             return await get_settings()
 
         @router.get("/config/export")
@@ -418,8 +597,20 @@ def build_control_plane_router(
             )
 
         @router.post("/config/import", response_model=ConfigImportResponse)
-        async def import_configuration(body: ConfigImportRequest):
+        async def import_configuration(body: ConfigImportRequest, request: Request):
             plan = await plan_import(server_repo, settings_repo, body.yaml, apply=body.apply)
+
+            # Record config import as ONE event, not one per touched server — otherwise a
+            # routine import drowns the log it's supposed to make legible.
+            if admin_event_repo is not None and body.apply and plan.ok:
+                action_descriptions = [a.describe(applied=True) for a in plan.actions]
+                await record_config_import(
+                    admin_event_repo,
+                    actions=action_descriptions,
+                    actor="admin-session",
+                    client_ip=request.client.host if request.client else None,
+                )
+
             return ConfigImportResponse(
                 # `applied` reflects what ACTUALLY happened, not what was asked for: a file with
                 # errors is rejected wholesale, so apply=true + errors still means nothing wrote.
@@ -562,5 +753,32 @@ def build_control_plane_router(
                         audit_logger.unsubscribe(q)
 
                 return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    if admin_event_repo is not None:
+        @router.get("/admin-events")
+        async def query_admin_events(
+            action: Optional[str] = None,
+            target_type: Optional[str] = None,
+            since: Optional[str] = None,
+            limit: int = 100,
+        ):
+            events = await admin_event_repo.query(
+                action=action, target_type=target_type, since=since, limit=limit,
+            )
+            return [
+                {
+                    "id": e.id,
+                    "ts": e.ts,
+                    "actor": e.actor,
+                    "action": e.action,
+                    "target_type": e.target_type,
+                    "target_id": e.target_id,
+                    "before": e.before,
+                    "after": e.after,
+                    "client_ip": e.client_ip,
+                    "summary": e.summary,
+                }
+                for e in events
+            ]
 
     return router

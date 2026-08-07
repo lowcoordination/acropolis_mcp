@@ -23,7 +23,7 @@ from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
-from db.repo import ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo
+from db.repo import AdminEventRepo, ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo
 from stoa.health import HealthPoller
 from stoa.retention import AuditRetentionJob
 from stoa.webhooks import WebhookDispatcher
@@ -169,7 +169,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.include_router(build_setup_router(settings_repo, rate_limiter))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
-        rate_limiter, pipeline, webhook_dispatcher,
+        rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db),
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo))
