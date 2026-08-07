@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from archon.api import build_control_plane_router
 from archon.auth.apikeys import ApiKeyService
+from archon.oidc import AttemptStore
 from archon.settings import Settings
 from archon.setup import build_setup_router
 from argus.aggregate_pipeline import AggregatePipeline
@@ -175,7 +176,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.webhook_dispatcher = webhook_dispatcher
     app.state.config_source = config_source
 
-    app.include_router(build_setup_router(settings_repo, rate_limiter, user_repo))
+    oidc_attempts = AttemptStore()
+    app.include_router(build_setup_router(settings_repo, rate_limiter, user_repo, http_client, oidc_attempts))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
         rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source, user_repo,

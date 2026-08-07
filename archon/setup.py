@@ -1,21 +1,44 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from typing import Optional
+from urllib.parse import urlparse
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 
+from archon.oidc import (
+    AttemptStore,
+    OidcCallbackError,
+    OidcConfigError,
+    OidcSettings,
+    build_authorization_url,
+    check_jit_allowlist,
+    decode_id_token_unverified,
+    discover,
+    exchange_code,
+    map_group_to_role,
+)
 from archon.passwords import hash_password, verify_password
-from archon.schemas import LoginRequest, PasswordChangeRequest, SetupRequest, SetupStatusResponse
+from archon.schemas import (
+    LoginRequest,
+    OidcStatusResponse,
+    PasswordChangeRequest,
+    SetupRequest,
+    SetupStatusResponse,
+)
 from archon.sessions import (
     DEFAULT_SESSION_VERSION,
     SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
     create_session_token,
-    decode_session_payload,
 )
 from db.repo import SettingsRepo, UserRepo
+
+_logger = logging.getLogger("archon.setup")
 
 # F16 fix (review 2026-08-04): no throttling existed on /login or /setup at all. PBKDF2-SHA256
 # at 600k iterations costs ~67ms/attempt — correct, OWASP-compliant work, but with no lockout it
@@ -49,6 +72,8 @@ def build_setup_router(
     settings_repo: SettingsRepo,
     rate_limiter: Optional[RateLimiterRegistry] = None,
     user_repo: Optional[UserRepo] = None,
+    http_client: Optional[httpx.AsyncClient] = None,
+    oidc_attempts: Optional[AttemptStore] = None,
 ) -> APIRouter:
     """Setup and login endpoints — deliberately NOT behind require_admin, since they're how
     an admin gets established (setup) or authenticated (login) in the first place.
@@ -258,5 +283,164 @@ def build_setup_router(
         new_version = await _current_session_version(settings_repo) + 1
         await settings_repo.set("session_version", str(new_version))
         return {"status": "ok"}
+
+    # --- OIDC (enterprise #1) --- deliberately NOT behind require_admin: /auth/oidc/login is
+    # how a not-yet-authenticated browser starts the flow, and /auth/oidc/callback is where the
+    # IdP redirects an equally not-yet-authenticated browser back to. Both are registered only
+    # when the pieces they need (user_repo, http_client, oidc_attempts) were actually wired in —
+    # tests constructing this router directly for local-auth-only coverage are unaffected.
+    if user_repo is not None and http_client is not None and oidc_attempts is not None:
+
+        async def _load_oidc_settings() -> OidcSettings:
+            values = await settings_repo.get_all()
+            try:
+                oidc_settings = OidcSettings.from_settings_dict(values)
+            except OidcConfigError as e:
+                raise HTTPException(status_code=500, detail=str(e))
+            if oidc_settings is None:
+                raise HTTPException(status_code=404, detail="OIDC is not configured")
+            return oidc_settings
+
+        @router.get("/auth/oidc/status", response_model=OidcStatusResponse)
+        async def oidc_status():
+            values = await settings_repo.get_all()
+            try:
+                oidc_settings = OidcSettings.from_settings_dict(values)
+            except OidcConfigError:
+                # Misconfigured (enabled=true but incomplete) reads as "not available" to an
+                # unauthenticated caller — the real error is only surfaced to whoever tries to
+                # actually start the flow, and belongs in server logs, not a public status probe.
+                return OidcStatusResponse(enabled=False)
+            if oidc_settings is None:
+                return OidcStatusResponse(enabled=False)
+            return OidcStatusResponse(enabled=True, login_url="/api/v1/auth/oidc/login")
+
+        @router.get("/auth/oidc/login")
+        async def oidc_login():
+            oidc_settings = await _load_oidc_settings()
+            try:
+                discovery_doc = await discover(oidc_settings.issuer, http_client)
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"OIDC discovery failed: {e}")
+
+            authorization_endpoint = discovery_doc.get("authorization_endpoint")
+            if not authorization_endpoint:
+                raise HTTPException(
+                    status_code=502, detail="OIDC discovery document missing authorization_endpoint"
+                )
+
+            attempt = oidc_attempts.create()
+            url = build_authorization_url(
+                authorization_endpoint=authorization_endpoint,
+                client_id=oidc_settings.client_id,
+                redirect_uri=oidc_settings.redirect_uri,
+                scopes=oidc_settings.scopes,
+                state=attempt.state,
+                nonce=attempt.nonce,
+                code_verifier=attempt.code_verifier,
+            )
+            return RedirectResponse(url, status_code=302)
+
+        @router.get("/auth/oidc/callback")
+        async def oidc_callback(
+            request: Request, response: Response,
+            code: Optional[str] = None, state: Optional[str] = None,
+            error: Optional[str] = None, error_description: Optional[str] = None,
+        ):
+            if error:
+                raise HTTPException(
+                    status_code=400, detail=f"OIDC provider returned an error: {error} ({error_description})"
+                )
+            if not code or not state:
+                raise HTTPException(status_code=400, detail="missing code or state")
+
+            # Single-use lookup: `pop` removes the attempt regardless of outcome, so the same
+            # state value can never be replayed against a second callback (session-fixation /
+            # replay guard).
+            attempt = oidc_attempts.pop(state)
+            if attempt is None:
+                raise HTTPException(status_code=400, detail="unknown or expired state")
+
+            oidc_settings = await _load_oidc_settings()
+            try:
+                discovery_doc = await discover(oidc_settings.issuer, http_client)
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"OIDC discovery failed: {e}")
+            token_endpoint = discovery_doc.get("token_endpoint")
+            if not token_endpoint:
+                raise HTTPException(
+                    status_code=502, detail="OIDC discovery document missing token_endpoint"
+                )
+
+            try:
+                tokens = await exchange_code(
+                    token_endpoint=token_endpoint, client_id=oidc_settings.client_id,
+                    client_secret=oidc_settings.client_secret, redirect_uri=oidc_settings.redirect_uri,
+                    code=code, code_verifier=attempt.code_verifier, http_client=http_client,
+                )
+            except httpx.HTTPStatusError as e:
+                _logger.warning("OIDC token exchange failed: %s", e)
+                raise HTTPException(status_code=400, detail="OIDC token exchange failed")
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"OIDC token exchange failed: {e}")
+
+            id_token = tokens.get("id_token")
+            if not id_token:
+                raise HTTPException(status_code=502, detail="OIDC token response missing id_token")
+
+            try:
+                claims = decode_id_token_unverified(id_token)
+            except OidcCallbackError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            # Nonce validation: the value embedded in the ID token must match the one THIS
+            # server generated for THIS attempt — this is what stops a replayed/substituted ID
+            # token (e.g. one obtained via a different, attacker-initiated flow) from being
+            # accepted as if it belonged to this browser's login.
+            if claims.get("nonce") != attempt.nonce:
+                raise HTTPException(status_code=400, detail="nonce mismatch")
+
+            subject = claims.get("sub")
+            if not subject or not isinstance(subject, str):
+                raise HTTPException(status_code=400, detail="id_token missing sub claim")
+
+            existing = await user_repo.get_by_subject(subject)
+            if existing is None:
+                if not oidc_settings.jit_provisioning:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="no local account for this identity and JIT provisioning is disabled",
+                    )
+                try:
+                    check_jit_allowlist(claims=claims, oidc_settings=oidc_settings)
+                except OidcCallbackError as e:
+                    raise HTTPException(status_code=403, detail=str(e))
+                role = map_group_to_role(claims=claims, oidc_settings=oidc_settings)
+                user = await user_repo.get_or_create_from_oidc(
+                    subject=subject, email=claims.get("email"), default_role=role,
+                    preferred_username=claims.get("preferred_username"),
+                )
+            else:
+                user = existing
+
+            if not user.enabled:
+                raise HTTPException(status_code=401, detail="account disabled")
+
+            session_secret = await settings_repo.get("session_secret")
+            if session_secret is None:
+                raise HTTPException(status_code=500, detail="server misconfigured: no session secret")
+
+            await user_repo.touch_last_login(user.id)
+            current_version = await _current_session_version(settings_repo)
+            token = create_session_token(
+                session_secret, session_version=current_version,
+                user_id=user.id, user_session_version=user.session_version,
+            )
+            response = RedirectResponse("/", status_code=302)
+            response.set_cookie(
+                SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
+                httponly=True, samesite="lax", secure=_request_is_https(request),
+            )
+            return response
 
     return router
