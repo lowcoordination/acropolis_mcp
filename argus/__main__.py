@@ -66,7 +66,7 @@ async def _run_import(path: str, dry_run: bool) -> None:
         await db.close()
 
 
-async def _run_export(path: str | None, include_credentials: bool) -> None:
+async def _run_export(path: str | None, include_credentials: bool, stable: bool = False) -> None:
     settings = Settings()
     db = Database(Path(settings.data_dir))
     await db.connect()
@@ -78,7 +78,7 @@ async def _run_export(path: str | None, include_credentials: bool) -> None:
         # while the operator sees that credentials were withheld.
         for warning in result.warnings:
             print(f"warning: {warning}", file=sys.stderr)
-        text = result.to_yaml()
+        text = result.to_stable_yaml() if stable else result.to_yaml()
         if path:
             Path(path).write_text(text)
             print(f"wrote {path}", file=sys.stderr)
@@ -114,6 +114,41 @@ async def _run_import_config(path: str, apply: bool) -> None:
         await db.close()
 
 
+async def _run_check(path: str) -> int:
+    """Check whether live config matches the file. Returns exit code: 0=in sync, 1=drift, 2=invalid.
+
+    This is the CI primitive for GitOps: run in a pipeline to detect drift between the
+    committed config file and the live gateway state. Three distinct exit codes because CI
+    needs to distinguish "config drifted" (actionable) from "file is malformed" (fix the file).
+    """
+    settings = Settings()
+    db = Database(Path(settings.data_dir))
+    await db.connect()
+    try:
+        plan = await plan_import(
+            ServerRepo(db), SettingsRepo(db), Path(path).read_text(), apply=False
+        )
+
+        if not plan.ok:
+            # Invalid file — parse errors, validation failures, etc.
+            for error in plan.errors:
+                print(f"error: {error}", file=sys.stderr)
+            return 2
+
+        # Check for drift: any action that isn't "unchanged" means live state differs from file
+        drift_actions = [a for a in plan.actions if a.kind != "unchanged"]
+        if drift_actions:
+            print("config drift detected:", file=sys.stderr)
+            for action in drift_actions:
+                print(f"  {action.describe(applied=False)}", file=sys.stderr)
+            return 1
+
+        # In sync
+        return 0
+    finally:
+        await db.close()
+
+
 def cli() -> None:
     parser = argparse.ArgumentParser(prog="argus")
     subparsers = parser.add_subparsers(dest="command")
@@ -128,6 +163,10 @@ def cli() -> None:
         "--include-credentials", action="store_true",
         help="Include plaintext upstream credentials (the file becomes a secret)",
     )
+    export_parser.add_argument(
+        "--stable", action="store_true",
+        help="Omit the exported_at timestamp — for committed exports that should be byte-identical",
+    )
 
     import_config_parser = subparsers.add_parser(
         "import-config", help="Import an Acropolis config export (dry run unless --apply)"
@@ -138,14 +177,22 @@ def cli() -> None:
         "--apply", action="store_true", help="Actually write the changes (default: dry run)"
     )
 
+    check_parser = subparsers.add_parser(
+        "check", help="Check whether live config matches a file (exit 0=in sync, 1=drift, 2=invalid)"
+    )
+    check_parser.add_argument("path", help="Path to an exported YAML file")
+
     args = parser.parse_args()
 
     if args.command == "import":
         asyncio.run(_run_import(args.path, args.dry_run))
     elif args.command == "export":
-        asyncio.run(_run_export(args.output, args.include_credentials))
+        asyncio.run(_run_export(args.output, args.include_credentials, args.stable))
     elif args.command == "import-config":
         asyncio.run(_run_import_config(args.path, args.apply))
+    elif args.command == "check":
+        exit_code = asyncio.run(_run_check(args.path))
+        raise SystemExit(exit_code)
     else:
         _run_server()
 

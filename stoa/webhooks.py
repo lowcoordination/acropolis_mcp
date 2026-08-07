@@ -25,7 +25,7 @@ DEBOUNCE_WINDOW_SECONDS = 60.0
 CAP_WINDOW_SECONDS = 3600.0
 CAP_MAX_PER_WINDOW = 20
 
-VALID_EVENTS = ("blocked", "unhealthy")
+VALID_EVENTS = ("blocked", "unhealthy", "drift")
 
 
 @dataclass

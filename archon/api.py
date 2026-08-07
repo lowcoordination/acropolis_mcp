@@ -63,6 +63,9 @@ _SETTINGS_DEFAULTS = {
     "audit_retention_days": "30",
     "webhook_enabled": "false",
     "webhook_events": "blocked,unhealthy",
+    "gitops_enabled": "false",
+    "gitops_poll_seconds": "300",
+    "gitops_allow_private": "false",
 }
 
 
@@ -100,6 +103,7 @@ def build_control_plane_router(
     pipeline: Optional[Pipeline] = None,
     webhook_dispatcher: Optional[WebhookDispatcher] = None,
     admin_event_repo: Optional[AdminEventRepo] = None,
+    config_source: Optional["ConfigSource"] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
@@ -789,5 +793,60 @@ def build_control_plane_router(
                 )
                 for e in events
             ]
+
+    # GitOps endpoints — only registered when a ConfigSource is wired in
+    if config_source is not None:
+        @router.get("/config/drift")
+        async def get_drift():
+            """Get current drift state between live config and git-tracked file."""
+            state = config_source.state
+            result = {
+                "status": state.status,
+                "last_check": state.last_check,
+                "last_error": state.last_error,
+                "commit_sha": state.commit_sha,
+            }
+            if state.plan is not None:
+                result["actions"] = [
+                    {
+                        "kind": a.kind,
+                        "target": a.target,
+                        "detail": a.detail,
+                        "description": a.describe(applied=False),
+                    }
+                    for a in state.plan.actions
+                ]
+                result["warnings"] = state.plan.warnings
+                result["errors"] = state.plan.errors
+            return result
+
+        @router.post("/config/reconcile")
+        async def reconcile_config(request: Request):
+            """Apply the pending drift plan. Writes one admin event with commit SHA."""
+            try:
+                plan = await config_source.reconcile()
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            # Record reconcile in admin events with commit SHA
+            if admin_event_repo is not None:
+                await record(
+                    admin_event_repo,
+                    action="config.reconcile",
+                    summary=f"reconciled from git ({len(plan.actions)} change(s))",
+                    actor="gitops",
+                    target_type="config",
+                    after={
+                        "commit_sha": config_source.state.commit_sha,
+                        "changes": [a.describe(applied=True) for a in plan.actions],
+                    },
+                    client_ip=request.client.host if request.client else None,
+                )
+
+            return {
+                "applied": plan.ok,
+                "actions": [a.describe(applied=True) for a in plan.actions],
+                "errors": plan.errors,
+            }
 
     return router
