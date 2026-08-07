@@ -384,6 +384,15 @@ class SetupRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     admin_password: str
+    # Bug fix (found in coordinator review of PR #16, 2026-08-07): this field was missing
+    # entirely, and archon/setup.py's /login handler was hardcoded to
+    # user_repo.get_by_username("admin") regardless of who was actually trying to log in --
+    # any locally-created operator/viewer user could never authenticate through the real login
+    # route, full stop. Optional, defaulting to "admin", for backward compatibility with the
+    # original single-credential form shape (any saved bookmark/script/integration that only
+    # ever sent admin_password keeps working unchanged) -- the field name stays
+    # "admin_password" for the same reason, even though it now authenticates any user.
+    username: str = "admin"
 
 
 class UserResponse(BaseModel):

@@ -36,6 +36,7 @@ from archon.sessions import (
     SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
     create_session_token,
+    decode_session_payload,
 )
 from db.repo import SettingsRepo, UserRepo
 
@@ -48,6 +49,14 @@ _logger = logging.getLogger("archon.setup")
 # RateLimiterRegistry the data plane already uses. Generous enough not to lock out a legitimate
 # admin who mistypes a password a few times, tight enough to make sustained guessing impractical.
 _LOGIN_RATE_LIMIT_SPEC = "10/minute"
+
+# Bug-fix follow-up (coordinator review of PR #16, 2026-08-07): a correctly-formatted-but-
+# unrelated hash for the "no such user" timing-safety branch in /login below. Generated once at
+# import time via the real hash_password() (not hand-written) so it has the exact same
+# iteration count and format as a genuine stored hash — verify_password against it costs the
+# same ~67ms PBKDF2 work as a real wrong-password check, which is the property that actually
+# matters here (constant password, not secret; this is not a credential).
+_DUMMY_HASH_FOR_TIMING = hash_password("not-a-real-account-timing-decoy")
 
 
 def _request_is_https(request: Request) -> bool:
@@ -176,14 +185,33 @@ def build_setup_router(
         if stored_hash is None:
             raise HTTPException(status_code=400, detail="setup has not been completed yet")
 
-        # enterprise #1: the login form is still single-credential (just a password, no
-        # username field) — this endpoint's request shape is unchanged. What changed is WHERE
-        # the hash it verifies against comes from: prefer the `users` table's 'admin' row (the
-        # normal post-migration/post-setup state) and fall back to the legacy
-        # settings.admin_password_hash read for a not-yet-migrated or partially-migrated
-        # instance (0007_users.sql non-negotiable: partial upgrade degrades to "still works").
-        user = await user_repo.get_by_username("admin") if user_repo is not None else None
-        verify_against = user.password_hash if (user is not None and user.password_hash) else stored_hash
+        # Bug fix (found in coordinator review of PR #16, 2026-08-07): this used to hardcode
+        # user_repo.get_by_username("admin") regardless of body.username (which didn't even
+        # exist as a field) -- ANY locally-created operator/viewer user was silently checked
+        # against the ADMIN's password hash and could never log in. Fixed to resolve by
+        # body.username. The legacy settings.admin_password_hash fallback is now scoped
+        # specifically to username == "admin" with no matching users-table row -- that's the
+        # exact partial-migration case 0007_users.sql's non-negotiable ("partial upgrade
+        # degrades to still works") is about, and it must NOT silently extend to every other
+        # username (a request for a NONEXISTENT non-admin username has no business succeeding
+        # against the admin's hash just because verify_against would otherwise be undefined).
+        user = await user_repo.get_by_username(body.username) if user_repo is not None else None
+        if user is not None:
+            verify_against = user.password_hash
+        elif body.username == "admin":
+            verify_against = stored_hash
+        else:
+            verify_against = None
+
+        if verify_against is None:
+            # No such user AND not the legacy-fallback-eligible "admin" case. Still run a dummy
+            # verify_password call against a syntactically-valid-but-unrelated hash so this
+            # branch takes roughly the same time as a real failed check — a login endpoint that
+            # returns instantly for "unknown username" and slowly for "wrong password" leaks
+            # username validity via timing.
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, verify_password, body.admin_password, _DUMMY_HASH_FOR_TIMING)
+            raise HTTPException(status_code=401, detail="incorrect password")
 
         # F16: see the identical run_in_executor note on /setup above — verify_password runs
         # the same synchronous PBKDF2 work and must not block the event loop either.
@@ -231,8 +259,28 @@ def build_setup_router(
         if stored_hash is None:
             raise HTTPException(status_code=400, detail="setup has not been completed yet")
 
-        # Same users-table-preferred / settings-fallback resolution as /login.
-        user = await user_repo.get_by_username("admin") if user_repo is not None else None
+        # Bug fix (found alongside the /login fix, coordinator review of PR #16, 2026-08-07):
+        # this had the SAME hardcoded-to-"admin" bug as /login, but for a different underlying
+        # reason -- this route is deliberately NOT behind require_admin (its security model is
+        # "knowing the current password IS the proof of identity," same as it always was for
+        # the single-admin flow), so there was never a Principal to read a real username from.
+        # Now: if a session cookie is present, resolve the CALLER'S OWN user_id from it
+        # (best-effort, not a hard auth requirement — a forged/expired cookie just means we
+        # fall through to the legacy admin-only path below, same as no cookie at all) and change
+        # THEIR password. A caller with no session cookie (or one carrying no user_id) is
+        # assumed to be the legacy single admin, exactly as before this identity milestone.
+        user = None
+        if user_repo is not None:
+            cookie = request.cookies.get(SESSION_COOKIE_NAME)
+            payload = decode_session_payload(cookie) if cookie else None
+            cookie_user_id = payload.get("user_id") if payload else None
+            if cookie_user_id is not None:
+                try:
+                    user = await user_repo.get_by_id(int(cookie_user_id))
+                except Exception:
+                    user = None
+            else:
+                user = await user_repo.get_by_username("admin")
         verify_against = user.password_hash if (user is not None and user.password_hash) else stored_hash
 
         loop = asyncio.get_running_loop()
@@ -246,15 +294,16 @@ def build_setup_router(
 
         new_hash = await loop.run_in_executor(None, hash_password, body.new_password)
         # Global session_version bump keeps invalidating any outstanding LEGACY (user-less)
-        # tokens, same as before the identity milestone. settings.admin_password_hash is kept
-        # in sync too — it's the fallback read path require_admin/login use when `users` is
-        # empty/absent, and this is the natural place to update it since it's already being
-        # written for compatibility.
+        # tokens, same as before the identity milestone.
         new_version = await _current_session_version(settings_repo) + 1
-        await settings_repo.set_many({
-            "admin_password_hash": new_hash,
-            "session_version": str(new_version),
-        })
+        settings_updates = {"session_version": str(new_version)}
+        if user is None or user.username == "admin":
+            # settings.admin_password_hash is kept in sync ONLY when the admin's own password
+            # is what changed — it's the fallback read path require_admin/login use when
+            # `users` is empty/absent, and must keep reflecting the admin account specifically,
+            # not whichever non-admin user happened to call this route.
+            settings_updates["admin_password_hash"] = new_hash
+        await settings_repo.set_many(settings_updates)
 
         new_user_version = DEFAULT_SESSION_VERSION
         user_id = None

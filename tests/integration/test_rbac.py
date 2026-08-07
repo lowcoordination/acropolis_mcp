@@ -36,13 +36,14 @@ async def rbac_app(tmp_path: Path):
 
 
 async def _login_as(transport: httpx.ASGITransport, username: str, password: str) -> httpx.AsyncClient:
+    # Bug fix (coordinator review of PR #16, 2026-08-07): POST /api/v1/login now takes a real
+    # `username` field (see archon/schemas.py's LoginRequest and the fix in archon/setup.py) —
+    # this goes through the ACTUAL login route for every role, not just "admin". Previously this
+    # helper's docstring said only admin could reach /login at all, and non-admin test clients
+    # were built by forging a session cookie directly; that was true, and it was the bug.
     client = httpx.AsyncClient(transport=transport, base_url="http://argus.test")
-    resp = await client.post("/api/v1/login", json={"admin_password": password})
+    resp = await client.post("/api/v1/login", json={"username": username, "admin_password": password})
     if resp.status_code != 200:
-        # Only the 'admin' user can log in through the single-credential /login form (it
-        # matches against the users table's 'admin' row specifically) — every other role's
-        # test client authenticates by creating the user via the admin API, then forging a
-        # session cookie directly, since /login has no username field.
         raise AssertionError(f"login failed for {username}: {resp.status_code} {resp.text}")
     return client
 
@@ -51,11 +52,24 @@ async def _create_user_and_login(
     app, transport: httpx.ASGITransport, admin_client: httpx.AsyncClient,
     username: str, role: str, password: str = "password-12345",
 ) -> httpx.AsyncClient:
+    """Creates a user via the real admin API, then authenticates as them through the real
+    POST /api/v1/login route (not a forged cookie) — this is the actual login path an operator
+    or viewer created via the Users page would use, and is the thing that was broken pre-fix."""
     resp = await admin_client.post(
         "/api/v1/users", json={"username": username, "password": password, "role": role}
     )
     assert resp.status_code == 201, resp.text
+    return await _login_as(transport, username, password)
 
+
+async def _forge_session_cookie_client(
+    app, transport: httpx.ASGITransport, username: str,
+) -> httpx.AsyncClient:
+    """For tests that need a valid session for an EXISTING user but don't care about proving
+    the login route itself (e.g. constructing a session for a role after a hand-edited DB
+    state that couldn't have come from a normal login, like test_unknown_role_denied_everywhere
+    below). Real login-path coverage lives in _login_as / _create_user_and_login above and in
+    tests/integration/test_identity.py's dedicated login tests."""
     from archon.sessions import DEFAULT_SESSION_VERSION, SESSION_COOKIE_NAME, create_session_token
 
     settings_repo: SettingsRepo = app.state.settings_repo
@@ -69,11 +83,10 @@ async def _create_user_and_login(
         session_secret, session_version=global_version,
         user_id=user.id, user_session_version=user.session_version,
     )
-    client = httpx.AsyncClient(
+    return httpx.AsyncClient(
         transport=transport, base_url="http://argus.test",
         cookies={SESSION_COOKIE_NAME: token},
     )
-    return client
 
 
 @pytest.fixture

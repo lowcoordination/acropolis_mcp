@@ -262,3 +262,191 @@ async def test_legacy_admin_session_still_works_when_users_table_has_no_matching
             resp = await client.get("/api/v1/servers")
             assert resp.status_code == 200, "user-less legacy token must still authenticate via fallback"
     await db.close()
+
+
+# --- Bug fix regression tests: POST /api/v1/login was hardcoded to check body.admin_password
+# against the "admin" user's hash regardless of who was actually trying to log in -- there was
+# no `username` field at all. Any locally-created operator/viewer user could never authenticate
+# through the real login route. Found in coordinator review of PR #16 (2026-08-07). These go
+# through the REAL HTTP /login route end to end, not a forged session cookie, since the whole
+# point is proving the route itself works for a non-admin user.
+
+async def test_locally_created_operator_can_log_in_via_real_login_route(app_and_transport):
+    app, transport = app_and_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
+        await admin_client.post("/api/v1/setup", json={"admin_password": "admin-pw-12345"})
+        created = await admin_client.post(
+            "/api/v1/users",
+            json={"username": "opuser", "password": "operator-real-login-pw", "role": "operator"},
+        )
+        assert created.status_code == 201
+
+    # A completely fresh client — no admin cookie, no prior state — logging in as the new user
+    # through the ACTUAL /api/v1/login endpoint.
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        login = await fresh.post(
+            "/api/v1/login", json={"username": "opuser", "admin_password": "operator-real-login-pw"}
+        )
+        assert login.status_code == 200, f"operator could not log in via the real route: {login.text}"
+        assert "acropolis_session" in login.cookies
+
+        me = await fresh.get("/api/v1/me")
+        assert me.status_code == 200
+        assert me.json()["username"] == "opuser"
+        assert me.json()["role"] == "operator"
+
+        # And role enforcement holds for a session obtained this way, same as any other.
+        forbidden = await fresh.post("/api/v1/keys", json={"name": "escalation-attempt"})
+        assert forbidden.status_code == 403
+
+
+async def test_locally_created_viewer_can_log_in_via_real_login_route(app_and_transport):
+    app, transport = app_and_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
+        await admin_client.post("/api/v1/setup", json={"admin_password": "admin-pw-12345"})
+        await admin_client.post(
+            "/api/v1/users",
+            json={"username": "viewuser", "password": "viewer-real-login-pw", "role": "viewer"},
+        )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        login = await fresh.post(
+            "/api/v1/login", json={"username": "viewuser", "admin_password": "viewer-real-login-pw"}
+        )
+        assert login.status_code == 200
+        me = await fresh.get("/api/v1/me")
+        assert me.json()["role"] == "viewer"
+
+
+async def test_login_with_correct_password_but_wrong_username_rejected(app_and_transport):
+    """Confirms the fix resolves by username, not just falls through to accepting anyone's
+    password against anyone's account."""
+    app, transport = app_and_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
+        await admin_client.post("/api/v1/setup", json={"admin_password": "admin-pw-12345"})
+        await admin_client.post(
+            "/api/v1/users",
+            json={"username": "alice", "password": "alice-only-password-1", "role": "viewer"},
+        )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        # alice's password against a DIFFERENT (nonexistent) username must fail.
+        resp = await fresh.post(
+            "/api/v1/login", json={"username": "bob", "admin_password": "alice-only-password-1"}
+        )
+        assert resp.status_code == 401
+
+        # The admin's password against alice's username must also fail — proves this isn't
+        # accidentally falling back to checking against the admin hash for any username.
+        resp = await fresh.post(
+            "/api/v1/login", json={"username": "alice", "admin_password": "admin-pw-12345"}
+        )
+        assert resp.status_code == 401
+
+
+async def test_login_defaults_to_admin_username_when_omitted(app_and_transport):
+    """Backward compatibility: a request body with only `admin_password` (the original,
+    pre-fix shape — any saved script/bookmark) must still log in as the admin account."""
+    app, transport = app_and_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
+        await admin_client.post("/api/v1/setup", json={"admin_password": "admin-pw-12345"})
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        resp = await fresh.post("/api/v1/login", json={"admin_password": "admin-pw-12345"})
+        assert resp.status_code == 200
+        me = await fresh.get("/api/v1/me")
+        assert me.json()["username"] == "admin"
+
+
+async def test_disabled_user_rejected_via_real_login_route(app_and_transport):
+    app, transport = app_and_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
+        await admin_client.post("/api/v1/setup", json={"admin_password": "admin-pw-12345"})
+        created = await admin_client.post(
+            "/api/v1/users",
+            json={"username": "disableduser", "password": "disabled-user-pw-1", "role": "viewer"},
+        )
+        user_id = created.json()["id"]
+        await admin_client.patch(f"/api/v1/users/{user_id}/enabled", json={"enabled": False})
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        resp = await fresh.post(
+            "/api/v1/login", json={"username": "disableduser", "admin_password": "disabled-user-pw-1"}
+        )
+        assert resp.status_code == 401
+
+
+async def test_oidc_only_user_cannot_log_in_locally(app_and_transport):
+    """An OIDC-only user has no password_hash at all — local login for that username must fail
+    cleanly, not raise, and specifically not silently succeed against some other hash."""
+    app, transport = app_and_transport
+    user_repo: UserRepo = app.state.user_repo
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
+        await admin_client.post("/api/v1/setup", json={"admin_password": "admin-pw-12345"})
+
+    await user_repo.create(
+        username="ssoonly", role="viewer", auth_source="oidc", oidc_subject="some-sub-value",
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        resp = await fresh.post(
+            "/api/v1/login", json={"username": "ssoonly", "admin_password": "anything-at-all"}
+        )
+        assert resp.status_code == 401
+
+
+async def test_login_rejects_unknown_username_without_crashing(app_and_transport):
+    app, transport = app_and_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
+        await admin_client.post("/api/v1/setup", json={"admin_password": "admin-pw-12345"})
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        resp = await fresh.post(
+            "/api/v1/login", json={"username": "totally-nonexistent-user", "admin_password": "whatever"}
+        )
+        assert resp.status_code == 401
+
+
+async def test_change_password_changes_the_callers_own_account_not_always_admin(app_and_transport):
+    """Bug fix, same root cause as /login: /change-password was hardcoded to always read/write
+    the admin's hash regardless of who was calling. Now resolves the caller from their session
+    cookie and changes THEIR password."""
+    app, transport = app_and_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
+        await admin_client.post("/api/v1/setup", json={"admin_password": "admin-pw-12345"})
+        await admin_client.post(
+            "/api/v1/users",
+            json={"username": "changepw-user", "password": "changepw-original-1", "role": "viewer"},
+        )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as user_client:
+        login = await user_client.post(
+            "/api/v1/login", json={"username": "changepw-user", "admin_password": "changepw-original-1"}
+        )
+        assert login.status_code == 200
+
+        change = await user_client.post(
+            "/api/v1/change-password",
+            json={"current_password": "changepw-original-1", "new_password": "changepw-new-12345"},
+        )
+        assert change.status_code == 200
+
+    # The user's NEW password now logs them in; their OLD password does not.
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        old = await fresh.post(
+            "/api/v1/login", json={"username": "changepw-user", "admin_password": "changepw-original-1"}
+        )
+        assert old.status_code == 401
+        new = await fresh.post(
+            "/api/v1/login", json={"username": "changepw-user", "admin_password": "changepw-new-12345"}
+        )
+        assert new.status_code == 200
+
+    # And the ADMIN's password is completely unaffected — this is the specific regression the
+    # original bug would have produced (a non-admin's password change silently rewriting the
+    # admin's hash instead).
+    async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as fresh:
+        admin_still_works = await fresh.post(
+            "/api/v1/login", json={"username": "admin", "admin_password": "admin-pw-12345"}
+        )
+        assert admin_still_works.status_code == 200

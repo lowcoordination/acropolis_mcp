@@ -6,18 +6,24 @@ import { useOidcStatus } from '../lib/useUsers'
 
 export function Login() {
   const queryClient = useQueryClient()
+  // Bug fix (found in coordinator review of PR #16, 2026-08-07): this form only ever had a
+  // password field and always logged in as "admin" — POST /api/v1/login was hardcoded the same
+  // way. Any locally-created operator/viewer user had no way to log in at all. Defaults to
+  // "admin" so the pre-existing single-credential muscle memory (and any saved bookmark) still
+  // works unchanged for the admin account specifically.
+  const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const { data: oidcStatus } = useOidcStatus()
 
   const login = useMutation({
-    mutationFn: () => setupApi.login(password),
+    mutationFn: () => setupApi.login(username, password),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['session'] })
       window.location.href = '/'
     },
     onError: (err) => {
-      setError(err instanceof ApiError ? 'Incorrect password' : 'Something went wrong')
+      setError(err instanceof ApiError ? 'Incorrect username or password' : 'Something went wrong')
     },
   })
 
@@ -41,14 +47,28 @@ export function Login() {
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
+            <label className="block text-sm font-medium mb-1" htmlFor="username">
+              Username
+            </label>
+            <input
+              id="username"
+              type="text"
+              autoComplete="username"
+              autoFocus
+              className="w-full rounded-md px-3 py-2 text-sm"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              required
+            />
+          </div>
+          <div>
             <label className="block text-sm font-medium mb-1" htmlFor="password">
-              Admin password
+              Password
             </label>
             <input
               id="password"
               type="password"
               autoComplete="current-password"
-              autoFocus
               className="w-full rounded-md px-3 py-2 text-sm"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
