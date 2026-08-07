@@ -171,6 +171,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.health_poller = health_poller
     app.state.retention_job = retention_job
     app.state.webhook_dispatcher = webhook_dispatcher
+    app.state.config_source = config_source
 
     app.include_router(build_setup_router(settings_repo, rate_limiter))
     app.include_router(build_control_plane_router(
