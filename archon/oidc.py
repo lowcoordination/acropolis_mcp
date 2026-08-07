@@ -106,11 +106,25 @@ class AttemptStore:
     need for a shared/external store; state doesn't need to survive a restart, and an attempt
     that outlives ATTEMPT_TTL_SECONDS is deliberately unusable rather than persisted."""
 
+    # Security-scan fix: /auth/oidc/login is (necessarily) unauthenticated — it's how a
+    # not-yet-logged-in browser starts the flow. Without a cap, an anonymous requester spamming
+    # that endpoint could grow `_attempts` unbounded between TTL sweeps, a cheap memory-
+    # exhaustion DoS. Each entry is tiny (~150 bytes), but "tiny but unbounded and attacker-
+    # triggered before any auth check" is exactly the shape worth capping defensively. Evicts
+    # the OLDEST entry to make room rather than rejecting the new attempt outright — a real
+    # burst of legitimate logins (e.g. a demo, or many users at once after an IdP-side outage
+    # resolves) should degrade to "very old, likely-already-abandoned attempts get evicted
+    # early," not "new logins start failing."
+    _MAX_OUTSTANDING_ATTEMPTS = 1000
+
     def __init__(self) -> None:
         self._attempts: dict[str, _PendingAttempt] = {}
 
     def create(self) -> _PendingAttempt:
         self._sweep()
+        if len(self._attempts) >= self._MAX_OUTSTANDING_ATTEMPTS:
+            oldest_state = min(self._attempts, key=lambda s: self._attempts[s].created_at)
+            self._attempts.pop(oldest_state, None)
         attempt = _PendingAttempt(
             state=secrets.token_urlsafe(32),
             nonce=secrets.token_urlsafe(32),
@@ -216,6 +230,26 @@ def decode_id_token_unverified(id_token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
     except Exception as e:
         raise OidcCallbackError(f"could not decode id_token payload: {e}") from e
+
+
+def validate_id_token_claims(*, claims: dict, oidc_settings: OidcSettings, issuer_claim: Optional[str]) -> None:
+    """Security-scan fix: validate `aud` (and `iss`, when the discovery document supplied one)
+    on the decoded ID token before trusting anything else in it.
+
+    Not strictly load-bearing under THIS flow's threat model — decode_id_token_unverified's own
+    docstring explains why signature verification isn't required here (the token arrives over a
+    direct back-channel exchange gated by client_secret + PKCE, never through the browser) — but
+    `aud`/`iss` checks are cheap, standard OIDC hygiene, and defense in depth against a
+    misconfigured or malicious IdP returning a token that was actually minted for a DIFFERENT
+    client/tenant at the same issuer. Raises OidcCallbackError (mapped to a 400 by the caller)
+    rather than silently trusting a token that doesn't claim to be for this app."""
+    aud = claims.get("aud")
+    aud_ok = aud == oidc_settings.client_id or (isinstance(aud, list) and oidc_settings.client_id in aud)
+    if not aud_ok:
+        raise OidcCallbackError("id_token audience does not match this client")
+
+    if issuer_claim is not None and claims.get("iss") != issuer_claim:
+        raise OidcCallbackError("id_token issuer does not match the configured provider")
 
 
 def check_jit_allowlist(*, claims: dict, oidc_settings: OidcSettings) -> None:

@@ -21,6 +21,7 @@ from archon.oidc import (
     discover,
     exchange_code,
     map_group_to_role,
+    validate_id_token_claims,
 )
 from archon.passwords import hash_password, verify_password
 from archon.schemas import (
@@ -390,6 +391,14 @@ def build_setup_router(
 
             try:
                 claims = decode_id_token_unverified(id_token)
+                # Security-scan fix: aud/iss hygiene, defense in depth on top of the PKCE +
+                # client_secret exchange that's the actual security boundary for this flow (see
+                # validate_id_token_claims's own docstring for why this isn't load-bearing but
+                # is still worth doing).
+                validate_id_token_claims(
+                    claims=claims, oidc_settings=oidc_settings,
+                    issuer_claim=discovery_doc.get("issuer"),
+                )
             except OidcCallbackError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 

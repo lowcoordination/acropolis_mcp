@@ -40,12 +40,15 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def _fake_id_token(*, sub: str, nonce: str, email: Optional[str] = None, groups: Optional[list[str]] = None) -> str:
+def _fake_id_token(
+    *, sub: str, nonce: str, email: Optional[str] = None, groups: Optional[list[str]] = None,
+    aud: Optional[str] = None, iss: Optional[str] = None,
+) -> str:
     """An unsigned-but-correctly-shaped JWT. archon/oidc.py's decode_id_token_unverified()
     deliberately does not check the signature for THIS flow (see its docstring) — the header/
     signature segments just need to be base64 segments, not a valid signature."""
     header = _b64url(json.dumps({"alg": "none", "typ": "JWT"}).encode())
-    claims = {"sub": sub, "nonce": nonce, "aud": _CLIENT_ID, "iss": _ISSUER}
+    claims = {"sub": sub, "nonce": nonce, "aud": aud or _CLIENT_ID, "iss": iss or _ISSUER}
     if email:
         claims["email"] = email
     if groups is not None:
@@ -67,6 +70,8 @@ class MockIdp:
         self.next_groups: Optional[list[str]] = None
         self.corrupt_nonce = False
         self.fail_token_exchange = False
+        self.wrong_aud: Optional[str] = None
+        self.wrong_iss: Optional[str] = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -90,6 +95,7 @@ class MockIdp:
             nonce = self.last_nonce if not self.corrupt_nonce else "wrong-nonce"
             id_token = _fake_id_token(
                 sub=self.next_sub, nonce=nonce, email=self.next_email, groups=self.next_groups,
+                aud=self.wrong_aud, iss=self.wrong_iss,
             )
             return httpx.Response(200, json={
                 "access_token": "fake-access-token", "id_token": id_token, "token_type": "Bearer",
@@ -382,3 +388,63 @@ async def test_idp_error_response_rejected(oidc_env):
         params={"error": "access_denied", "error_description": "user cancelled"},
     )
     assert resp.status_code == 400
+
+
+# --- Self-review fixes: aud/iss validation, AttemptStore cap ----------------------------------
+
+async def test_wrong_audience_rejected(oidc_env):
+    """Self-review fix: an ID token whose `aud` doesn't match our client_id must be rejected —
+    defense in depth on top of the PKCE + client_secret exchange (see
+    validate_id_token_claims's docstring for why this isn't the primary security boundary but
+    is still worth enforcing)."""
+    client, idp, settings_repo, user_repo = oidc_env
+    idp.wrong_aud = "some-other-clients-id"
+    state, nonce = await _start_login_and_capture_state(client)
+    idp.last_nonce = nonce
+    resp = await client.get("/api/v1/auth/oidc/callback", params={"code": "auth-code-1", "state": state})
+    assert resp.status_code == 400
+    assert "audience" in resp.json()["detail"].lower()
+
+
+async def test_wrong_issuer_rejected(oidc_env):
+    client, idp, settings_repo, user_repo = oidc_env
+    idp.wrong_iss = "https://a-different-idp.example"
+    state, nonce = await _start_login_and_capture_state(client)
+    idp.last_nonce = nonce
+    resp = await client.get("/api/v1/auth/oidc/callback", params={"code": "auth-code-1", "state": state})
+    assert resp.status_code == 400
+    assert "issuer" in resp.json()["detail"].lower()
+
+
+async def test_correct_audience_and_issuer_accepted(oidc_env):
+    """Contrast case: proves the aud/iss check isn't accidentally rejecting everything."""
+    client, idp, settings_repo, user_repo = oidc_env
+    state, nonce = await _start_login_and_capture_state(client)
+    idp.last_nonce = nonce
+    resp = await client.get("/api/v1/auth/oidc/callback", params={"code": "auth-code-1", "state": state})
+    assert resp.status_code == 302
+
+
+async def test_attempt_store_caps_outstanding_attempts():
+    """Self-review fix: AttemptStore must not grow unbounded — /auth/oidc/login is
+    unauthenticated, so an anonymous requester spamming it is the realistic attacker here."""
+    from archon.oidc import AttemptStore
+
+    store = AttemptStore()
+    for _ in range(AttemptStore._MAX_OUTSTANDING_ATTEMPTS + 50):
+        store.create()
+    assert len(store._attempts) <= AttemptStore._MAX_OUTSTANDING_ATTEMPTS
+
+
+async def test_attempt_store_evicts_oldest_when_capped():
+    from archon.oidc import AttemptStore
+
+    store = AttemptStore()
+    store._MAX_OUTSTANDING_ATTEMPTS = 3  # shrink for a fast, deterministic test
+    first = store.create()
+    store.create()
+    store.create()
+    store.create()  # should evict `first`
+
+    assert store.pop(first.state) is None
+    assert len(store._attempts) == 3
