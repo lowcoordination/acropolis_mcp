@@ -67,5 +67,9 @@ export const api = {
     const qs = params ? `?${new URLSearchParams(params)}` : ''
     return request<T>(`${path}${qs}`, { method: 'PATCH' })
   },
+  // Distinct from `patch` above (which sends query params, matching PATCH /keys/{id}?enabled=…)
+  // — the /users/{id}/role and /users/{id}/enabled routes take a JSON body instead.
+  patchJson: <T>(path: string, body: unknown) =>
+    request<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
 }

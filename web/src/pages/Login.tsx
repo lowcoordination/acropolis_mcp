@@ -2,11 +2,13 @@ import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { setupApi } from '../api/settings'
 import { ApiError } from '../api/client'
+import { useOidcStatus } from '../lib/useUsers'
 
 export function Login() {
   const queryClient = useQueryClient()
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const { data: oidcStatus } = useOidcStatus()
 
   const login = useMutation({
     mutationFn: () => setupApi.login(password),
@@ -66,6 +68,25 @@ export function Login() {
             {login.isPending ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
+        {oidcStatus?.enabled && oidcStatus.login_url && (
+          <>
+            <div className="flex items-center gap-3 my-4">
+              <div className="flex-1 border-t" style={{ borderColor: 'var(--border)' }} />
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                or
+              </span>
+              <div className="flex-1 border-t" style={{ borderColor: 'var(--border)' }} />
+            </div>
+            {/* A plain navigation, not a fetch — /auth/oidc/login issues a 302 to the IdP's
+                authorization endpoint, which only makes sense as a real browser navigation. */}
+            <a
+              href={oidcStatus.login_url}
+              className="btn-secondary w-full rounded-md py-2 text-sm font-medium flex items-center justify-center"
+            >
+              Sign in with SSO
+            </a>
+          </>
+        )}
       </div>
     </div>
   )
