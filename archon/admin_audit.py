@@ -62,12 +62,12 @@ def _serialize_policy(policy: ServerPolicy) -> dict[str, Any]:
     }
 
 
-def _filter_server_fields(data: dict[str, Any]) -> dict[str, Any]:
+def filter_server_fields(data: dict[str, Any]) -> dict[str, Any]:
     """Return only the allowlisted fields from a server dict."""
     return {k: v for k, v in data.items() if k in RECORDABLE_SERVER_FIELDS}
 
 
-def _filter_settings_keys(data: dict[str, str]) -> dict[str, str]:
+def filter_settings_keys(data: dict[str, str]) -> dict[str, str]:
     """Return only the allowlisted keys from a settings dict."""
     return {k: v for k, v in data.items() if k in RECORDABLE_SETTINGS_KEYS}
 

@@ -322,6 +322,19 @@ class AuditEventResponse(BaseModel):
     origin: Optional[str] = None  # None (normal traffic) | "test" (admin Try-it call)
 
 
+class AdminEventResponse(BaseModel):
+    id: int
+    ts: str
+    actor: Optional[str] = None
+    action: str
+    target_type: Optional[str] = None
+    target_id: Optional[str] = None
+    before: Optional[str] = None
+    after: Optional[str] = None
+    client_ip: Optional[str] = None
+    summary: str
+
+
 class ConfigImportRequest(BaseModel):
     yaml: str
     # Defaults to False so the destructive path is never the accidental one — a client that

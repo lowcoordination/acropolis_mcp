@@ -613,6 +613,20 @@ class AdminEventRecord(BaseModel):
     client_ip: Optional[str] = None
     summary: str  # human-readable, e.g. "mode: allowlist -> passthrough"
 
+    def parse_before(self) -> Optional[dict]:
+        """Parse the before JSON into a dict. Returns None if before is NULL."""
+        if self.before is None:
+            return None
+        import json
+        return json.loads(self.before)
+
+    def parse_after(self) -> Optional[dict]:
+        """Parse the after JSON into a dict. Returns None if after is NULL."""
+        if self.after is None:
+            return None
+        import json
+        return json.loads(self.after)
+
 
 class AdminEventRepo:
     """Control-plane audit log — records administrative actions (server CRUD, policy changes,

@@ -67,6 +67,13 @@ class ApiKeyService:
     async def list(self) -> list[ApiKeyRecord]:
         return await self._repo.list()
 
+    async def get(self, key_id: int) -> Optional[ApiKeyRecord]:
+        """Get a key by ID, or None if not found. Used by admin_audit for before/after diff."""
+        try:
+            return await self._repo.get_by_id(key_id)
+        except ServerNotFoundError:
+            return None
+
     async def disable(self, key_id: int) -> None:
         await self._repo.set_enabled(key_id, False)
 

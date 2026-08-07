@@ -13,8 +13,8 @@ from fastapi.responses import StreamingResponse
 
 from archon.admin_auth import require_admin
 from archon.admin_audit import (
-    _filter_server_fields,
-    _filter_settings_keys,
+    filter_server_fields,
+    filter_settings_keys,
     record,
     record_config_import,
     record_policy_change,
@@ -22,6 +22,7 @@ from archon.admin_audit import (
 from archon.auth.apikeys import ApiKeyService
 from archon.config_io import export_config, plan_import
 from archon.schemas import (
+    AdminEventResponse,
     AuditEventResponse,
     ConfigImportAction,
     ConfigImportRequest,
@@ -131,10 +132,11 @@ def build_control_plane_router(
                 admin_event_repo,
                 action="server.create",
                 summary=f"created server '{body.slug}'",
+                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
                 actor="admin-session",
                 target_type="server",
                 target_id=body.slug,
-                after=_filter_server_fields({
+                after=filter_server_fields({
                     "slug": body.slug,
                     "name": body.name,
                     "upstream_url": body.upstream_url,
@@ -210,7 +212,7 @@ def build_control_plane_router(
         try:
             # Fetch before state for audit diff
             before_server = await server_repo.get(slug)
-            before_dict = _filter_server_fields({
+            before_dict = filter_server_fields({
                 "slug": before_server.slug,
                 "name": before_server.name,
                 "upstream_url": before_server.upstream_url,
@@ -227,7 +229,7 @@ def build_control_plane_router(
             raise HTTPException(status_code=404, detail="server not found")
 
         if admin_event_repo is not None:
-            after_dict = _filter_server_fields({
+            after_dict = filter_server_fields({
                 "slug": server.slug,
                 "name": server.name,
                 "upstream_url": server.upstream_url,
@@ -244,6 +246,7 @@ def build_control_plane_router(
                 admin_event_repo,
                 action="server.update",
                 summary=summary,
+                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
                 actor="admin-session",
                 target_type="server",
                 target_id=slug,
@@ -259,7 +262,7 @@ def build_control_plane_router(
         try:
             # Fetch before state for audit
             server = await server_repo.get(slug)
-            before_dict = _filter_server_fields({
+            before_dict = filter_server_fields({
                 "slug": server.slug,
                 "name": server.name,
                 "upstream_url": server.upstream_url,
@@ -276,6 +279,7 @@ def build_control_plane_router(
                 admin_event_repo,
                 action="server.delete",
                 summary=f"deleted server '{slug}'",
+                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
                 actor="admin-session",
                 target_type="server",
                 target_id=slug,
@@ -416,6 +420,7 @@ def build_control_plane_router(
                 server_slug=slug,
                 current=before_policy,
                 incoming=after_policy,
+                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
                 actor="admin-session",
                 client_ip=request.client.host if request.client else None,
             )
@@ -436,6 +441,7 @@ def build_control_plane_router(
                 admin_event_repo,
                 action="key.create",
                 summary=f"created API key '{body.name}'",
+                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
                 actor="admin-session",
                 target_type="key",
                 target_id=str(generated.record.id),
@@ -451,25 +457,25 @@ def build_control_plane_router(
     @router.patch("/keys/{key_id}", response_model=KeyResponse)
     async def patch_key(key_id: int, enabled: bool, request: Request):
         # Fetch before state for audit
-        keys_before = await api_keys.list()
-        key_before = next((k for k in keys_before if k.id == key_id), None)
+        key_before = await api_keys.get(key_id)
 
         if enabled:
             await api_keys.enable(key_id)
         else:
             await api_keys.disable(key_id)
 
-        keys = await api_keys.list()
-        match = next((k for k in keys if k.id == key_id), None)
-        if match is None:
+        key_after = await api_keys.get(key_id)
+        if key_after is None:
             raise HTTPException(status_code=404, detail="key not found")
 
+        # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
         if admin_event_repo is not None and key_before is not None:
             action = "key.enable" if enabled else "key.disable"
             await record(
                 admin_event_repo,
                 action=action,
-                summary=f"{'enabled' if enabled else 'disabled'} API key '{match.name}'",
+                summary=f"{'enabled' if enabled else 'disabled'} API key '{key_after.name}'",
+                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
                 actor="admin-session",
                 target_type="key",
                 target_id=str(key_id),
@@ -478,21 +484,22 @@ def build_control_plane_router(
                 client_ip=request.client.host if request.client else None,
             )
 
-        return _key_to_response(match)
+        return _key_to_response(key_after)
 
     @router.delete("/keys/{key_id}", status_code=204)
     async def delete_key(key_id: int, request: Request):
         # Fetch before state for audit
-        keys_before = await api_keys.list()
-        key_before = next((k for k in keys_before if k.id == key_id), None)
+        key_before = await api_keys.get(key_id)
 
         await api_keys.delete(key_id)
 
+        # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
         if admin_event_repo is not None and key_before is not None:
             await record(
                 admin_event_repo,
                 action="key.delete",
                 summary=f"deleted API key '{key_before.name}'",
+                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
                 actor="admin-session",
                 target_type="key",
                 target_id=str(key_id),
@@ -521,7 +528,7 @@ def build_control_plane_router(
         async def update_settings(body: SettingsUpdateRequest, request: Request):
             # Fetch before state for audit diff
             before_settings = await _get_settings_with_defaults(settings_repo)
-            before_filtered = _filter_settings_keys(before_settings)
+            before_filtered = filter_settings_keys(before_settings)
 
             updates: dict[str, str] = {}
             if body.auth_mode is not None:
@@ -559,7 +566,7 @@ def build_control_plane_router(
 
             # Fetch after state for audit diff
             after_settings = await _get_settings_with_defaults(settings_repo)
-            after_filtered = _filter_settings_keys(after_settings)
+            after_filtered = filter_settings_keys(after_settings)
 
             if admin_event_repo is not None:
                 changes = []
@@ -572,7 +579,8 @@ def build_control_plane_router(
                     admin_event_repo,
                     action="settings.update",
                     summary=summary,
-                    actor="admin-session",
+                    # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
+                actor="admin-session",
                     target_type="settings",
                     before=before_filtered,
                     after=after_filtered,
@@ -607,7 +615,8 @@ def build_control_plane_router(
                 await record_config_import(
                     admin_event_repo,
                     actions=action_descriptions,
-                    actor="admin-session",
+                    # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
+                actor="admin-session",
                     client_ip=request.client.host if request.client else None,
                 )
 
@@ -755,7 +764,7 @@ def build_control_plane_router(
                 return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     if admin_event_repo is not None:
-        @router.get("/admin-events")
+        @router.get("/admin-events", response_model=list[AdminEventResponse])
         async def query_admin_events(
             action: Optional[str] = None,
             target_type: Optional[str] = None,
@@ -766,18 +775,18 @@ def build_control_plane_router(
                 action=action, target_type=target_type, since=since, limit=limit,
             )
             return [
-                {
-                    "id": e.id,
-                    "ts": e.ts,
-                    "actor": e.actor,
-                    "action": e.action,
-                    "target_type": e.target_type,
-                    "target_id": e.target_id,
-                    "before": e.before,
-                    "after": e.after,
-                    "client_ip": e.client_ip,
-                    "summary": e.summary,
-                }
+                AdminEventResponse(
+                    id=e.id,
+                    ts=e.ts,
+                    actor=e.actor,
+                    action=e.action,
+                    target_type=e.target_type,
+                    target_id=e.target_id,
+                    before=e.before,
+                    after=e.after,
+                    client_ip=e.client_ip,
+                    summary=e.summary,
+                )
                 for e in events
             ]
 
