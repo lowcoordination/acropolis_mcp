@@ -12,7 +12,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
-from archon.admin_auth import require_admin
+from archon.admin_auth import Principal, require_admin
 from archon.admin_audit import (
     filter_server_fields,
     filter_settings_keys,
@@ -22,12 +22,15 @@ from archon.admin_audit import (
 )
 from archon.auth.apikeys import ApiKeyService
 from archon.config_io import export_config, plan_import
+from archon.passwords import hash_password
+from archon.rbac import ROLE_RANK, is_valid_role, require_role
 from archon.schemas import (
     AdminEventResponse,
     AuditEventResponse,
     ConfigImportAction,
     ConfigImportRequest,
     ConfigImportResponse,
+    CurrentUserResponse,
     DriftActionResponse,
     DriftStatusResponse,
     KeyCreatedResponse,
@@ -46,6 +49,10 @@ from archon.schemas import (
     StatsResponse,
     ToolTestRequest,
     ToolTestResponse,
+    UserCreateRequest,
+    UserEnabledUpdateRequest,
+    UserResponse,
+    UserRoleUpdateRequest,
     WebhookTestResponse,
 )
 from argus.audit import AuditLogger
@@ -54,7 +61,18 @@ from argus.pipeline import Pipeline
 from argus.rate_limiter import RateLimiterRegistry, server_key
 from argus.toolslist import ToolsCache
 from db.database import utcnow
-from db.repo import _UNSET, AdminEventRepo, AuditRepo, ServerNotFoundError, ServerRepo, SettingsRepo, SlugConflictError
+from db.repo import (
+    _UNSET,
+    AdminEventRepo,
+    AuditRepo,
+    ServerNotFoundError,
+    ServerRepo,
+    SettingsRepo,
+    UserNotFoundError,
+    UserRepo,
+    UsernameConflictError,
+    SlugConflictError,
+)
 from stoa.health import PROBE_TIMEOUT_SECONDS, HealthPoller
 from stoa.webhooks import VALID_EVENTS, WebhookDispatcher
 
@@ -107,8 +125,18 @@ def build_control_plane_router(
     webhook_dispatcher: Optional[WebhookDispatcher] = None,
     admin_event_repo: Optional[AdminEventRepo] = None,
     config_source: Optional["ConfigSource"] = None,
+    user_repo: Optional[UserRepo] = None,
 ) -> APIRouter:
-    router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
+    # enterprise #2 (RBAC): the router used to carry ONE blanket
+    # dependencies=[Depends(require_admin)] gate — authenticated meant authorized for
+    # everything. That's gone; every route below is individually annotated with
+    # `Depends(require_role(...))` at its own minimum role. This is deliberate and explicit
+    # rather than a decorator registry or in-handler checks (02-rbac.md design decision 2) —
+    # `grep "require_role" archon/api.py` enumerates every protected route and its floor, and a
+    # new route added without an annotation is UNPROTECTED (401 only, from require_admin having
+    # never run) rather than silently permissive, which is the fail-safe direction for a mistake
+    # to fail in even though the parametrised test suite is what's meant to catch it for real.
+    router = APIRouter(prefix="/api/v1")
 
     # F21 fix (review 2026-08-04): /api/v1/health used to live HERE, behind require_admin —
     # but both the Dockerfile HEALTHCHECK and the k8s liveness/readiness probes target it
@@ -118,13 +146,16 @@ def build_control_plane_router(
     # archon/setup.py's router, which is deliberately never behind require_admin — see that
     # module for the actual route.
 
-    @router.get("/servers", response_model=list[ServerResponse])
+    @router.get("/servers", response_model=list[ServerResponse], dependencies=[Depends(require_role("viewer"))])
     async def list_servers():
         servers = await server_repo.list()
         return [_server_to_response(s) for s in servers]
 
     @router.post("/servers", response_model=ServerResponse, status_code=201)
-    async def create_server(body: ServerCreateRequest, request: Request):
+    async def create_server(
+        body: ServerCreateRequest, request: Request,
+        principal: Principal = Depends(require_role("admin")),
+    ):
         try:
             server = await server_repo.create(
                 slug=body.slug, name=body.name, upstream_url=body.upstream_url,
@@ -139,8 +170,7 @@ def build_control_plane_router(
                 admin_event_repo,
                 action="server.create",
                 summary=f"created server '{body.slug}'",
-                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                actor=principal.actor,
                 target_type="server",
                 target_id=body.slug,
                 after=filter_server_fields({
@@ -166,7 +196,7 @@ def build_control_plane_router(
 
         return _server_to_response(server)
 
-    @router.post("/servers/{slug}/probe", response_model=ServerResponse)
+    @router.post("/servers/{slug}/probe", response_model=ServerResponse, dependencies=[Depends(require_role("operator"))])
     async def probe_server_now(slug: str):
         try:
             server = await server_repo.get(slug)
@@ -200,7 +230,7 @@ def build_control_plane_router(
                     pass
         return _server_to_response(await server_repo.get(slug))
 
-    @router.get("/servers/{slug}", response_model=ServerResponse)
+    @router.get("/servers/{slug}", response_model=ServerResponse, dependencies=[Depends(require_role("viewer"))])
     async def get_server(slug: str):
         try:
             server = await server_repo.get(slug)
@@ -209,7 +239,10 @@ def build_control_plane_router(
         return _server_to_response(server)
 
     @router.put("/servers/{slug}", response_model=ServerResponse)
-    async def update_server(slug: str, body: ServerUpdateRequest, request: Request):
+    async def update_server(
+        slug: str, body: ServerUpdateRequest, request: Request,
+        principal: Principal = Depends(require_role("admin")),
+    ):
         # F23: upstream_auth_header needs three states (unset/set-to-value/cleared-to-null),
         # which a plain `Optional[str] = None` field can't distinguish on its own — checking
         # model_fields_set tells us whether the key was present in the request body at all.
@@ -253,8 +286,7 @@ def build_control_plane_router(
                 admin_event_repo,
                 action="server.update",
                 summary=summary,
-                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                actor=principal.actor,
                 target_type="server",
                 target_id=slug,
                 before=before_dict,
@@ -265,7 +297,10 @@ def build_control_plane_router(
         return _server_to_response(server)
 
     @router.delete("/servers/{slug}", status_code=204)
-    async def delete_server(slug: str, request: Request):
+    async def delete_server(
+        slug: str, request: Request,
+        principal: Principal = Depends(require_role("admin")),
+    ):
         try:
             # Fetch before state for audit
             server = await server_repo.get(slug)
@@ -286,8 +321,7 @@ def build_control_plane_router(
                 admin_event_repo,
                 action="server.delete",
                 summary=f"deleted server '{slug}'",
-                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                actor=principal.actor,
                 target_type="server",
                 target_id=slug,
                 before=before_dict,
@@ -300,7 +334,7 @@ def build_control_plane_router(
             # bucket (and its old consumed-token state) must not still be registered under it.
             rate_limiter.unregister(server_key(slug))
 
-    @router.get("/servers/{slug}/tools", response_model=ServerToolsResponse)
+    @router.get("/servers/{slug}/tools", response_model=ServerToolsResponse, dependencies=[Depends(require_role("viewer"))])
     async def get_server_tools(slug: str, force_refresh: bool = False):
         try:
             server = await server_repo.get(slug)
@@ -338,13 +372,16 @@ def build_control_plane_router(
         return ServerToolsResponse(fetched_at=fetched_at, tools=result)
 
     if pipeline is not None:
-        @router.post("/servers/{slug}/test-call", response_model=ToolTestResponse)
+        @router.post(
+            "/servers/{slug}/test-call", response_model=ToolTestResponse,
+            dependencies=[Depends(require_role("operator"))],
+        )
         async def test_call(slug: str, request: Request, body: ToolTestRequest):
             # Feature #1 (in-UI tool tester): dispatches through the REAL pipeline — real rate
             # limiting, real policy evaluation, real audit logging — rather than a second
             # evaluator that could drift from the one actually enforcing. `skip_api_key_auth`
-            # bypasses only the data plane's bearer-token check (the operator is already
-            # authenticated as admin via require_admin on this whole router); `force_generation`
+            # bypasses only the data plane's bearer-token check (the caller is already
+            # authenticated with at least operator role via require_role above); `force_generation`
             # forces the bridged path so this always goes through the same evaluate() call a
             # real 2026-generation client's tools/call would. `origin="test"` tags the resulting
             # audit row so it never counts toward /stats or the default Audit page view.
@@ -393,7 +430,7 @@ def build_control_plane_router(
                 upstream_response=upstream_response,
             )
 
-    @router.get("/servers/{slug}/policy", response_model=PolicyResponse)
+    @router.get("/servers/{slug}/policy", response_model=PolicyResponse, dependencies=[Depends(require_role("viewer"))])
     async def get_policy(slug: str):
         try:
             server = await server_repo.get(slug)
@@ -403,7 +440,10 @@ def build_control_plane_router(
         return PolicyResponse(**policy.model_dump())
 
     @router.put("/servers/{slug}/policy", response_model=PolicyResponse)
-    async def set_policy(slug: str, body: PolicyUpdateRequest, request: Request):
+    async def set_policy(
+        slug: str, body: PolicyUpdateRequest, request: Request,
+        principal: Principal = Depends(require_role("operator")),
+    ):
         try:
             server = await server_repo.get(slug)
         except ServerNotFoundError:
@@ -427,20 +467,27 @@ def build_control_plane_router(
                 server_slug=slug,
                 current=before_policy,
                 incoming=after_policy,
-                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                actor=principal.actor,
                 client_ip=request.client.host if request.client else None,
             )
 
         return PolicyResponse(**after_policy.model_dump())
 
-    @router.get("/keys", response_model=list[KeyResponse])
+    @router.get("/keys", response_model=list[KeyResponse], dependencies=[Depends(require_role("admin"))])
     async def list_keys():
         keys = await api_keys.list()
         return [_key_to_response(k) for k in keys]
 
     @router.post("/keys", response_model=KeyCreatedResponse, status_code=201)
-    async def create_key(body: KeyCreateRequest, request: Request):
+    async def create_key(
+        body: KeyCreateRequest, request: Request,
+        principal: Principal = Depends(require_role("admin")),
+    ):
+        # 02-rbac.md design decision 3: key minting is admin-only, not merely because keys feel
+        # sensitive — an operator who could mint a key could use it against the DATA plane and
+        # act entirely outside their control-plane role, which would make the operator/admin
+        # boundary trivially bypassable. require_role("admin") above is what actually enforces
+        # this; see tests/integration/test_rbac.py's "operator cannot mint a key" case.
         generated = await api_keys.create(name=body.name, server_scopes=body.server_scopes)
 
         if admin_event_repo is not None:
@@ -448,8 +495,7 @@ def build_control_plane_router(
                 admin_event_repo,
                 action="key.create",
                 summary=f"created API key '{body.name}'",
-                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                actor=principal.actor,
                 target_type="key",
                 target_id=str(generated.record.id),
                 after={"name": body.name, "key_prefix": generated.record.key_prefix, "server_scopes": body.server_scopes},
@@ -462,7 +508,10 @@ def build_control_plane_router(
         )
 
     @router.patch("/keys/{key_id}", response_model=KeyResponse)
-    async def patch_key(key_id: int, enabled: bool, request: Request):
+    async def patch_key(
+        key_id: int, enabled: bool, request: Request,
+        principal: Principal = Depends(require_role("admin")),
+    ):
         # Fetch before state for audit
         key_before = await api_keys.get(key_id)
 
@@ -475,15 +524,13 @@ def build_control_plane_router(
         if key_after is None:
             raise HTTPException(status_code=404, detail="key not found")
 
-        # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
         if admin_event_repo is not None and key_before is not None:
             action = "key.enable" if enabled else "key.disable"
             await record(
                 admin_event_repo,
                 action=action,
                 summary=f"{'enabled' if enabled else 'disabled'} API key '{key_after.name}'",
-                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                actor=principal.actor,
                 target_type="key",
                 target_id=str(key_id),
                 before={"enabled": key_before.enabled},
@@ -494,20 +541,21 @@ def build_control_plane_router(
         return _key_to_response(key_after)
 
     @router.delete("/keys/{key_id}", status_code=204)
-    async def delete_key(key_id: int, request: Request):
+    async def delete_key(
+        key_id: int, request: Request,
+        principal: Principal = Depends(require_role("admin")),
+    ):
         # Fetch before state for audit
         key_before = await api_keys.get(key_id)
 
         await api_keys.delete(key_id)
 
-        # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
         if admin_event_repo is not None and key_before is not None:
             await record(
                 admin_event_repo,
                 action="key.delete",
                 summary=f"deleted API key '{key_before.name}'",
-                # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                actor=principal.actor,
                 target_type="key",
                 target_id=str(key_id),
                 before={"name": key_before.name, "key_prefix": key_before.key_prefix},
@@ -515,7 +563,7 @@ def build_control_plane_router(
             )
 
     if settings_repo is not None:
-        @router.get("/settings", response_model=SettingsResponse)
+        @router.get("/settings", response_model=SettingsResponse, dependencies=[Depends(require_role("viewer"))])
         async def get_settings():
             values = await _get_settings_with_defaults(settings_repo)
             return SettingsResponse(
@@ -532,7 +580,10 @@ def build_control_plane_router(
             )
 
         @router.put("/settings", response_model=SettingsResponse)
-        async def update_settings(body: SettingsUpdateRequest, request: Request):
+        async def update_settings(
+            body: SettingsUpdateRequest, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
             # Fetch before state for audit diff
             before_settings = await _get_settings_with_defaults(settings_repo)
             before_filtered = filter_settings_keys(before_settings)
@@ -586,8 +637,7 @@ def build_control_plane_router(
                     admin_event_repo,
                     action="settings.update",
                     summary=summary,
-                    # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                    actor="admin-session",
+                    actor=principal.actor,
                     target_type="settings",
                     before=before_filtered,
                     after=after_filtered,
@@ -596,8 +646,20 @@ def build_control_plane_router(
 
             return await get_settings()
 
-        @router.get("/config/export")
-        async def export_configuration(include_credentials: bool = False):
+        @router.get("/config/export", dependencies=[Depends(require_role("viewer"))])
+        async def export_configuration(
+            include_credentials: bool = False,
+            principal: Principal = Depends(require_admin),
+        ):
+            # Judgment call beyond what 02-rbac.md's table spells out: plain "config export" is
+            # viewer-level there, but include_credentials=true returns PLAINTEXT upstream auth
+            # headers and the webhook signing secret (see config_io.py) — letting a viewer
+            # request that would hand them exactly the credentials the operator/admin boundary
+            # exists to protect. Base export stays viewer; the credentials variant is admin-only.
+            if include_credentials and (
+                ROLE_RANK.get(principal.role) is None or ROLE_RANK[principal.role] < ROLE_RANK["admin"]
+            ):
+                raise HTTPException(status_code=403, detail="include_credentials requires admin role")
             result = await export_config(
                 server_repo, settings_repo, include_credentials=include_credentials
             )
@@ -612,7 +674,13 @@ def build_control_plane_router(
             )
 
         @router.post("/config/import", response_model=ConfigImportResponse)
-        async def import_configuration(body: ConfigImportRequest, request: Request):
+        async def import_configuration(
+            body: ConfigImportRequest, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
+            # 02-rbac.md design decision 1: config import is admin-only even though it edits
+            # policies (which operators may do directly) — one import rewrites the entire
+            # instance in one shot, a different blast radius from a single server's policy.
             plan = await plan_import(server_repo, settings_repo, body.yaml, apply=body.apply)
 
             # Record config import as ONE event, not one per touched server — otherwise a
@@ -622,8 +690,7 @@ def build_control_plane_router(
                 await record_config_import(
                     admin_event_repo,
                     actions=action_descriptions,
-                    # TODO(enterprise #2): actor should be the real user ID, not hardcoded "admin-session"
-                actor="admin-session",
+                    actor=principal.actor,
                     client_ip=request.client.host if request.client else None,
                 )
 
@@ -644,13 +711,16 @@ def build_control_plane_router(
             )
 
     if webhook_dispatcher is not None:
-        @router.post("/webhooks/test", response_model=WebhookTestResponse)
+        @router.post(
+            "/webhooks/test", response_model=WebhookTestResponse,
+            dependencies=[Depends(require_role("admin"))],
+        )
         async def test_webhook():
             ok, status_code, error = await webhook_dispatcher.send_test()
             return WebhookTestResponse(ok=ok, status_code=status_code, error=error)
 
     if audit_repo is not None:
-        @router.get("/stats", response_model=StatsResponse)
+        @router.get("/stats", response_model=StatsResponse, dependencies=[Depends(require_role("viewer"))])
         async def get_stats():
             from datetime import datetime, timedelta, timezone
 
@@ -678,7 +748,7 @@ def build_control_plane_router(
                 recent_blocked=recent_blocked,
             )
 
-        @router.get("/audit", response_model=list[AuditEventResponse])
+        @router.get("/audit", response_model=list[AuditEventResponse], dependencies=[Depends(require_role("viewer"))])
         async def query_audit(
             server_slug: Optional[str] = None, decision: Optional[str] = None,
             tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
@@ -698,7 +768,7 @@ def build_control_plane_router(
             )
             return [AuditEventResponse(**{**e, "bridged": bool(e["bridged"])}) for e in events]
 
-        @router.get("/audit/export.csv")
+        @router.get("/audit/export.csv", dependencies=[Depends(require_role("viewer"))])
         async def export_audit_csv(
             server_slug: Optional[str] = None, decision: Optional[str] = None,
             tool: Optional[str] = None, api_key_id: Optional[int] = None,
@@ -752,7 +822,7 @@ def build_control_plane_router(
             )
 
         if audit_logger is not None:
-            @router.get("/audit/tail")
+            @router.get("/audit/tail", dependencies=[Depends(require_role("viewer"))])
             async def audit_tail(request: Request):
                 async def event_stream():
                     q = audit_logger.subscribe()
@@ -771,7 +841,7 @@ def build_control_plane_router(
                 return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     if admin_event_repo is not None:
-        @router.get("/admin-events", response_model=list[AdminEventResponse])
+        @router.get("/admin-events", response_model=list[AdminEventResponse], dependencies=[Depends(require_role("viewer"))])
         async def query_admin_events(
             action: Optional[str] = None,
             target_type: Optional[str] = None,
@@ -797,9 +867,151 @@ def build_control_plane_router(
                 for e in events
             ]
 
+    # Current-principal endpoint — always registered, works under every auth path (admin_token
+    # break-glass, legacy pre-migration session, or a real user), so the frontend has one place
+    # to ask "who am I" regardless of migration/auth state. viewer-level: knowing your own
+    # identity isn't a privileged operation.
+    @router.get("/me", response_model=CurrentUserResponse, dependencies=[Depends(require_role("viewer"))])
+    async def get_current_user(principal: Principal = Depends(require_admin)):
+        return CurrentUserResponse(
+            user_id=principal.user_id, username=principal.username,
+            role=principal.role, auth_source=principal.auth_source,
+        )
+
+    # User management — enterprise #1/#2. All admin-only: creating a user, changing a role, or
+    # disabling an account are exactly the "irreversible or security-lowering" actions
+    # 02-rbac.md draws the operator/admin boundary around.
+    if user_repo is not None:
+        def _user_to_response(u) -> UserResponse:
+            return UserResponse(
+                id=u.id, username=u.username, email=u.email, role=u.role,
+                auth_source=u.auth_source, enabled=u.enabled,
+                created_at=u.created_at, last_login_at=u.last_login_at,
+            )
+
+        @router.get("/users", response_model=list[UserResponse], dependencies=[Depends(require_role("admin"))])
+        async def list_users():
+            users = await user_repo.list()
+            return [_user_to_response(u) for u in users]
+
+        @router.post("/users", response_model=UserResponse, status_code=201)
+        async def create_user(
+            body: UserCreateRequest, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
+            if not is_valid_role(body.role):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"role must be one of {sorted(ROLE_RANK)}, got {body.role!r}",
+                )
+            if len(body.password) < 8:
+                raise HTTPException(status_code=400, detail="password must be at least 8 characters")
+
+            loop = asyncio.get_running_loop()
+            password_hash = await loop.run_in_executor(None, hash_password, body.password)
+            try:
+                user = await user_repo.create(
+                    username=body.username, role=body.role, password_hash=password_hash,
+                    email=body.email, auth_source="local",
+                )
+            except UsernameConflictError:
+                raise HTTPException(status_code=409, detail=f"username '{body.username}' already exists")
+
+            if admin_event_repo is not None:
+                await record(
+                    admin_event_repo,
+                    action="user.create",
+                    summary=f"created user '{body.username}' with role '{body.role}'",
+                    actor=principal.actor,
+                    target_type="user",
+                    target_id=str(user.id),
+                    after={"username": user.username, "role": user.role, "auth_source": user.auth_source},
+                    client_ip=request.client.host if request.client else None,
+                )
+            return _user_to_response(user)
+
+        @router.patch("/users/{user_id}/role", response_model=UserResponse)
+        async def update_user_role(
+            user_id: int, body: UserRoleUpdateRequest, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
+            if not is_valid_role(body.role):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"role must be one of {sorted(ROLE_RANK)}, got {body.role!r}",
+                )
+            try:
+                before = await user_repo.get_by_id(user_id)
+            except UserNotFoundError:
+                raise HTTPException(status_code=404, detail="user not found")
+
+            user = await user_repo.update_role(user_id, body.role)
+            # A role change is exactly what per-user session revocation exists for: the OLD
+            # role must not keep working via an already-issued cookie until it expires on its
+            # own up to 7 days later — same reasoning as F18's password-change bump, scoped to
+            # this one user instead of everyone.
+            await user_repo.bump_session_version(user_id)
+
+            if admin_event_repo is not None and before.role != user.role:
+                # Role changes must write a control-plane audit event (02-rbac.md design
+                # decision 2) — privilege changes are exactly what admin_events exists for.
+                await record(
+                    admin_event_repo,
+                    action="user.role_change",
+                    summary=f"changed role of '{user.username}': {before.role} -> {user.role}",
+                    actor=principal.actor,
+                    target_type="user",
+                    target_id=str(user_id),
+                    before={"role": before.role},
+                    after={"role": user.role},
+                    client_ip=request.client.host if request.client else None,
+                )
+            return _user_to_response(user)
+
+        @router.patch("/users/{user_id}/enabled", response_model=UserResponse)
+        async def update_user_enabled(
+            user_id: int, body: UserEnabledUpdateRequest, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
+            try:
+                before = await user_repo.get_by_id(user_id)
+            except UserNotFoundError:
+                raise HTTPException(status_code=404, detail="user not found")
+
+            if not body.enabled and principal.user_id == user_id:
+                # A self-lockout guard: an admin disabling their OWN account while it's the
+                # only session they're acting through would have to immediately re-authenticate
+                # as someone else, which may not exist yet on a small instance. Not a security
+                # boundary (they could still do it via a second admin account, or the
+                # admin_token break-glass) — just a footgun guard.
+                raise HTTPException(status_code=400, detail="cannot disable your own account")
+
+            user = await user_repo.set_enabled(user_id, body.enabled)
+            if not body.enabled:
+                # Disabling must stop an EXISTING session on its very next request, not just
+                # block future logins — bump the per-user version so any outstanding cookie for
+                # this user is rejected immediately (require_admin re-checks `enabled` too, as
+                # defense in depth, but the version bump is what makes it immediate rather than
+                # racing the 7-day cookie expiry).
+                await user_repo.bump_session_version(user_id)
+
+            if admin_event_repo is not None and before.enabled != user.enabled:
+                await record(
+                    admin_event_repo,
+                    action="user.enabled_change",
+                    summary=f"{'enabled' if user.enabled else 'disabled'} user '{user.username}'",
+                    actor=principal.actor,
+                    target_type="user",
+                    target_id=str(user_id),
+                    before={"enabled": before.enabled},
+                    after={"enabled": user.enabled},
+                    client_ip=request.client.host if request.client else None,
+                )
+            return _user_to_response(user)
+
     # GitOps endpoints — only registered when a ConfigSource is wired in
     if config_source is not None:
-        @router.get("/config/drift", response_model=DriftStatusResponse)
+        @router.get("/config/drift", response_model=DriftStatusResponse, dependencies=[Depends(require_role("viewer"))])
         async def get_drift():
             """Get current drift state between live config and git-tracked file."""
             state = config_source.state
@@ -822,9 +1034,13 @@ def build_control_plane_router(
                 result.errors = state.plan.errors
             return result
 
-        @router.post("/config/reconcile")
+        @router.post("/config/reconcile", dependencies=[Depends(require_role("admin"))])
         async def reconcile_config(request: Request):
-            """Apply the pending drift plan. Writes one admin event recording the change."""
+            """Apply the pending drift plan. Writes one admin event recording the change.
+
+            02-rbac.md's interaction note with 06-policy-as-code: reconcile is admin-only since
+            it's config import by another name — same one-shot-rewrites-the-instance blast
+            radius as POST /config/import, just sourced from git instead of an uploaded file."""
             try:
                 plan = await config_source.reconcile()
             except ValueError as e:
