@@ -268,3 +268,63 @@ async def test_reconcile_writes_admin_event_with_commit_sha(client):
     # Should get 400 (no pending plan) not 404 (endpoint missing)
     assert resp.status_code == 400
     assert "no pending plan" in resp.json()["detail"].lower()
+
+
+# Security regression tests (found by /security-scan 2026-08-07)
+
+async def test_reconcile_rejects_private_url_even_with_cached_plan(client, app_transport):
+    """SSRF regression: reconcile() must re-validate gitops_url with _validate_webhook_url.
+
+    Attack: cache a plan from a valid public URL, then point gitops_url at a private/metadata
+    address and call reconcile — the fetch must be rejected, not silently performed.
+    """
+    await _setup_admin(client)
+
+    app = app_transport.app
+    from stoa.gitops import ConfigSource
+    from db.repo import ServerRepo, SettingsRepo
+
+    db = app.state.db
+    cs = ConfigSource(ServerRepo(db), SettingsRepo(db))
+    settings_repo = SettingsRepo(db)
+    await settings_repo.set("gitops_enabled", "true")
+    await settings_repo.set("gitops_url", "https://169.254.169.254/latest/meta-data/")
+
+    state = await cs.check_once()
+    # The metadata (link-local) URL must be rejected by _validate_webhook_url
+    assert state.status == "error"
+    assert state.plan is None, "a rejected URL must not cache a plan"
+    assert "non-public" in (state.last_error or "") or "169.254" in (state.last_error or "")
+    await cs.stop()
+
+
+async def test_fetch_config_rejects_oversized_body(client, app_transport, monkeypatch):
+    """DoS regression: a config body larger than MAX_CONFIG_BYTES must be rejected."""
+    await _setup_admin(client)
+
+    from stoa.gitops import ConfigSource, MAX_CONFIG_BYTES
+
+    app = app_transport.app
+    from db.repo import ServerRepo, SettingsRepo
+    db = app.state.db
+    cs = ConfigSource(ServerRepo(db), SettingsRepo(db))
+    settings_repo = SettingsRepo(db)
+    await settings_repo.set("gitops_enabled", "true")
+    await settings_repo.set("gitops_url", "https://example.com/huge.yaml")
+
+    # Stub the HTTP client to return an oversized body
+    oversized = b"x" * (MAX_CONFIG_BYTES + 1)
+
+    class _FakeResponse:
+        content = oversized
+        def raise_for_status(self):
+            pass
+
+    async def _fake_get(url):
+        return _FakeResponse()
+
+    monkeypatch.setattr(cs._http, "get", _fake_get)
+
+    with pytest.raises(ValueError, match="too large"):
+        await cs._fetch_config()
+    await cs.stop()

@@ -8,6 +8,7 @@ import secrets
 import uuid
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -823,11 +824,14 @@ def build_control_plane_router(
 
         @router.post("/config/reconcile")
         async def reconcile_config(request: Request):
-            """Apply the pending drift plan. Writes one admin event with commit SHA."""
+            """Apply the pending drift plan. Writes one admin event recording the change."""
             try:
                 plan = await config_source.reconcile()
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
+            except httpx.HTTPError as e:
+                # The gateway couldn't reach the config source during the reconcile re-fetch.
+                raise HTTPException(status_code=502, detail=f"config source fetch failed: {e}")
 
             # Record reconcile in admin events
             if admin_event_repo is not None:

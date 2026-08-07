@@ -31,6 +31,11 @@ DEFAULT_POLL_SECONDS = 300.0  # 5 minutes
 # Timeout for fetching the config file. Short — this is a background poll, not a user request.
 FETCH_TIMEOUT_SECONDS = 10.0
 
+# Cap on fetched config size (bytes). A config file is a handful of KB; anything larger is
+# either a mistake or a hostile source trying to exhaust memory. Bound it before parsing so a
+# multi-GB response can't be read into memory.
+MAX_CONFIG_BYTES = 1_048_576  # 1 MiB
+
 
 @dataclass
 class DriftState:
@@ -134,6 +139,34 @@ class ConfigSource:
         except ValueError:
             return DEFAULT_POLL_SECONDS
 
+    async def _fetch_config(self) -> str:
+        """Fetch the configured config file, validating the URL and capping size.
+
+        Shared by check_once() and reconcile() so BOTH paths apply the same SSRF validation
+        and size cap. Raises ValueError on an invalid URL or oversized body, httpx.HTTPError on
+        transport/HTTP failure.
+        """
+        url = await self._settings_repo.get("gitops_url")
+        if not url:
+            raise ValueError("gitops_url not configured")
+
+        # SSRF validation: same strict policy as webhook targets. Applied on EVERY fetch —
+        # check_once and reconcile alike — so a URL that changes between the two can't slip
+        # past the pre-flight check (TOCTOU). allow_private is read live so an operator's
+        # opt-in/opt-out takes effect without a restart.
+        allow_private = (await self._settings_repo.get("gitops_allow_private")) == "true"
+        _validate_webhook_url(url, allow_private=allow_private)
+
+        response = await self._http.get(url)
+        response.raise_for_status()
+
+        # Size cap: a config file is a handful of KB; anything larger is a mistake or a
+        # hostile source. Bound it before reading into memory.
+        body = response.content
+        if len(body) > MAX_CONFIG_BYTES:
+            raise ValueError(f"config file too large ({len(body)} bytes > {MAX_CONFIG_BYTES})")
+        return body.decode("utf-8")
+
     async def check_once(self) -> DriftState:
         """Run one drift check. Updates self._state and returns it."""
         enabled = await self._settings_repo.get("gitops_enabled")
@@ -142,28 +175,16 @@ class ConfigSource:
             self._state.last_check = time.time()
             return self._state
 
-        url = await self._settings_repo.get("gitops_url")
-        if not url:
-            self._state.status = "unknown"
-            self._state.last_check = time.time()
-            self._state.last_error = "gitops_url not configured"
-            return self._state
-
-        # SSRF validation: same strict policy as webhook targets
-        allow_private = (await self._settings_repo.get("gitops_allow_private")) == "true"
+        # Fetch the config file. _fetch_config() applies SSRF validation + size cap on every
+        # call, so the same strict policy guards the background poll as it does reconcile().
         try:
-            _validate_webhook_url(url, allow_private=allow_private)
+            yaml_text = await self._fetch_config()
         except ValueError as e:
-            self._state.status = "error"
+            # Covers "not configured", invalid URL (SSRF), and oversized body.
+            self._state.status = "error" if "not configured" not in str(e) else "unknown"
             self._state.last_check = time.time()
-            self._state.last_error = f"invalid gitops_url: {e}"
+            self._state.last_error = str(e)
             return self._state
-
-        # Fetch the config file
-        try:
-            response = await self._http.get(url)
-            response.raise_for_status()
-            yaml_text = response.text
         except httpx.HTTPError as e:
             self._state.status = "error"
             self._state.last_check = time.time()
@@ -216,14 +237,10 @@ class ConfigSource:
         if self._state.plan is None:
             raise ValueError("no pending plan to reconcile")
 
-        # Re-fetch to get the current file content (don't trust cached plan)
-        url = await self._settings_repo.get("gitops_url")
-        if not url:
-            raise ValueError("gitops_url not configured")
-
-        response = await self._http.get(url)
-        response.raise_for_status()
-        yaml_text = response.text
+        # Re-fetch to get the current file content (don't trust cached plan). _fetch_config()
+        # re-validates the URL with _validate_webhook_url on every call, closing the TOCTOU gap
+        # where a URL could change between the drift check and the reconcile.
+        yaml_text = await self._fetch_config()
 
         # Apply with apply=True
         plan = await plan_import(
