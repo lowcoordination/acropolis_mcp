@@ -140,3 +140,25 @@ class ApiKeyRecord(BaseModel):
     server_scopes: Optional[list[str]] = None
     created_at: str
     last_used_at: Optional[str] = None
+
+
+class UserRecord(BaseModel):
+    """A control-plane principal — local password auth or OIDC (enterprise #1/#2).
+
+    `role` is deliberately a bare str, not an enum: 02-rbac.md's design decision is that role
+    validity/hierarchy is an APPLICATION-layer concern (archon/rbac.py), not a schema-layer one,
+    so a future role can be added without a migration. archon/rbac.py's ROLE_RANK is the single
+    source of truth for what a "valid" role is; a value here that isn't a ROLE_RANK key must be
+    treated as no access everywhere, never a permissive default.
+    """
+    id: int
+    username: str
+    email: Optional[str] = None
+    password_hash: Optional[str] = None  # NULL for OIDC-only users
+    role: str = "admin"
+    auth_source: str = "local"  # 'local' | 'oidc'
+    oidc_subject: Optional[str] = None  # IdP 'sub' — never key identity on email
+    enabled: bool = True
+    session_version: int = 0  # per-user revocation counter, independent of the global one
+    created_at: str
+    last_login_at: Optional[str] = None

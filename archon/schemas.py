@@ -386,6 +386,48 @@ class LoginRequest(BaseModel):
     admin_password: str
 
 
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: Optional[str] = None
+    role: str
+    auth_source: str
+    enabled: bool
+    created_at: str
+    last_login_at: Optional[str] = None
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "viewer"
+    email: Optional[str] = None
+
+
+class UserRoleUpdateRequest(BaseModel):
+    role: str
+
+
+class UserEnabledUpdateRequest(BaseModel):
+    enabled: bool
+
+
+class CurrentUserResponse(BaseModel):
+    """Who the caller is authenticated as — enterprise #1/#2. `user_id` is None for the
+    admin-token break-glass path and the legacy pre-migration session, which is itself useful
+    signal for the frontend (there's no real "log out" for a bearer token, and the legacy path
+    has no user row to show)."""
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    role: str
+    auth_source: str
+
+
+class OidcStatusResponse(BaseModel):
+    enabled: bool
+    login_url: Optional[str] = None
+
+
 class PasswordChangeRequest(BaseModel):
     current_password: str
     new_password: str

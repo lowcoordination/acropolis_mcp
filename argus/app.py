@@ -23,7 +23,7 @@ from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
-from db.repo import AdminEventRepo, ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo
+from db.repo import AdminEventRepo, ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo, UserRepo
 from stoa.gitops import ConfigSource
 from stoa.health import HealthPoller
 from stoa.retention import AuditRetentionJob
@@ -76,6 +76,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     api_key_repo = ApiKeyRepo(db)
     audit_repo = AuditRepo(db)
     settings_repo = SettingsRepo(db)
+    user_repo = UserRepo(db)
 
     api_keys = ApiKeyService(api_key_repo)
     rate_limiter = RateLimiterRegistry()
@@ -161,6 +162,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.settings = settings
     app.state.db = db
     app.state.settings_repo = settings_repo
+    app.state.user_repo = user_repo
     app.state.server_repo = server_repo
     app.state.api_keys = api_keys
     app.state.rate_limiter = rate_limiter
@@ -173,7 +175,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.webhook_dispatcher = webhook_dispatcher
     app.state.config_source = config_source
 
-    app.include_router(build_setup_router(settings_repo, rate_limiter))
+    app.include_router(build_setup_router(settings_repo, rate_limiter, user_repo))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
         rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source,

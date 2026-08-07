@@ -13,9 +13,9 @@ from archon.sessions import (
     SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
     create_session_token,
+    decode_session_payload,
 )
-from argus.rate_limiter import RateLimiterRegistry
-from db.repo import SettingsRepo
+from db.repo import SettingsRepo, UserRepo
 
 # F16 fix (review 2026-08-04): no throttling existed on /login or /setup at all. PBKDF2-SHA256
 # at 600k iterations costs ~67ms/attempt — correct, OWASP-compliant work, but with no lockout it
@@ -46,13 +46,21 @@ async def _current_session_version(settings_repo: SettingsRepo) -> int:
 
 
 def build_setup_router(
-    settings_repo: SettingsRepo, rate_limiter: Optional[RateLimiterRegistry] = None
+    settings_repo: SettingsRepo,
+    rate_limiter: Optional[RateLimiterRegistry] = None,
+    user_repo: Optional[UserRepo] = None,
 ) -> APIRouter:
     """Setup and login endpoints — deliberately NOT behind require_admin, since they're how
     an admin gets established (setup) or authenticated (login) in the first place.
 
     `rate_limiter` is optional only so existing direct-construction call sites (tests) don't
-    break; every real deployment via create_app() passes the shared RateLimiterRegistry."""
+    break; every real deployment via create_app() passes the shared RateLimiterRegistry.
+
+    `user_repo` (enterprise #1): when provided, setup/login/change-password write through to
+    the `users` table (local users first — see 01-identity-and-sso.md design decision 1) IN
+    ADDITION to the legacy settings.admin_password_hash write, which is kept as a fallback read
+    path per that plan's non-negotiables. Optional so tests constructing this router directly
+    without a full app (pre-identity-milestone style) keep working unmodified."""
     router = APIRouter(prefix="/api/v1")
 
     @router.get("/health")
@@ -105,7 +113,21 @@ def build_setup_router(
             "auth_mode": body.auth_mode,
         })
 
-        token = create_session_token(session_secret, session_version=DEFAULT_SESSION_VERSION)
+        user_id: Optional[int] = None
+        if user_repo is not None:
+            # Local users first (01-identity-and-sso.md design decision 1): first-run setup
+            # creates the real `users` row directly, same hash, so a fresh install never has to
+            # rely on the legacy fallback path at all — that path exists for UPGRADES of an
+            # existing pre-identity-milestone instance, not new ones.
+            user = await user_repo.create(
+                username="admin", role="admin", password_hash=password_hash,
+            )
+            user_id = user.id
+
+        token = create_session_token(
+            session_secret, session_version=DEFAULT_SESSION_VERSION,
+            user_id=user_id, user_session_version=DEFAULT_SESSION_VERSION,
+        )
         response.set_cookie(
             SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
             httponly=True, samesite="lax", secure=_request_is_https(request),
@@ -128,12 +150,23 @@ def build_setup_router(
         if stored_hash is None:
             raise HTTPException(status_code=400, detail="setup has not been completed yet")
 
+        # enterprise #1: the login form is still single-credential (just a password, no
+        # username field) — this endpoint's request shape is unchanged. What changed is WHERE
+        # the hash it verifies against comes from: prefer the `users` table's 'admin' row (the
+        # normal post-migration/post-setup state) and fall back to the legacy
+        # settings.admin_password_hash read for a not-yet-migrated or partially-migrated
+        # instance (0007_users.sql non-negotiable: partial upgrade degrades to "still works").
+        user = await user_repo.get_by_username("admin") if user_repo is not None else None
+        verify_against = user.password_hash if (user is not None and user.password_hash) else stored_hash
+
         # F16: see the identical run_in_executor note on /setup above — verify_password runs
         # the same synchronous PBKDF2 work and must not block the event loop either.
         loop = asyncio.get_running_loop()
-        password_ok = await loop.run_in_executor(None, verify_password, body.admin_password, stored_hash)
+        password_ok = await loop.run_in_executor(None, verify_password, body.admin_password, verify_against)
         if not password_ok:
             raise HTTPException(status_code=401, detail="incorrect password")
+        if user is not None and not user.enabled:
+            raise HTTPException(status_code=401, detail="account disabled")
 
         session_secret = await settings_repo.get("session_secret")
         if session_secret is None:
@@ -144,7 +177,14 @@ def build_setup_router(
             raise HTTPException(status_code=500, detail="server misconfigured: no session secret")
 
         current_version = await _current_session_version(settings_repo)
-        token = create_session_token(session_secret, session_version=current_version)
+        if user is not None:
+            await user_repo.touch_last_login(user.id)
+            token = create_session_token(
+                session_secret, session_version=current_version,
+                user_id=user.id, user_session_version=user.session_version,
+            )
+        else:
+            token = create_session_token(session_secret, session_version=current_version)
         response.set_cookie(
             SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
             httponly=True, samesite="lax", secure=_request_is_https(request),
@@ -165,9 +205,13 @@ def build_setup_router(
         if stored_hash is None:
             raise HTTPException(status_code=400, detail="setup has not been completed yet")
 
+        # Same users-table-preferred / settings-fallback resolution as /login.
+        user = await user_repo.get_by_username("admin") if user_repo is not None else None
+        verify_against = user.password_hash if (user is not None and user.password_hash) else stored_hash
+
         loop = asyncio.get_running_loop()
         password_ok = await loop.run_in_executor(
-            None, verify_password, body.current_password, stored_hash
+            None, verify_password, body.current_password, verify_against
         )
         if not password_ok:
             raise HTTPException(status_code=401, detail="incorrect current password")
@@ -175,17 +219,32 @@ def build_setup_router(
             raise HTTPException(status_code=400, detail="password must be at least 8 characters")
 
         new_hash = await loop.run_in_executor(None, hash_password, body.new_password)
+        # Global session_version bump keeps invalidating any outstanding LEGACY (user-less)
+        # tokens, same as before the identity milestone. settings.admin_password_hash is kept
+        # in sync too — it's the fallback read path require_admin/login use when `users` is
+        # empty/absent, and this is the natural place to update it since it's already being
+        # written for compatibility.
         new_version = await _current_session_version(settings_repo) + 1
         await settings_repo.set_many({
             "admin_password_hash": new_hash,
             "session_version": str(new_version),
         })
 
+        new_user_version = DEFAULT_SESSION_VERSION
+        user_id = None
+        if user is not None:
+            await user_repo.set_password_hash(user.id, new_hash)
+            new_user_version = await user_repo.bump_session_version(user.id)
+            user_id = user.id
+
         # Issue the caller a fresh, valid-under-the-new-version token so THEY aren't logged out
         # by their own password change — only every OTHER outstanding session is invalidated.
         session_secret = await settings_repo.get("session_secret")
         if session_secret is not None:
-            token = create_session_token(session_secret, session_version=new_version)
+            token = create_session_token(
+                session_secret, session_version=new_version,
+                user_id=user_id, user_session_version=new_user_version,
+            )
             response.set_cookie(
                 SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
                 httponly=True, samesite="lax", secure=_request_is_https(request),
