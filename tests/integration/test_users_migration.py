@@ -189,3 +189,35 @@ async def test_populated_upgrade_end_to_end_existing_password_still_logs_in(tmp_
                 bad = await fresh.post("/api/v1/login", json={"admin_password": "wrong"})
                 assert bad.status_code == 401
     await db.close()
+
+
+async def test_seeded_admin_created_at_is_utc_iso8601_like_every_other_timestamp(tmp_path: Path):
+    """Self-review fix: the migration originally wrote created_at via bare SQL datetime('now')
+    ('YYYY-MM-DD HH:MM:SS', no timezone marker) while every other created_at in the app (written
+    by db/database.py's utcnow()) is ISO 8601 with an explicit UTC offset. The frontend renders
+    these with `new Date(...)`, which parses a timezone-less string as LOCAL time — the
+    migration-seeded admin's created_at would silently mis-render relative to every other
+    timestamp in the UI. Fixed to emit a 'Z'-suffixed string that both `new Date()` and Python's
+    fromisoformat (post-3.11) parse as UTC."""
+    from datetime import datetime
+
+    path = tmp_path / "gateway.db"
+    conn = await _connect(path)
+    await _apply_migrations(conn, _PRE_0007_MIGRATIONS, "gateway.db")
+    await conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('admin_password_hash', 'somehash')"
+    )
+    await conn.commit()
+    await _apply_migrations(conn, _ALL_GATEWAY_MIGRATIONS, "gateway.db")
+
+    conn.row_factory = aiosqlite.Row
+    cur = await conn.execute("SELECT created_at FROM users WHERE username = 'admin'")
+    row = await cur.fetchone()
+    created_at = row["created_at"]
+
+    assert created_at.endswith("Z"), f"expected a 'Z'-suffixed UTC timestamp, got {created_at!r}"
+    # Must actually parse as a valid UTC-aware timestamp, not just happen to end in the letter Z.
+    parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None
+
+    await conn.close()

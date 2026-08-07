@@ -45,6 +45,14 @@ CREATE INDEX IF NOT EXISTS idx_users_oidc_subject ON users(oidc_subject);
 -- (pre-setup) database has no admin_password_hash row yet, so this SELECT returns zero rows
 -- and the INSERT is a no-op — `users` stays empty, which is exactly the "partial/fresh install"
 -- state archon/admin_auth.py's fallback path is designed to keep working under.
+--
+-- Self-review fix: created_at uses strftime with a 'Z' suffix rather than bare datetime('now')
+-- ('YYYY-MM-DD HH:MM:SS', no timezone marker). Every OTHER created_at in this app is written by
+-- db/database.py's utcnow() (Python's datetime.now(timezone.utc).isoformat(), e.g.
+-- "2026-08-07T20:47:58+00:00") and the frontend renders these with `new Date(...)` — a
+-- timezone-less string is parsed as LOCAL time by JS, silently mis-rendering the migration-
+-- seeded admin's created_at relative to every other timestamp in the UI. strftime's 'Z' suffix
+-- makes this string parse as UTC too, consistent with the rest of the app.
 INSERT INTO users (username, password_hash, role, auth_source, created_at)
-  SELECT 'admin', value, 'admin', 'local', datetime('now')
+  SELECT 'admin', value, 'admin', 'local', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   FROM settings WHERE key = 'admin_password_hash';

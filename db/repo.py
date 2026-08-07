@@ -813,17 +813,30 @@ class UserRepo:
         oidc_subject: Optional[str] = None,
         enabled: bool = True,
     ) -> UserRecord:
+        # Self-review fix: the pre-flight username check below doesn't (and can't, on its own)
+        # rule out a concurrent oidc_subject collision — two simultaneous JIT-provisioning
+        # calls for the same brand-new `sub` (e.g. a double-clicked "Sign in with SSO", or two
+        # browser tabs) can both pass UserRepo.get_or_create_from_oidc's `existing is None`
+        # check before either has committed. The `oidc_subject UNIQUE` constraint in
+        # 0007_users.sql is the real backstop; without catching its violation here, the loser of
+        # the race got an unhandled aiosqlite.IntegrityError (a 500) instead of a clean outcome.
+        # Caught and converted to UsernameConflictError so callers (get_or_create_from_oidc's
+        # retry loop, and archon/setup.py's callback handler) have one exception shape to
+        # handle regardless of which UNIQUE constraint actually fired.
         async with self._db.gateway_write_lock:
             existing = await self._write.execute("SELECT 1 FROM users WHERE username = ?", (username,))
             if await existing.fetchone() is not None:
                 raise UsernameConflictError(username)
             now = utcnow()
-            cur = await self._write.execute(
-                """INSERT INTO users
-                   (username, email, password_hash, role, auth_source, oidc_subject, enabled, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (username, email, password_hash, role, auth_source, oidc_subject, int(enabled), now),
-            )
+            try:
+                cur = await self._write.execute(
+                    """INSERT INTO users
+                       (username, email, password_hash, role, auth_source, oidc_subject, enabled, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (username, email, password_hash, role, auth_source, oidc_subject, int(enabled), now),
+                )
+            except aiosqlite.IntegrityError as e:
+                raise UsernameConflictError(username) from e
             await self._write.commit()
             new_id = cur.lastrowid
         return await self.get_by_id(new_id)
@@ -903,6 +916,17 @@ class UserRepo:
                     auth_source="oidc", oidc_subject=subject,
                 )
             except UsernameConflictError:
+                # Self-review fix: create() now raises this same exception for EITHER a
+                # username collision OR a concurrent oidc_subject collision (see its own
+                # comment) — the latter happens when two simultaneous logins for the same new
+                # `sub` both passed the `existing is None` check above before either committed.
+                # Re-checking by subject distinguishes the two cases: if a row for this subject
+                # exists now, the other request won the race and this one should simply return
+                # its result rather than spin through up to 50 username suffixes for a conflict
+                # that was never actually about the username.
+                existing = await self.get_by_subject(subject)
+                if existing is not None:
+                    return existing
                 suffix += 1
                 username = f"{base}-{suffix}"
                 if suffix > 50:
