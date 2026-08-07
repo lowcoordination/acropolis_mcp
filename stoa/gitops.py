@@ -39,7 +39,6 @@ class DriftState:
     plan: Optional[ImportPlan] = None
     last_check: Optional[float] = None
     last_error: Optional[str] = None
-    commit_sha: Optional[str] = None  # populated when source is a git ref
 
 
 class ConfigSource:
@@ -48,12 +47,18 @@ class ConfigSource:
     Settings (read live from SettingsRepo on every poll):
         gitops_enabled        — "true" to enable polling
         gitops_url            — HTTPS URL to the config file (raw file, not a git clone)
-        gitops_ref            — optional git ref for provenance (commit SHA recorded in audit)
+        gitops_ref            — optional git ref for provenance
         gitops_path           — path within the repo (for URL construction)
         gitops_poll_seconds   — override poll interval
         gitops_allow_private  — "true" to allow private/LAN URLs (default: blocked)
 
     The URL is validated on every poll with _validate_webhook_url's strict policy.
+
+    Usage:
+        config_source = ConfigSource(server_repo, settings_repo)
+        await config_source.start()
+        ...
+        await config_source.stop()
     """
 
     def __init__(
@@ -64,6 +69,7 @@ class ConfigSource:
     ):
         self._server_repo = server_repo
         self._settings_repo = settings_repo
+        # If no client provided, we create one and own its lifecycle
         self._http = http_client or httpx.AsyncClient(
             timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=False
         )
@@ -71,6 +77,14 @@ class ConfigSource:
         self._state = DriftState()
         self._task: Optional[asyncio.Task] = None
         self._webhook_dispatcher = None  # set by app.py if webhooks enabled
+        self._started = False
+
+    async def __aenter__(self) -> "ConfigSource":
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.stop()
 
     def set_webhook_dispatcher(self, dispatcher) -> None:
         """Wire in the webhook dispatcher for drift events. Called by app.py."""
@@ -81,10 +95,12 @@ class ConfigSource:
         return self._state
 
     async def start(self) -> None:
-        if self._task is None:
+        if not self._started:
+            self._started = True
             self._task = asyncio.create_task(self._poll_loop())
 
     async def stop(self) -> None:
+        self._started = False
         if self._task is not None:
             self._task.cancel()
             try:

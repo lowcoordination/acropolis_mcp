@@ -1,16 +1,20 @@
 """Tests for GitOps / policy-as-code (Enterprise #7)."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
+import httpx
 import pytest
 
 from archon.settings import Settings
 from argus.app import create_app
 from db.database import Database
+
+# Project root for subprocess calls — derived from test file location, not hardcoded
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
 @pytest.fixture
@@ -53,7 +57,7 @@ servers: []
     data_dir = tmp_path / "data"
     result = subprocess.run(
         [sys.executable, "-m", "argus", "check", str(config_file)],
-        cwd="/home/lowcoordination/src/argus",
+        cwd=PROJECT_ROOT,
         env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
@@ -68,7 +72,7 @@ def test_cli_check_exit_code_1_when_drift(tmp_path):
     data_dir = tmp_path / "data"
     export_result = subprocess.run(
         [sys.executable, "-m", "argus", "export", "--stable"],
-        cwd="/home/lowcoordination/src/argus",
+        cwd=PROJECT_ROOT,
         env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
@@ -86,7 +90,7 @@ servers: []
     # Run check
     result = subprocess.run(
         [sys.executable, "-m", "argus", "check", str(config_file)],
-        cwd="/home/lowcoordination/src/argus",
+        cwd=PROJECT_ROOT,
         env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
@@ -103,7 +107,7 @@ def test_cli_check_exit_code_2_when_invalid_file(tmp_path):
     data_dir = tmp_path / "data"
     result = subprocess.run(
         [sys.executable, "-m", "argus", "check", str(config_file)],
-        cwd="/home/lowcoordination/src/argus",
+        cwd=PROJECT_ROOT,
         env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
@@ -119,14 +123,14 @@ def test_cli_export_stable_produces_identical_output(tmp_path):
     # Export twice with --stable
     result1 = subprocess.run(
         [sys.executable, "-m", "argus", "export", "--stable"],
-        cwd="/home/lowcoordination/src/argus",
+        cwd=PROJECT_ROOT,
         env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
     )
     result2 = subprocess.run(
         [sys.executable, "-m", "argus", "export", "--stable"],
-        cwd="/home/lowcoordination/src/argus",
+        cwd=PROJECT_ROOT,
         env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
@@ -144,7 +148,7 @@ def test_cli_export_without_stable_includes_exported_at(tmp_path):
 
     result = subprocess.run(
         [sys.executable, "-m", "argus", "export"],
-        cwd="/home/lowcoordination/src/argus",
+        cwd=PROJECT_ROOT,
         env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,

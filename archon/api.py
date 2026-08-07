@@ -27,6 +27,8 @@ from archon.schemas import (
     ConfigImportAction,
     ConfigImportRequest,
     ConfigImportResponse,
+    DriftActionResponse,
+    DriftStatusResponse,
     KeyCreatedResponse,
     KeyCreateRequest,
     KeyResponse,
@@ -796,28 +798,27 @@ def build_control_plane_router(
 
     # GitOps endpoints — only registered when a ConfigSource is wired in
     if config_source is not None:
-        @router.get("/config/drift")
+        @router.get("/config/drift", response_model=DriftStatusResponse)
         async def get_drift():
             """Get current drift state between live config and git-tracked file."""
             state = config_source.state
-            result = {
-                "status": state.status,
-                "last_check": state.last_check,
-                "last_error": state.last_error,
-                "commit_sha": state.commit_sha,
-            }
+            result = DriftStatusResponse(
+                status=state.status,
+                last_check=state.last_check,
+                last_error=state.last_error,
+            )
             if state.plan is not None:
-                result["actions"] = [
-                    {
-                        "kind": a.kind,
-                        "target": a.target,
-                        "detail": a.detail,
-                        "description": a.describe(applied=False),
-                    }
+                result.actions = [
+                    DriftActionResponse(
+                        kind=a.kind,
+                        target=a.target,
+                        detail=a.detail,
+                        description=a.describe(applied=False),
+                    )
                     for a in state.plan.actions
                 ]
-                result["warnings"] = state.plan.warnings
-                result["errors"] = state.plan.errors
+                result.warnings = state.plan.warnings
+                result.errors = state.plan.errors
             return result
 
         @router.post("/config/reconcile")
@@ -828,7 +829,7 @@ def build_control_plane_router(
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
-            # Record reconcile in admin events with commit SHA
+            # Record reconcile in admin events
             if admin_event_repo is not None:
                 await record(
                     admin_event_repo,
@@ -837,7 +838,6 @@ def build_control_plane_router(
                     actor="gitops",
                     target_type="config",
                     after={
-                        "commit_sha": config_source.state.commit_sha,
                         "changes": [a.describe(applied=True) for a in plan.actions],
                     },
                     client_ip=request.client.host if request.client else None,
