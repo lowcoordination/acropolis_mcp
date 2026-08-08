@@ -9,7 +9,7 @@ import aiosqlite
 from pydantic import BaseModel, ValidationError
 
 from .database import Database, utcnow
-from .models import ApiKeyRecord, ParamRule, ServerPolicy, ServerRecord
+from .models import ApiKeyRecord, ParamRule, ServerPolicy, ServerRecord, UserRecord
 
 logger = logging.getLogger("db.repo")
 
@@ -21,6 +21,14 @@ class ServerNotFoundError(Exception):
 
 
 class SlugConflictError(Exception):
+    pass
+
+
+class UserNotFoundError(Exception):
+    pass
+
+
+class UsernameConflictError(Exception):
     pass
 
 
@@ -723,3 +731,204 @@ class AdminEventRepo:
             )
             for row in rows
         ]
+
+
+def _row_to_user(row: aiosqlite.Row) -> UserRecord:
+    return UserRecord(
+        id=row["id"],
+        username=row["username"],
+        email=row["email"],
+        password_hash=row["password_hash"],
+        role=row["role"],
+        auth_source=row["auth_source"],
+        oidc_subject=row["oidc_subject"],
+        enabled=bool(row["enabled"]),
+        session_version=row["session_version"],
+        created_at=row["created_at"],
+        last_login_at=row["last_login_at"],
+    )
+
+
+class UserRepo:
+    """CRUD for the `users` table — local + OIDC control-plane principals (enterprise #1/#2).
+
+    F7-style discipline: reads go through the dedicated read connection, writes serialize
+    through `gateway_write_lock` on the writer connection, same as every other repo in this
+    module — `users` lives in gateway.db alongside servers/keys/settings, not a separate store.
+    """
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    @property
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
+        assert self._db.gateway is not None
+        self._db.gateway.row_factory = aiosqlite.Row
+        return self._db.gateway
+
+    async def count(self) -> int:
+        """Used by archon/admin_auth.py to decide whether to fall back to the legacy
+        settings-based admin check — an empty/absent `users` table means a partially-applied
+        upgrade or a pre-migration database, and must degrade to "still works", not "locked out"."""
+        cur = await self._read.execute("SELECT COUNT(*) FROM users")
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def get_by_id(self, user_id: int) -> UserRecord:
+        cur = await self._read.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = await cur.fetchone()
+        if row is None:
+            raise UserNotFoundError(str(user_id))
+        return _row_to_user(row)
+
+    async def get_by_username(self, username: str) -> Optional[UserRecord]:
+        cur = await self._read.execute("SELECT * FROM users WHERE username = ?", (username,))
+        row = await cur.fetchone()
+        return _row_to_user(row) if row else None
+
+    async def get_by_subject(self, oidc_subject: str) -> Optional[UserRecord]:
+        # Keyed on oidc_subject (IdP 'sub'), never email — see 0007_users.sql's header comment.
+        cur = await self._read.execute("SELECT * FROM users WHERE oidc_subject = ?", (oidc_subject,))
+        row = await cur.fetchone()
+        return _row_to_user(row) if row else None
+
+    async def list(self) -> list[UserRecord]:
+        cur = await self._read.execute("SELECT * FROM users ORDER BY username")
+        rows = await cur.fetchall()
+        return [_row_to_user(r) for r in rows]
+
+    async def create(
+        self,
+        username: str,
+        role: str,
+        password_hash: Optional[str] = None,
+        email: Optional[str] = None,
+        auth_source: str = "local",
+        oidc_subject: Optional[str] = None,
+        enabled: bool = True,
+    ) -> UserRecord:
+        # Self-review fix: the pre-flight username check below doesn't (and can't, on its own)
+        # rule out a concurrent oidc_subject collision — two simultaneous JIT-provisioning
+        # calls for the same brand-new `sub` (e.g. a double-clicked "Sign in with SSO", or two
+        # browser tabs) can both pass UserRepo.get_or_create_from_oidc's `existing is None`
+        # check before either has committed. The `oidc_subject UNIQUE` constraint in
+        # 0007_users.sql is the real backstop; without catching its violation here, the loser of
+        # the race got an unhandled aiosqlite.IntegrityError (a 500) instead of a clean outcome.
+        # Caught and converted to UsernameConflictError so callers (get_or_create_from_oidc's
+        # retry loop, and archon/setup.py's callback handler) have one exception shape to
+        # handle regardless of which UNIQUE constraint actually fired.
+        async with self._db.gateway_write_lock:
+            existing = await self._write.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+            if await existing.fetchone() is not None:
+                raise UsernameConflictError(username)
+            now = utcnow()
+            try:
+                cur = await self._write.execute(
+                    """INSERT INTO users
+                       (username, email, password_hash, role, auth_source, oidc_subject, enabled, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (username, email, password_hash, role, auth_source, oidc_subject, int(enabled), now),
+                )
+            except aiosqlite.IntegrityError as e:
+                raise UsernameConflictError(username) from e
+            await self._write.commit()
+            new_id = cur.lastrowid
+        return await self.get_by_id(new_id)
+
+    async def update_role(self, user_id: int, role: str) -> UserRecord:
+        async with self._db.gateway_write_lock:
+            await self._write.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+            await self._write.commit()
+        return await self.get_by_id(user_id)
+
+    async def set_enabled(self, user_id: int, enabled: bool) -> UserRecord:
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                "UPDATE users SET enabled = ? WHERE id = ?", (int(enabled), user_id)
+            )
+            await self._write.commit()
+        return await self.get_by_id(user_id)
+
+    async def set_password_hash(self, user_id: int, password_hash: str) -> UserRecord:
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id)
+            )
+            await self._write.commit()
+        return await self.get_by_id(user_id)
+
+    async def touch_last_login(self, user_id: int) -> None:
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                "UPDATE users SET last_login_at = ? WHERE id = ?", (utcnow(), user_id)
+            )
+            await self._write.commit()
+
+    async def bump_session_version(self, user_id: int) -> int:
+        """Per-user analogue of the global session_version bump in settings — invalidates every
+        outstanding session token for exactly this one user (disable, role change, password
+        change, explicit logout-all-for-this-user), without touching anyone else's session."""
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                "UPDATE users SET session_version = session_version + 1 WHERE id = ?", (user_id,)
+            )
+            await self._write.commit()
+            cur = await self._write.execute(
+                "SELECT session_version FROM users WHERE id = ?", (user_id,)
+            )
+            row = await cur.fetchone()
+            return row["session_version"] if row else 0
+
+    async def get_or_create_from_oidc(
+        self,
+        *,
+        subject: str,
+        email: Optional[str],
+        default_role: str,
+        preferred_username: Optional[str] = None,
+    ) -> UserRecord:
+        """JIT provisioning (enterprise #1): first successful OIDC login for an unknown `sub`
+        creates a user. Callers are responsible for the allowlist check (domain/group) BEFORE
+        calling this — this method assumes provisioning has already been authorized and just
+        does the DB work. Keyed on subject, never email, so two IdP accounts sharing an email
+        address (an IdP misconfiguration, not something this app can prevent) still resolve to
+        two distinct local users rather than silently merging."""
+        existing = await self.get_by_subject(subject)
+        if existing is not None:
+            return existing
+
+        # Username must be unique locally; the IdP's preferred_username/email has no such
+        # guarantee. Fall back to a subject-derived name and disambiguate on conflict rather
+        # than fail JIT provisioning outright.
+        base = preferred_username or (email.split("@")[0] if email else None) or f"oidc-{subject[:8]}"
+        username = base
+        suffix = 0
+        while True:
+            try:
+                return await self.create(
+                    username=username, role=default_role, email=email,
+                    auth_source="oidc", oidc_subject=subject,
+                )
+            except UsernameConflictError:
+                # Self-review fix: create() now raises this same exception for EITHER a
+                # username collision OR a concurrent oidc_subject collision (see its own
+                # comment) — the latter happens when two simultaneous logins for the same new
+                # `sub` both passed the `existing is None` check above before either committed.
+                # Re-checking by subject distinguishes the two cases: if a row for this subject
+                # exists now, the other request won the race and this one should simply return
+                # its result rather than spin through up to 50 username suffixes for a conflict
+                # that was never actually about the username.
+                existing = await self.get_by_subject(subject)
+                if existing is not None:
+                    return existing
+                suffix += 1
+                username = f"{base}-{suffix}"
+                if suffix > 50:
+                    # Pathological collision storm — fail loudly rather than loop forever.
+                    raise

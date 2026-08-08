@@ -35,15 +35,30 @@ DEFAULT_SESSION_VERSION = 0
 
 
 def create_session_token(
-    secret: str, issued_at: Optional[float] = None, session_version: int = DEFAULT_SESSION_VERSION
+    secret: str,
+    issued_at: Optional[float] = None,
+    session_version: int = DEFAULT_SESSION_VERSION,
+    user_id: Optional[int] = None,
+    user_session_version: int = DEFAULT_SESSION_VERSION,
 ) -> str:
     """A minimal signed session token: base64(payload).base64(hmac-sha256).
     No external dependency (itsdangerous, etc.) — deliberately small footprint for a
-    self-hostable product. Payload carries an issued-at timestamp and a session_version (F18);
-    there is a single admin per instance in v1, so there's no subject/user id to encode."""
+    self-hostable product. Payload carries an issued-at timestamp and a session_version (F18).
+
+    enterprise #1/#2: `user_id` + `user_session_version` identify WHICH principal this token
+    asserts, on top of the existing global `session_version`. `user_id` is Optional and defaults
+    to None so tokens issued before the identity milestone (or by the legacy settings-only auth
+    path, still supported as a fallback — see archon/admin_auth.py) keep verifying exactly as
+    before; a None-subject token is understood as "the legacy single admin," not a distinct
+    principal. `user_session_version` is the PER-USER analogue of the global counter — bumping a
+    single user's version revokes only their sessions, not everyone's (the property 02-rbac.md
+    and 01-identity-and-sso.md both require: disabling/demoting one user must not log out the
+    other four)."""
     payload = json.dumps({
         "iat": issued_at if issued_at is not None else time.time(),
         "session_version": session_version,
+        "user_id": user_id,
+        "user_session_version": user_session_version,
     }).encode()
     payload_b64 = _b64encode(payload)
     signature = hmac.new(secret.encode(), payload_b64.encode(), hashlib.sha256).digest()
@@ -51,8 +66,17 @@ def create_session_token(
 
 
 def verify_session_token(
-    token: str, secret: str, current_session_version: int = DEFAULT_SESSION_VERSION
+    token: str,
+    secret: str,
+    current_session_version: int = DEFAULT_SESSION_VERSION,
+    current_user_session_version: Optional[int] = None,
 ) -> bool:
+    """`current_user_session_version` is the CALLER's job to look up (from the user_id embedded
+    in the token, which the caller must extract via decode_session_payload first — this function
+    stays a pure boolean check on a version it's TOLD is current, same shape as the existing
+    global-version check, rather than reaching into a repo itself). Pass None when the token is
+    known/expected to be a legacy admin-only token (no user_id) — the per-user check is then
+    skipped, matching pre-identity-milestone behavior exactly."""
     try:
         payload_b64, signature_b64 = token.split(".", 1)
     except ValueError:
@@ -85,4 +109,27 @@ def verify_session_token(
     if not isinstance(token_version, int) or token_version != current_session_version:
         return False
 
+    if current_user_session_version is not None:
+        token_user_version = payload.get("user_session_version", DEFAULT_SESSION_VERSION)
+        if not isinstance(token_user_version, int) or token_user_version != current_user_session_version:
+            return False
+
     return True
+
+
+def decode_session_payload(token: str) -> Optional[dict]:
+    """Extract the (unverified-signature) payload dict from a token, or None if malformed.
+    Used to read `user_id` BEFORE signature verification would normally gate access — this is
+    safe because the value is only ever used to look up which user's session_version to compare
+    against; verify_session_token's HMAC check still runs and still rejects any token whose
+    payload was tampered with, so a forged user_id can't grant a forged session, only cause a
+    lookup for the wrong user (which then fails signature verification anyway)."""
+    try:
+        payload_b64, _signature_b64 = token.split(".", 1)
+    except ValueError:
+        return None
+    try:
+        payload = json.loads(_b64decode(payload_b64))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None

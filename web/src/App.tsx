@@ -9,6 +9,7 @@ import { ServerDetail } from './pages/ServerDetail'
 import { Keys } from './pages/Keys'
 import { Audit } from './pages/Audit'
 import { Settings } from './pages/Settings'
+import { Users } from './pages/Users'
 
 function App() {
   const { data: setupStatus, isLoading, isError } = useSetupStatus()
@@ -41,6 +42,13 @@ function App() {
         <Route path="keys" element={<Keys />} />
         <Route path="audit" element={<Audit />} />
         <Route path="settings" element={<Settings />} />
+        {/* No client-side role gate on this route itself — Users renders an empty/error state
+            for a non-admin (GET /users 403s), and every mutation in it 403s server-side
+            regardless. The NAV LINK is what's hidden per-role (see Layout.tsx); a viewer who
+            navigates here directly by URL sees a clean "could not load" rather than a fake
+            404, which is honest about the route existing and matches 02-rbac.md's "403, not
+            404" principle at the API layer this page is built on. */}
+        <Route path="users" element={<Users />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

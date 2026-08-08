@@ -39,6 +39,10 @@ export const setupApi = {
   status: () => api.get<SetupStatusResponse>('/setup/status'),
   complete: (admin_password: string, auth_mode: 'open' | 'keyed') =>
     api.post<SetupStatusResponse>('/setup', { admin_password, auth_mode }),
-  login: (admin_password: string) => api.post<{ status: string }>('/login', { admin_password }),
+  // Bug fix (coordinator review of PR #16, 2026-08-07): `username` added — see Login.tsx and
+  // archon/schemas.py's LoginRequest for why. Field name stays `admin_password` to match the
+  // backend's (also-preserved-for-compat) request shape.
+  login: (username: string, admin_password: string) =>
+    api.post<{ status: string }>('/login', { username, admin_password }),
   logout: () => api.post<{ status: string }>('/logout'),
 }
