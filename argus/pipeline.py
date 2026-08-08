@@ -419,15 +419,6 @@ class Pipeline:
                 dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
                 dlp_match_count=decision.dlp_match_count,
             )
-            # DLP redact (enterprise #10): the bridged path forwards `params` directly to
-            # ProtocolBridge.bridge_call rather than raw body bytes, so redaction here means
-            # substituting the redacted arguments into `params` before that call — no
-            # body_override needed on this path, but the ordering guarantee is identical: this
-            # happens before bridge_call is ever invoked, so nothing unredacted leaves the
-            # process.
-            if decision.dlp_redacted_arguments is not None:
-                params = dict(params)
-                params["arguments"] = decision.dlp_redacted_arguments
             if decision.blocked:
                 return Response(
                     content=rpc_error(
@@ -436,6 +427,18 @@ class Pipeline:
                     ),
                     status_code=403, media_type="application/json",
                 )
+            # DLP redact (enterprise #10): the bridged path forwards `params` directly to
+            # ProtocolBridge.bridge_call rather than raw body bytes, so redaction here means
+            # substituting the redacted arguments into `params` before that call — no
+            # body_override needed on this path. Deliberately placed AFTER the blocked-return
+            # above (matching the non-bridged path's structure in _process) — a block never
+            # carries dlp_redacted_arguments (see argus/policy.py's evaluate: the redact branch
+            # always has blocked=False), so this ordering is not currently load-bearing for
+            # correctness, but keeping "can this call still be blocked" resolved before "what do
+            # we forward" is the safer invariant to read and to preserve under future changes.
+            if decision.dlp_redacted_arguments is not None:
+                params = dict(params)
+                params["arguments"] = decision.dlp_redacted_arguments
         else:
             await self._audit.log(
                 server_slug=server.slug, tool=None, decision="PASSTHROUGH",

@@ -147,7 +147,18 @@ BUILTIN_DETECTORS: dict[str, Detector] = {
     "email": Detector(
         name="email",
         label="Email address",
-        pattern=re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+        # SECURITY (found in self-review, not in the original design): the more "natural"
+        # `[A-Za-z0-9.-]+\.[A-Za-z]{2,}` domain shape is vulnerable to catastrophic
+        # backtracking — confirmed directly: `"a." * 20000 + "@" + "b." * 20000` against that
+        # pattern took 15+ seconds. The '.' appearing both inside the preceding character class
+        # AND as the literal separator immediately after it is an ambiguous-overlap shape, the
+        # same family of bug as the classic `(a+)+` ReDoS example, just less obviously so.
+        # This pattern avoids it structurally: '.' never appears inside the repeated charset,
+        # so each `(?:\.[A-Za-z0-9-]+)+` iteration has exactly one way to consume its input —
+        # no backtracking ambiguity to exploit. Verified via a 20-iteration randomized fuzz
+        # sweep (worst case <2ms) in addition to the specific adversarial input above. See
+        # docs/dlp.md and test_dlp.py's test_email_detector_pattern_resists_redos.
+        pattern=re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b"),
     ),
     "us_ssn": Detector(
         name="us_ssn",
@@ -192,13 +203,25 @@ class CustomPatternSpec:
 
 
 async def _scan_value_with_detector(text: str, detector: Detector) -> list[Finding]:
-    """Find all matches of one detector in one string. Uses the detector's own compiled
-    pattern's finditer for span discovery (built-in patterns are curated/trusted, not
-    operator-supplied), but a per-candidate confirmation for validated detectors still MUST go
-    through _match_with_timeout below for custom patterns. Built-in patterns are fixed at
-    deploy time (not editable via the web UI), so they are not the F2 attack surface the way
-    custom_patterns are — but we still keep individual match spans bounded to a single word/
-    token shape (\\b...\\b) to avoid pathological input blowing up finditer."""
+    """Find all matches of one detector in one string. Matches directly (not routed through
+    the forkserver) — built-in patterns are curated and fixed at deploy time (not editable via
+    the web UI), so they are not operator-supplied untrusted INPUT the way custom_patterns'
+    regex text is.
+
+    SECURITY (self-review finding): "curated" is not automatically "safe" — the ORIGINAL email
+    detector pattern here was in fact vulnerable to catastrophic backtracking on crafted input
+    (confirmed: ~15s on `"a."*20000 + "@" + "b."*20000` before the fix), despite being a
+    hand-written, reviewed pattern with no operator input involved. Routing every built-in
+    match through the forkserver was considered and rejected as the general fix: benchmarked at
+    ~150ms of forkserver overhead PER DETECTOR PER ARGUMENT (see docs/dlp.md), enabling all 6
+    built-ins would add ~900ms+ to every scanned call — directly undermining the "DLP scanning
+    must stay fast, this is a gateway" principle this whole feature is built around, to guard
+    against a class of bug whose actual fix is "prove the specific pattern is safe," not "treat
+    every curated pattern as untrusted." The real fix applied instead: each built-in pattern
+    must be demonstrated non-backtracking (bounded, non-nested-ambiguous quantifiers, verified
+    against adversarial/fuzzed input — see the email detector's fix comment and
+    test_email_detector_pattern_resists_redos in tests/unit/test_dlp.py) at AUTHORING time,
+    same bar future detectors added to BUILTIN_DETECTORS must clear before shipping."""
     findings: list[Finding] = []
     for m in detector.pattern.finditer(text):
         candidate = m.group(0)

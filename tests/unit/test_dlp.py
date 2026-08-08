@@ -171,6 +171,50 @@ def test_dlp_detector_names_match_builtin_registry():
 
 
 # ---------------------------------------------------------------------------
+# Built-in detector patterns must not be vulnerable to catastrophic backtracking.
+#
+# Self-review finding: the ORIGINAL email detector pattern
+# (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b") was vulnerable — confirmed ~15s
+# against "a."*20000 + "@" + "b."*20000 — despite being curated, non-operator-supplied text.
+# Built-in patterns are matched DIRECTLY (not routed through the forkserver, see
+# _scan_value_with_detector's docstring for why), so each one must be individually proven safe
+# rather than relying on runtime protection. This test is the regression guard for that bar —
+# it must pass for every CURRENT detector, and any future detector added to BUILTIN_DETECTORS
+# should be added to the adversarial-input list below before shipping.
+# ---------------------------------------------------------------------------
+
+_EMAIL_REDOS_ADVERSARIAL_INPUT = "a." * 20000 + "@" + "b." * 20000
+
+
+def test_email_detector_pattern_resists_redos():
+    """The specific input that broke the original pattern — must now complete quickly."""
+    pattern = BUILTIN_DETECTORS["email"].pattern
+    start = time.monotonic()
+    list(pattern.finditer(_EMAIL_REDOS_ADVERSARIAL_INPUT))
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"email pattern took {elapsed:.2f}s on adversarial input — ReDoS regression"
+
+
+def test_all_builtin_detector_patterns_resist_randomized_fuzz():
+    """Broader net than the one known-bad input above: randomized fuzz input drawn from each
+    pattern's own relevant alphabet, run against every built-in detector, bounding worst-case
+    time. Not exhaustive (fuzzing never is), but catches the class of bug the email detector
+    had — a future detector pattern that's slow on structured-but-adversarial input."""
+    import random
+
+    rng = random.Random(1234)
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_@+= "
+    for name, detector in BUILTIN_DETECTORS.items():
+        for _ in range(15):
+            n = rng.randint(500, 20000)
+            text = "".join(rng.choices(alphabet, k=n))
+            start = time.monotonic()
+            list(detector.pattern.finditer(text))
+            elapsed = time.monotonic() - start
+            assert elapsed < 1.0, f"detector {name!r} took {elapsed:.2f}s on fuzzed input len={n} — possible ReDoS"
+
+
+# ---------------------------------------------------------------------------
 # Actions: allow / redact / block
 # ---------------------------------------------------------------------------
 

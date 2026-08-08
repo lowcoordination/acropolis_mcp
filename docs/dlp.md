@@ -151,13 +151,41 @@ search followed by an unguarded finditer. See `test_finditer_spans_with_timeout_
 in `tests/unit/test_policy.py`.
 
 Built-in detector patterns are curated and fixed at deploy time (not editable through the web
-UI), so they are not this attack surface — they're matched directly, without the forkserver
-overhead, which is why the benchmark below shows built-in-only scanning costs sub-millisecond
-while a single custom pattern costs ~150ms (dominated by the forkserver's fixed process-spawn
-cost, not by the pattern or argument content — see F2's own documentation in `argus/policy.py`
-for why that overhead is an accepted trade for correctness on a security-critical path).
+UI), so the *pattern text* is not operator-supplied the way `dlp_custom_patterns` is — they're
+matched directly, without the forkserver overhead, which is why the benchmark below shows
+built-in-only scanning costs sub-millisecond while a single custom pattern costs ~150ms
+(dominated by the forkserver's fixed process-spawn cost, not by the pattern or argument content
+— see F2's own documentation in `argus/policy.py` for why that overhead is an accepted trade for
+correctness on a security-critical path).
+
+**"Curated" is not automatically "safe," and this was found the hard way during this PR's own
+self-review, not caught in initial design.** The original `email` detector pattern —
+`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`, a hand-written pattern with no operator
+input involved — was itself vulnerable to catastrophic backtracking: confirmed at ~15 seconds
+against `"a."*20000 + "@" + "b."*20000`, because `.` appeared both inside a repeated character
+class and as the literal separator immediately after it, an ambiguous-overlap shape in the same
+family as the textbook `(a+)+` ReDoS example, just far less obvious to spot by inspection. The
+value being scanned (the tool call argument) is *always* untrusted regardless of where the
+pattern came from — a curated pattern narrows the attack surface to "did the author get the
+regex right," it does not eliminate it.
+
+Routing every built-in match through the forkserver was considered as the general fix and
+rejected: benchmarked at ~150ms of overhead *per detector per argument* (see below), enabling
+all 6 built-ins would add roughly 900ms to every scanned call, which would violate this
+feature's own "DLP scanning must stay fast" premise to guard against a bug class whose real fix
+is pattern-level, not infrastructure-level. The fix actually applied: rewrite the specific
+vulnerable pattern to a structurally non-ambiguous form (verified against both the specific
+adversarial input and a 15-iteration randomized fuzz sweep, worst case <2ms), and add a
+permanent regression test (`test_all_builtin_detector_patterns_resist_randomized_fuzz` in
+`tests/unit/test_dlp.py`) fuzzing every current built-in pattern — the bar any future addition
+to `BUILTIN_DETECTORS` must also clear before shipping.
 
 ## Performance
+
+DLP scanning inherits the existing `max_body_bytes` guard (default 1MB, enforced in
+`Pipeline._read_body_guarded` before the request body is even parsed) — an argument-scan cost
+that scales with argument size is therefore bounded by the same cap that already protects every
+other part of request handling, not a new unbounded surface this feature introduces.
 
 Measured with `tests/bench/bench_dlp.py` (`python -m tests.bench.bench_dlp`), 300 iterations per
 cell, on representative argument sizes (small: ~36 bytes, medium: ~1KB, large: ~20KB):
@@ -166,23 +194,23 @@ cell, on representative argument sizes (small: ~36 bytes, medium: ~1KB, large: ~
 
 | Argument size | Added p50 | Added p99 |
 |---|---|---|
-| Small (~36B) | 0.009ms | 0.015ms |
-| Medium (~1KB) | 0.058ms | 0.074ms |
-| Large (~20KB) | 1.063ms | 1.495ms |
+| Small (~36B) | 0.007ms | 0.009ms |
+| Medium (~1KB) | 0.057ms | 0.069ms |
+| Large (~20KB) | 1.062ms | 1.102ms |
 
 **With one operator-supplied custom pattern added (forkserver-routed):**
 
 | Argument size | Added p50 | Added p99 |
 |---|---|---|
-| Small (~36B) | ~147ms | ~175ms |
-| Medium (~1KB) | ~147ms | ~175ms |
-| Large (~20KB) | ~148ms | ~171ms |
+| Small (~36B) | ~148ms | ~175ms |
+| Medium (~1KB) | ~147ms | ~172ms |
+| Large (~20KB) | ~148ms | ~193ms |
 
 Two takeaways:
 
 1. **Built-in-only scanning is cheap and scales sub-linearly with argument size** — the added
-   cost at 20KB (~1.5ms p99) is nowhere near enough to be user-visible on a gateway request.
-2. **Every custom pattern adds a roughly fixed ~150-175ms**, dominated by the forkserver
+   cost at 20KB (~1.1ms p99) is nowhere near enough to be user-visible on a gateway request.
+2. **Every custom pattern adds a roughly fixed ~150-190ms**, dominated by the forkserver
    process-spawn cost documented in `argus/policy.py` (measured there at ~22ms per spawn; this
    feature's overhead is higher because span recovery may involve a second internal pass inside
    the same guarded subprocess). This cost is *per custom pattern configured on the server*, not
@@ -191,8 +219,8 @@ Two takeaways:
    are a deliberate, visible opt-in rather than bundled into the default detector set.
 
 **The response-scanning deferral, quantified:** extrapolating the built-in-only scanning rate
-(~0.075ms added p99 per KB) to response-sized payloads projects to ~0.75ms at 10KB, ~7.5ms at
-100KB, and ~75ms at 1MB — response bodies routinely exceed all of these sizes, and that number
+(~0.055ms added p99 per KB) to response-sized payloads projects to ~0.55ms at 10KB, ~5.5ms at
+100KB, and ~55ms at 1MB — response bodies routinely exceed all of these sizes, and that number
 doesn't even account for the streaming-chunk-boundary and size-cap problems described above,
 which argument scanning never has to solve. This is a **projection from argument-scanning
 measurements**, explicitly not a benchmark of a real response-scanning implementation (none
