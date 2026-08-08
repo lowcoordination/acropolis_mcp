@@ -45,6 +45,21 @@ def _policy_diff(current: ServerPolicy, incoming: ServerPolicy) -> list[str]:
         deltas.append(
             f"param_rules: {len(current.param_rules)} -> {len(incoming.param_rules)} tool(s) with rules"
         )
+    # Enterprise #10 (DLP): a DLP config change is a security-lowering/relevant action in its
+    # own right (turning a detector off, or from block to redact, weakens enforcement) and must
+    # be visible in the control-plane audit trail same as any other policy field. Detector
+    # names/actions and custom-pattern names/pattern TEXT are operator-authored configuration,
+    # not secrets — safe to record in full, unlike the matched VALUES a detector finds at
+    # runtime (which never appear here or anywhere in audit_events; see argus/dlp.py).
+    if current.dlp_detectors != incoming.dlp_detectors:
+        deltas.append(
+            f"dlp_detectors: {len(current.dlp_detectors)} -> {len(incoming.dlp_detectors)} configured"
+        )
+    if current.dlp_custom_patterns != incoming.dlp_custom_patterns:
+        deltas.append(
+            f"dlp_custom_patterns: {len(current.dlp_custom_patterns)} -> "
+            f"{len(incoming.dlp_custom_patterns)} configured"
+        )
     return deltas
 
 
@@ -59,6 +74,8 @@ def _serialize_policy(policy: ServerPolicy) -> dict[str, Any]:
             tool: {param: rule.model_dump() for param, rule in rules.items()}
             for tool, rules in policy.param_rules.items()
         },
+        "dlp_detectors": dict(sorted(policy.dlp_detectors.items())),
+        "dlp_custom_patterns": [p.model_dump() for p in policy.dlp_custom_patterns],
     }
 
 

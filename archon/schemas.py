@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, field_validator, model_validator
 
-from db.models import SLUG_RE, ParamRule, ServerPolicy
+from db.models import SLUG_RE, DlpCustomPattern, ParamRule, ServerPolicy
 
 
 def _validate_slug(slug: str) -> str:
@@ -178,6 +178,8 @@ class PolicyResponse(BaseModel):
     allowed: list[str]
     denied: list[str]
     param_rules: dict[str, dict[str, ParamRule]]
+    dlp_detectors: dict[str, str] = {}
+    dlp_custom_patterns: list[DlpCustomPattern] = []
 
 
 class PolicyUpdateRequest(ServerPolicy):
@@ -320,6 +322,9 @@ class AuditEventResponse(BaseModel):
     status_code: Optional[int]
     latency_ms: Optional[int]
     origin: Optional[str] = None  # None (normal traffic) | "test" (admin Try-it call)
+    dlp_detector: Optional[str] = None  # enterprise #10 — which detector fired, if any
+    dlp_action: Optional[str] = None  # "block" | "redact" — never the matched/redacted value
+    dlp_match_count: Optional[int] = None
 
 
 class AdminEventResponse(BaseModel):

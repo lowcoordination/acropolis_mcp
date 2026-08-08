@@ -89,6 +89,20 @@ def _regex_worker(pattern, value: str, result_queue) -> None:
     result_queue.put(pattern.search(value) is not None)
 
 
+def _finditer_spans_worker(pattern, value: str, result_queue) -> None:
+    # Enterprise #10 (DLP): a SEPARATE bounded worker for callers (argus/dlp.py's custom
+    # pattern span recovery) that need every match SPAN, not just a matched/not-matched bool.
+    # `pattern.search(value)` (the existing _regex_worker above) proves a pattern terminates
+    # promptly for its FIRST match, but re.finditer restarts matching from each match's end —
+    # a pattern that resolves its first match quickly is not guaranteed to resolve its second,
+    # third, etc. equally quickly (this is exactly the kind of position-dependent backtracking
+    # blowup ReDoS patterns are built from). Reusing the identical forkserver/timeout/kill
+    # machinery here (same _mp_context, same semaphore, same wall-clock budget via the caller)
+    # closes that gap rather than trusting a second, unguarded finditer call once the FIRST
+    # match alone has been proven fast.
+    result_queue.put([(m.start(), m.end()) for m in pattern.finditer(value)])
+
+
 async def _match_with_timeout(compiled, value: str) -> MatchOutcome:
     """Runs compiled.search(value) in a forked child process with a hard wall-clock timeout that
     starts only once the process is actually running (see _regex_semaphore above — this is what
@@ -141,6 +155,52 @@ async def _match_with_timeout(compiled, value: str) -> MatchOutcome:
             result_queue.close()
 
 
+async def _finditer_spans_with_timeout(compiled, value: str) -> Optional[list[tuple[int, int]]]:
+    """Enterprise #10 (DLP) companion to _match_with_timeout, for callers that need every match
+    SPAN (redaction needs positions, not just yes/no) rather than a single matched/not-matched
+    outcome. Deliberately a SEPARATE function rather than extending _match_with_timeout's return
+    type — that function is F2's hardened, narrowly-scoped primitive and this keeps its
+    contract (and its test coverage) untouched. Mirrors its process-lifecycle handling exactly
+    (same _mp_context, same semaphore, same timeout budget, same terminate/kill teardown) so the
+    two stay behaviorally identical on the timeout/kill path; only the worker function and
+    result shape differ. Returns None on timeout or infra failure — the caller must treat that
+    as UNDETERMINED and fail closed, exactly as MatchOutcome.UNDETERMINED does for
+    _match_with_timeout."""
+    async with _regex_semaphore:
+        result_queue = _mp_context.Queue()
+        process = _mp_context.Process(target=_finditer_spans_worker, args=(compiled, value, result_queue))
+        process.start()
+
+        loop = asyncio.get_running_loop()
+        try:
+            spans = await loop.run_in_executor(
+                _wait_executor, result_queue.get, True, _REGEX_MATCH_TIMEOUT_SECONDS
+            )
+            process.join(timeout=1.0)
+            return spans
+        except queue.Empty:
+            logger.warning(
+                "dlp custom pattern finditer exceeded %.1fs (pattern=%r) — terminating and "
+                "treating as UNDETERMINED",
+                _REGEX_MATCH_TIMEOUT_SECONDS, compiled.pattern,
+            )
+            return None
+        except Exception:
+            logger.exception(
+                "dlp custom pattern finditer for pattern=%r failed unexpectedly (not a timeout) "
+                "— treating as UNDETERMINED",
+                compiled.pattern,
+            )
+            return None
+        finally:
+            process.terminate()
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1.0)
+            result_queue.close()
+
+
 @dataclass
 class Decision:
     blocked: bool
@@ -148,6 +208,17 @@ class Decision:
     rule: Optional[str] = None
     matched: Optional[str] = None
     args_summary: Optional[dict] = None
+    # Enterprise #10 (DLP): set only when a DLP detector fired. dlp_detector/dlp_action/
+    # dlp_match_count are safe to audit/log/send in a webhook — dlp_redacted_arguments (when
+    # action == "redact") carries the REDACTED (placeholder-substituted) arguments dict, which
+    # is safe to forward upstream but is deliberately kept off the audit row and webhook path;
+    # only argus/pipeline.py reads it, to build the re-serialized forwarded body. See
+    # docs/dlp.md's audit-safety invariant: the matched/redacted value must never appear in the
+    # audit log or a webhook payload, only which detector fired and what action was taken.
+    dlp_detector: Optional[str] = None
+    dlp_action: Optional[str] = None
+    dlp_match_count: int = 0
+    dlp_redacted_arguments: Optional[dict] = None
 
 
 # §26 fix (review 2026-08-04): summarize_args's docstring claimed it avoided logging secrets
@@ -256,6 +327,52 @@ async def evaluate(tool_name: str, arguments: dict, server_name: str, policy: Se
                 rule=rule_name,
                 matched=detail,
                 args_summary=args_summary,
+            )
+
+    # DLP scan (enterprise #10) — deliberately LAST, after allow/deny and param rules: a call
+    # that's going to be blocked outright by an earlier check shouldn't pay for a DLP scan.
+    # Deliberately arguments-only (not responses) — see docs/dlp.md for the benchmark-gated
+    # scope decision. Every detector defaults to off (ServerPolicy.dlp_detectors defaults to
+    # {}), so a server with no DLP config configured takes this branch's early-return on the
+    # very first line of dlp_scan and is byte-identical to pre-DLP behavior.
+    if policy.dlp_detectors or policy.dlp_custom_patterns:
+        from argus.dlp import dlp_scan
+
+        dlp_result = await dlp_scan(arguments, policy)
+        if dlp_result.action in ("block", "redact"):
+            # args_summary (audit-log-only, see summarize_args) is built from the ORIGINAL
+            # arguments and only redacts by SENSITIVE KEY NAME — it has no idea a DLP detector
+            # just found a secret sitting in an innocuously-named key like "message". Without
+            # this, a DLP-driven block/redact would still write the raw matched value straight
+            # into audit_events.args_summary, defeating the entire audit-safety invariant this
+            # feature is built around. Re-summarize from the redacted arguments (falling back
+            # to the placeholder-substituted whole value on block, where dlp_scan doesn't
+            # bother building a full redacted copy — see argus/dlp.py's dlp_scan short-circuit).
+            safe_arguments = dlp_result.redacted_arguments
+            if safe_arguments is None:
+                safe_arguments = {
+                    k: (f"[REDACTED:{dlp_result.detector}]" if isinstance(v, str) else v)
+                    for k, v in arguments.items()
+                }
+            args_summary = summarize_args(safe_arguments)
+        if dlp_result.action == "block":
+            return Decision(
+                blocked=True,
+                reason=f"DLP detector '{dlp_result.detector}' matched a blocked pattern",
+                rule="dlp",
+                args_summary=args_summary,
+                dlp_detector=dlp_result.detector,
+                dlp_action="block",
+                dlp_match_count=dlp_result.match_count,
+            )
+        if dlp_result.action == "redact":
+            return Decision(
+                blocked=False,
+                args_summary=args_summary,
+                dlp_detector=dlp_result.detector,
+                dlp_action="redact",
+                dlp_match_count=dlp_result.match_count,
+                dlp_redacted_arguments=dlp_result.redacted_arguments,
             )
 
     return Decision(blocked=False, args_summary=args_summary)

@@ -16,7 +16,7 @@ import yaml
 from archon.settings import Settings
 from argus.app import create_app
 from db.database import Database
-from db.models import ParamRule, ServerPolicy
+from db.models import DlpCustomPattern, ParamRule, ServerPolicy
 from db.repo import ServerRepo, SettingsRepo
 
 
@@ -49,6 +49,15 @@ async def client(tmp_path: Path):
         param_rules={"shell_run": {"command": ParamRule(max_length=200, block_patterns=["sudo"])}},
     ))
     await server_repo.create(slug="fetch", name="Fetch", upstream_url="http://127.0.0.1:9002/mcp")
+
+    dlp_server = await server_repo.create(
+        slug="dlp-server", name="DLP Server", upstream_url="http://127.0.0.1:9003/mcp",
+    )
+    await server_repo.set_policy(dlp_server.id, ServerPolicy(
+        mode="passthrough",
+        dlp_detectors={"credit_card": "block", "email": "redact"},
+        dlp_custom_patterns=[DlpCustomPattern(name="employee_id", pattern=r"EMP-\d{6}", action="redact")],
+    ))
 
     # The three secrets that must never appear in an export.
     await settings_repo.set_many({
@@ -124,6 +133,29 @@ async def test_export_round_trips_policy_faithfully(client):
     assert shell["policy"]["allowed"] == ["shell_run"]
     assert shell["policy"]["param_rules"]["shell_run"]["command"]["max_length"] == 200
     assert shell["policy"]["param_rules"]["shell_run"]["command"]["block_patterns"] == ["sudo"]
+
+
+async def test_export_round_trips_dlp_config_faithfully(client):
+    """Enterprise #10: verifies the plan's claim that dlp_detectors/dlp_custom_patterns ride
+    the existing policy serialization with no special-casing needed — export, don't assume."""
+    resp = await client.get("/api/v1/config/export")
+    data = yaml.safe_load(resp.text)
+    dlp = next(s for s in data["servers"] if s["slug"] == "dlp-server")
+    assert dlp["policy"]["dlp_detectors"] == {"credit_card": "block", "email": "redact"}
+    assert dlp["policy"]["dlp_custom_patterns"] == [
+        {"name": "employee_id", "pattern": r"EMP-\d{6}", "action": "redact"}
+    ]
+
+
+async def test_import_of_exported_dlp_config_reports_unchanged(client):
+    """The full round-trip claim: export -> reimport must show the DLP-bearing server as
+    unchanged, not as a spurious update — proves the on-disk (export_config/_parse) and
+    in-DB (ServerRepo.get_policy/set_policy) representations of dlp_detectors/
+    dlp_custom_patterns agree exactly."""
+    exported = (await client.get("/api/v1/config/export")).text
+    resp = await client.post("/api/v1/config/import", json={"yaml": exported})
+    dlp_action = next(a for a in resp.json()["actions"] if a["target"] == "server 'dlp-server'")
+    assert dlp_action["kind"] == "unchanged", dlp_action
 
 
 # --------------------------------------------------------------------------- import

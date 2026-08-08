@@ -130,6 +130,45 @@ async def test_policy_update_writes_admin_event_with_diff(client):
     assert "allowed: 0 -> 2 tool(s)" in policy_event["summary"]
 
 
+async def test_dlp_policy_change_writes_admin_event_with_diff(client):
+    """Enterprise #10: a DLP config change is a security-lowering/relevant action worth
+    auditing, same as any other policy field — this is the AdminEventRepo infrastructure from
+    enterprise #4, reused rather than rebuilt."""
+    await _setup_admin(client)
+    await client.post("/api/v1/servers", json={
+        "slug": "test-server", "name": "Test Server", "upstream_url": "http://localhost:8000/mcp",
+    })
+
+    resp = await client.put("/api/v1/servers/test-server/policy", json={
+        "mode": "passthrough",
+        "dlp_detectors": {"credit_card": "block", "email": "redact"},
+        "dlp_custom_patterns": [{"name": "employee_id", "pattern": "EMP-\\d{6}", "action": "redact"}],
+    })
+    assert resp.status_code == 200
+
+    events = await client.get("/api/v1/admin-events")
+    data = events.json()
+    policy_event = next(e for e in data if e["action"] == "policy.update")
+    assert "dlp_detectors: 0 -> 2 configured" in policy_event["summary"]
+    assert "dlp_custom_patterns: 0 -> 1 configured" in policy_event["summary"]
+    after = json.loads(policy_event["after"])
+    assert after["policy"]["dlp_detectors"] == {"credit_card": "block", "email": "redact"}
+    assert after["policy"]["dlp_custom_patterns"][0]["name"] == "employee_id"
+
+
+async def test_dlp_config_change_alone_still_produces_a_diff_summary():
+    """Unit-level companion: turning a detector from redact to block (no other policy field
+    changing) must still surface as a delta — confirms the DLP fields are compared, not just
+    counted as part of some other field's equality check."""
+    from archon.admin_audit import _policy_diff
+    from db.models import ServerPolicy
+
+    current = ServerPolicy(dlp_detectors={"email": "redact"})
+    incoming = ServerPolicy(dlp_detectors={"email": "block"})
+    deltas = _policy_diff(current, incoming)
+    assert any("dlp_detectors" in d for d in deltas)
+
+
 async def test_key_create_writes_admin_event(client):
     await _setup_admin(client)
     resp = await client.post("/api/v1/keys", json={"name": "test-key"})

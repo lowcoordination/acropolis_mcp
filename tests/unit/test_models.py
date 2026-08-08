@@ -5,7 +5,7 @@ import re
 import pytest
 from pydantic import ValidationError
 
-from db.models import ParamRule, ServerPolicy
+from db.models import DlpCustomPattern, ParamRule, ServerPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -62,3 +62,66 @@ def test_compiled_patterns_is_cached_not_recompiled_each_call():
     second = rule.compiled_patterns()
     assert first is second, "compiled_patterns() should return the same cached list object"
     assert first[0] is second[0], "individual compiled Pattern objects should be reused, not rebuilt"
+
+
+# ---------------------------------------------------------------------------
+# Enterprise #10 — ServerPolicy.dlp_detectors / dlp_custom_patterns validation
+# ---------------------------------------------------------------------------
+
+def test_dlp_detectors_default_to_empty_dict():
+    """A server with no DLP config configured must default to zero detectors — the hard
+    regression-test requirement, not just a design preference (see argus/policy.py's evaluate,
+    which skips the DLP scan entirely when this is empty)."""
+    policy = ServerPolicy()
+    assert policy.dlp_detectors == {}
+    assert policy.dlp_custom_patterns == []
+
+
+@pytest.mark.parametrize("action", ["allow", "redact", "block"])
+def test_valid_dlp_detector_actions_accepted(action):
+    policy = ServerPolicy(dlp_detectors={"credit_card": action})
+    assert policy.dlp_detectors["credit_card"] == action
+
+
+def test_invalid_dlp_detector_action_rejected():
+    with pytest.raises(ValidationError, match="action must be one of"):
+        ServerPolicy(dlp_detectors={"credit_card": "quarantine"})
+
+
+def test_unknown_dlp_detector_name_rejected():
+    with pytest.raises(ValidationError, match="unknown dlp detector"):
+        ServerPolicy(dlp_detectors={"totally_made_up": "block"})
+
+
+def test_dlp_custom_pattern_valid_regex_accepted():
+    pattern = DlpCustomPattern(name="employee_id", pattern=r"EMP-\d{6}", action="redact")
+    assert pattern.action == "redact"
+
+
+def test_dlp_custom_pattern_invalid_regex_rejected():
+    with pytest.raises(ValidationError, match="invalid regex"):
+        DlpCustomPattern(name="broken", pattern="[", action="block")
+
+
+def test_dlp_custom_pattern_oversized_regex_rejected():
+    with pytest.raises(ValidationError, match="too long"):
+        DlpCustomPattern(name="huge", pattern="a" * 201, action="block")
+
+
+def test_dlp_custom_pattern_invalid_action_rejected():
+    with pytest.raises(ValidationError, match="action must be one of"):
+        DlpCustomPattern(name="x", pattern="abc", action="quarantine")
+
+
+def test_dlp_custom_pattern_default_action_is_block():
+    pattern = DlpCustomPattern(name="x", pattern="abc")
+    assert pattern.action == "block"
+
+
+def test_server_policy_with_dlp_custom_patterns_round_trips_via_model_dump():
+    policy = ServerPolicy(
+        dlp_custom_patterns=[DlpCustomPattern(name="employee_id", pattern=r"EMP-\d{6}", action="redact")]
+    )
+    dumped = policy.model_dump()
+    rebuilt = ServerPolicy(**dumped)
+    assert rebuilt == policy

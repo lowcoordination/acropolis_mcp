@@ -13,6 +13,7 @@ import {
 import { POLICY_PRESETS } from '../lib/policyPresets'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
 import { ToolTester } from '../components/ToolTester'
+import { DlpEditor } from '../components/DlpEditor'
 import type { ParamRule, PolicyMode, PolicyResponse } from '../api/types'
 
 function relativeTime(isoTimestamp: string): string {
@@ -225,6 +226,10 @@ export function ServerDetail() {
     setDraft((d) => (d ? { ...d, rate_limit: value || null } : d))
   }
 
+  function setDlpConfig(dlp_detectors: PolicyResponse['dlp_detectors'], dlp_custom_patterns: PolicyResponse['dlp_custom_patterns']) {
+    setDraft((d) => (d ? { ...d, dlp_detectors, dlp_custom_patterns } : d))
+  }
+
   function applyPreset(presetId: string) {
     setSelectedPresetId(presetId)
     const preset = POLICY_PRESETS.find((p) => p.id === presetId)
@@ -318,6 +323,41 @@ export function ServerDetail() {
           />
         </div>
 
+        {isDirty && (
+          <div className="space-y-2">
+            {saveError && (
+              <p className="text-sm" style={{ color: 'var(--danger)' }}>
+                {saveError}
+              </p>
+            )}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => savePolicy.mutate(draft)}
+                className="btn-primary rounded-md px-4 py-2 text-sm font-medium disabled:opacity-60"
+                disabled={savePolicy.isPending}
+              >
+                {savePolicy.isPending ? 'Saving…' : 'Save policy'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setDraft(policy ?? null)}
+                className="btn-secondary rounded-md px-4 py-2 text-sm font-medium"
+              >
+                Discard changes
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="card p-5 space-y-4">
+        <h2 className="text-sm font-semibold">DLP (data loss prevention)</h2>
+        <DlpEditor
+          detectors={draft.dlp_detectors}
+          customPatterns={draft.dlp_custom_patterns}
+          onChange={setDlpConfig}
+        />
         {isDirty && (
           <div className="space-y-2">
             {saveError && (

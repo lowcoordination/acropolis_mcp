@@ -35,6 +35,15 @@ function EventRow({ event }: { event: AuditEvent }) {
         <div className="px-4 pb-3 text-xs space-y-1" style={{ color: 'var(--text-muted)' }}>
           {event.reason && <div>Reason: {event.reason}</div>}
           {event.matched && <div className="font-mono">Matched: {event.matched}</div>}
+          {event.dlp_detector && (
+            // Deliberately shows ONLY the detector name and action, never the matched/redacted
+            // value — that value never leaves the backend (see argus/dlp.py's audit-safety
+            // invariant), so there is nothing more specific to show here even in expanded view.
+            <div>
+              DLP: <span className="font-mono">{event.dlp_detector}</span> ({event.dlp_action}
+              {event.dlp_match_count ? `, ${event.dlp_match_count} match(es)` : ''})
+            </div>
+          )}
           {event.args_summary && <div className="font-mono break-all">Args: {event.args_summary}</div>}
           {!!event.bridged && <div>Bridged (2026 stateless client)</div>}
           {event.latency_ms !== null && <div>Latency: {event.latency_ms}ms</div>}

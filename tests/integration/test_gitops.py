@@ -238,6 +238,39 @@ settings:
         assert action["kind"] == "unchanged", f"unexpected drift: {action}"
 
 
+async def test_dlp_config_drift_is_detected(client):
+    """Enterprise #10: a DLP config change must show up as drift the same way any other policy
+    field would — proves policy-as-code and DLP compose correctly rather than DLP silently
+    riding along unrecognized in the exported/compared representation."""
+    await _setup_admin(client)
+    await client.post("/api/v1/servers", json={
+        "slug": "test-server", "name": "Test Server", "upstream_url": "http://localhost:8000/mcp",
+    })
+    await client.put("/api/v1/servers/test-server/policy", json={
+        "mode": "passthrough", "dlp_detectors": {"credit_card": "block"},
+    })
+
+    export_resp = await client.get("/api/v1/config/export")
+    exported = export_resp.text
+    assert "dlp_detectors" in exported
+    assert "credit_card: block" in exported
+
+    # Re-importing the exact export should show no drift.
+    reimport = await client.post("/api/v1/config/import", json={"yaml": exported, "apply": False})
+    for action in reimport.json()["actions"]:
+        assert action["kind"] == "unchanged", f"unexpected drift on re-import: {action}"
+
+    # A file with a DIFFERENT dlp_detectors value must show up as an update, not silently
+    # match — the actual drift-detection claim.
+    import yaml as _yaml
+    data = _yaml.safe_load(exported)
+    data["servers"][0]["policy"]["dlp_detectors"] = {"credit_card": "redact"}
+    drifted_yaml = _yaml.safe_dump(data)
+    drift_resp = await client.post("/api/v1/config/import", json={"yaml": drifted_yaml, "apply": False})
+    update_action = next(a for a in drift_resp.json()["actions"] if a["kind"] == "update")
+    assert "dlp_detectors" in update_action["detail"]
+
+
 async def test_ssrf_validation_rejects_private_url(client):
     """gitops_url pointing at a private IP is rejected without opt-in."""
     await _setup_admin(client)

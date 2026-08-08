@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from argus.policy import evaluate, summarize_args, tool_is_visible
-from db.models import ParamRule, ServerPolicy
+from argus.policy import _finditer_spans_with_timeout, evaluate, summarize_args, tool_is_visible
+from db.models import DlpCustomPattern, ParamRule, ServerPolicy
 
 
 async def test_passthrough_always_allows():
@@ -306,3 +306,155 @@ def test_summarize_args_still_truncates_long_non_sensitive_values():
 def test_summarize_args_passes_through_short_non_sensitive_values():
     summary = summarize_args({"path": "/tmp/file.txt"})
     assert summary["path"] == "/tmp/file.txt"
+
+
+# ---------------------------------------------------------------------------
+# Enterprise #10 — DLP integration into evaluate()
+# ---------------------------------------------------------------------------
+
+async def test_no_dlp_config_is_byte_identical_to_pre_dlp_behavior():
+    """Hard regression-test requirement from the plan: a server with NO dlp_detectors/
+    dlp_custom_patterns configured must behave exactly as before this feature existed — no
+    dlp_* fields populated on the Decision, even when the arguments contain something that
+    WOULD match a detector if one were configured."""
+    policy = ServerPolicy(mode="passthrough")
+    decision = await evaluate(
+        "tool", {"message": "my card is 4111111111111111, email nick@example.com"}, "srv", policy
+    )
+    assert not decision.blocked
+    assert decision.dlp_detector is None
+    assert decision.dlp_action is None
+    assert decision.dlp_match_count == 0
+    assert decision.dlp_redacted_arguments is None
+
+
+async def test_dlp_allow_action_does_not_block_or_redact():
+    policy = ServerPolicy(mode="passthrough", dlp_detectors={"credit_card": "allow"})
+    decision = await evaluate("tool", {"message": "card 4111111111111111"}, "srv", policy)
+    assert not decision.blocked
+    assert decision.dlp_action is None
+
+
+async def test_dlp_redact_allows_call_and_sets_redacted_arguments():
+    policy = ServerPolicy(mode="passthrough", dlp_detectors={"email": "redact"})
+    decision = await evaluate(
+        "tool", {"message": "reach me at nick@example.com for details"}, "srv", policy
+    )
+    assert not decision.blocked
+    assert decision.dlp_action == "redact"
+    assert decision.dlp_detector == "email"
+    assert decision.dlp_match_count == 1
+    assert "nick@example.com" not in decision.dlp_redacted_arguments["message"]
+    assert "[REDACTED:email]" in decision.dlp_redacted_arguments["message"]
+
+
+async def test_dlp_block_blocks_the_call():
+    policy = ServerPolicy(mode="passthrough", dlp_detectors={"credit_card": "block"})
+    decision = await evaluate("tool", {"message": "card 4111111111111111"}, "srv", policy)
+    assert decision.blocked
+    assert decision.rule == "dlp"
+    assert decision.dlp_detector == "credit_card"
+    assert decision.dlp_action == "block"
+
+
+async def test_dlp_block_decision_never_carries_matched_value():
+    """The audit-safety invariant: the matched/redacted value must never appear anywhere a
+    Decision surfaces it. `reason` is a fixed template naming the detector, not the value;
+    `matched` (the field other rule types use to carry the offending text) stays None for DLP
+    so nothing downstream (audit, webhook) can accidentally forward the secret through it."""
+    policy = ServerPolicy(mode="passthrough", dlp_detectors={"credit_card": "block"})
+    decision = await evaluate("tool", {"message": "card 4111111111111111"}, "srv", policy)
+    assert decision.matched is None
+    assert "4111111111111111" not in (decision.reason or "")
+
+
+async def test_dlp_runs_after_allow_deny_not_before():
+    """Ordering: a call already blocked by allowlist/denylist must not even attempt a DLP
+    scan — asserted indirectly via decision.rule being 'denylist', not 'dlp', even though the
+    argument would also match the configured DLP block detector."""
+    policy = ServerPolicy(
+        mode="denylist", denied=["dangerous_tool"], dlp_detectors={"credit_card": "block"}
+    )
+    decision = await evaluate(
+        "dangerous_tool", {"message": "card 4111111111111111"}, "srv", policy
+    )
+    assert decision.blocked
+    assert decision.rule == "denylist"
+    assert decision.dlp_detector is None  # never reached the DLP scan
+
+
+async def test_dlp_runs_after_param_rules_not_before():
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"other": ParamRule(denied=True)}},
+        dlp_detectors={"credit_card": "block"},
+    )
+    decision = await evaluate(
+        "tool", {"other": "x", "message": "card 4111111111111111"}, "srv", policy
+    )
+    assert decision.blocked
+    assert decision.rule == "denied_param"
+    assert decision.dlp_detector is None
+
+
+async def test_dlp_custom_pattern_wired_through_evaluate():
+    policy = ServerPolicy(
+        mode="passthrough",
+        dlp_custom_patterns=[DlpCustomPattern(name="employee_id", pattern=r"EMP-\d{6}", action="block")],
+    )
+    decision = await evaluate("tool", {"note": "assigned EMP-123456"}, "srv", policy)
+    assert decision.blocked
+    assert decision.dlp_detector == "employee_id"
+
+
+async def test_finditer_spans_with_timeout_recovers_real_match_spans():
+    """The DLP custom-pattern span-recovery primitive (argus/dlp.py's
+    _scan_value_with_custom_pattern) — a well-behaved pattern returns every match's
+    (start, end) span, not just a matched/not-matched bool."""
+    import re
+
+    compiled = re.compile(r"\d+")
+    spans = await _finditer_spans_with_timeout(compiled, "a1 b22 c333")
+    assert spans == [(1, 2), (4, 6), (8, 11)]
+
+
+async def test_finditer_spans_with_timeout_fails_closed_on_pathological_pattern():
+    """Security-critical: the ENTIRE finditer() call (not just a single search()) must be
+    bounded. A pattern that resolves its FIRST match quickly is not guaranteed to resolve
+    later matches equally quickly — finditer restarts matching from each match's end, which is
+    exactly the kind of position-dependent backtracking a ReDoS pattern exploits. This is the
+    gap a naive 'search() once, then trust finditer()' design would leave open; this test
+    proves the fix bounds finditer itself, returning None (UNDETERMINED) rather than hanging."""
+    import re
+    import time
+
+    evil = re.compile(r"(a+)+$")
+    evil_input = "a" * 30 + "!"
+
+    start = time.monotonic()
+    spans = await _finditer_spans_with_timeout(evil, evil_input)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0
+    assert spans is None
+
+
+async def test_dlp_custom_pattern_redos_fails_closed_through_evaluate():
+    """End-to-end confirmation that a pathological custom DLP pattern set through ServerPolicy
+    and reaching evaluate() still fails closed within a bounded time, exactly matching F2's
+    block_pattern precedent."""
+    import time
+
+    policy = ServerPolicy(
+        mode="passthrough",
+        dlp_custom_patterns=[DlpCustomPattern(name="evil", pattern=r"(a+)+$", action="block")],
+    )
+    evil_input = "a" * 30 + "!"
+
+    start = time.monotonic()
+    decision = await evaluate("tool", {"value": evil_input}, "srv", policy)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0
+    assert decision.blocked
+    assert decision.dlp_detector == "evil"

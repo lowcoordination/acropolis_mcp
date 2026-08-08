@@ -181,6 +181,13 @@ class WebhookDispatcher:
                     "matched": event.get("matched"),
                     "reason": event.get("reason"),
                     "count": count,
+                    # Enterprise #10 (DLP): the detector NAME is safe to send (operator-facing
+                    # metadata, same trust level as `rule`) — the matched/redacted VALUE never
+                    # is. `event.get("matched")` above is None on a DLP-driven block (see
+                    # argus/policy.py's Decision — DLP never populates `matched`), so this key
+                    # is the only DLP-specific field this payload ever carries, mirroring the
+                    # existing deliberate exclusion of args_summary from webhook payloads.
+                    "dlp_detector": event.get("dlp_detector"),
                 },
             )
         finally:

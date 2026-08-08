@@ -38,12 +38,41 @@ export interface ParamRule {
 
 export type PolicyMode = 'passthrough' | 'allowlist' | 'denylist'
 
+// Enterprise #10 (DLP). Keep in sync with argus/dlp.py's BUILTIN_DETECTORS and
+// db/models.py's _VALID_DLP_DETECTOR_NAMES.
+export type DlpDetectorName =
+  | 'credit_card'
+  | 'email'
+  | 'us_ssn'
+  | 'aws_access_key'
+  | 'private_key_pem'
+  | 'high_entropy_string'
+
+export type DlpAction = 'allow' | 'redact' | 'block'
+
+export const DLP_DETECTORS: { name: DlpDetectorName; label: string }[] = [
+  { name: 'credit_card', label: 'Credit card number (Luhn-validated)' },
+  { name: 'email', label: 'Email address' },
+  { name: 'us_ssn', label: 'US Social Security Number' },
+  { name: 'aws_access_key', label: 'AWS access key ID' },
+  { name: 'private_key_pem', label: 'PEM private key header' },
+  { name: 'high_entropy_string', label: 'Generic high-entropy string (likely a secret)' },
+]
+
+export interface DlpCustomPattern {
+  name: string
+  pattern: string
+  action: DlpAction
+}
+
 export interface PolicyResponse {
   mode: PolicyMode
   rate_limit: string | null
   allowed: string[]
   denied: string[]
   param_rules: Record<string, Record<string, ParamRule>>
+  dlp_detectors: Record<string, DlpAction>
+  dlp_custom_patterns: DlpCustomPattern[]
 }
 
 export interface KeyResponse {
@@ -116,6 +145,9 @@ export interface AuditEvent {
   bridged: boolean
   status_code: number | null
   latency_ms: number | null
+  dlp_detector: string | null
+  dlp_action: DlpAction | null
+  dlp_match_count: number | null
 }
 
 export interface SetupStatusResponse {
