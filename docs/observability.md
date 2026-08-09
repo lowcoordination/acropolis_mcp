@@ -116,6 +116,16 @@ secret **value** in a tool argument and a memorable fake **resolved credential**
 exported span serialized (name, attributes, event bodies, status description — not just the
 attribute dict) and swept for both canary strings. Neither appears anywhere.
 
+That file also covers the specific worry a security-scan pass on this feature would raise:
+`span()`'s generic `except Exception: record_exception(...)` clause fires for ANY exception that
+propagates through a `with span:` block, not just the success-path attribute-setting the other
+canary tests exercise. `TestExceptionPathNeverLeaksThroughRecordedSpanException` forces a real
+`SecretResolutionError` to propagate through the `secrets.resolve` span (a genuine credential
+resolution failure, not a mock) and proves the recorded exception is still canary-free — provable
+by construction, since `SecretResolutionError`'s message is built only from the reference string
+and a static reason (see `archon/secrets/__init__.py`), never a resolved plaintext, but verified
+empirically here rather than left as a code-review claim.
+
 ## `traceparent`/`tracestate` propagation: a deliberate header-policy change
 
 `argus/headers.py` exists because header forwarding was a hardened surface (see that file's

@@ -194,3 +194,87 @@ class TestCredentialCanaryNeverInSpans:
         # The (non-secret) reference string itself is fine to appear nowhere in particular here
         # (this code path doesn't put it in any span attribute) — no assertion either way; the
         # only load-bearing claims are the two negatives above.
+
+
+class _CanaryFailingSecretProvider:
+    """Fails to resolve, but — like a real SecretResolutionError — embeds the CANARY reference
+    string (never a resolved value; there IS no resolved value on a failure) in its exception
+    message, the same shape archon/secrets/*.py's real providers use. Exists to exercise the
+    security-scan's specific worry: argus/tracing.py's span() context manager has a generic
+    `except Exception as exc: wrapped.record_exception(exc)` clause that fires for ANY exception
+    propagating through a `with span:` block, including genuine failures, not just the
+    success-path attribute-setting this file's other tests cover. This test proves that even a
+    REAL exception recorded onto the secrets.resolve span — not a mocked no-op — never carries
+    anything beyond the safe-by-construction reference+reason shape
+    SecretResolutionError guarantees (see archon/secrets/__init__.py's own docstring on this)."""
+
+    async def resolve(self, ref: str) -> str:
+        from archon.secrets import SecretResolutionError
+
+        raise SecretResolutionError(ref, "simulated Vault outage for the security-scan test")
+
+    async def store(self, ref: str, value: str) -> str:
+        raise NotImplementedError
+
+    async def delete(self, ref: str) -> None:
+        raise NotImplementedError
+
+
+class TestExceptionPathNeverLeaksThroughRecordedSpanException:
+    async def test_secret_resolution_failure_records_safe_exception_only(self, tmp_path, upstream):
+        """The secrets.resolve span's `with` block genuinely raises (SecretResolutionError
+        propagates out of Pipeline._resolve_credential's inner `with self._tracing.span(...)`
+        before being caught by the OUTER try/except that builds the 502 response — see that
+        method's docstring on why the raise is structured that way) — so
+        TracingManager.span()'s generic exception-recording path is exercised for real here, not
+        just success-path attribute-setting. The recorded exception must still be
+        canary-and-secret-free: SecretResolutionError's message is built only from the
+        reference string and a static reason, never a resolved plaintext (there IS no resolved
+        plaintext on a failure), so this is provable by construction — this test is the
+        empirical check, not just a code-review claim."""
+        settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
+        db = Database(tmp_path)
+        await db.connect()
+        server_repo = ServerRepo(db)
+        await server_repo.create(
+            slug="failing-canary-server", name="Failing Canary", upstream_url=f"{upstream.url}/mcp",
+            upstream_auth_header=CREDENTIAL_REF,
+        )
+
+        app = create_app(settings, db)
+        exporter = InMemorySpanExporter()
+        manager = TracingManager(enabled=True, sample_ratio=1.0)
+        manager.init(exporter=exporter)
+        app.state.pipeline._tracing = manager
+        app.state.bridge._tracing = manager
+        app.state.pipeline._secrets = _CanaryFailingSecretProvider()
+
+        transport = httpx.ASGITransport(app=app)
+        headers = {
+            "Content-Type": "application/json", "Accept": "application/json",
+            "Mcp-Method": "tools/call", "Mcp-Name": "echo",
+        }
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"message": "hi"}},
+        }
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
+                resp = await client.post("/mcp/failing-canary-server", json=body, headers=headers)
+        await db.close()
+
+        # Sanity: the failure path actually ran (502, not a successful call) and a
+        # secrets.resolve span genuinely recorded an exception — otherwise this test would prove
+        # nothing.
+        assert resp.status_code == 502
+        names = [s.name for s in exporter.get_finished_spans()]
+        assert "secrets.resolve" in names
+        resolve_span = next(s for s in exporter.get_finished_spans() if s.name == "secrets.resolve")
+        assert len(resolve_span.events) >= 1, "expected the failure to record an exception event"
+
+        blob = _serialize_all_spans(exporter)
+        assert CREDENTIAL_CANARY not in blob, "a resolved-credential-shaped string leaked via a recorded exception"
+        # The reference string and the static reason ARE expected to appear in the recorded
+        # exception message — that's the safe, by-construction part SecretResolutionError
+        # guarantees; only a resolved plaintext (which never existed here) would be unsafe.
+        assert "simulated Vault outage" in blob or CREDENTIAL_REF in blob
