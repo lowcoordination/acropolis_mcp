@@ -20,7 +20,7 @@ Non-negotiables (see that plan; restated here because this module is where they'
    dlp_detector, dlp_action, bridged flag, HTTP status code). This module does not attempt to
    scrub attribute values; the discipline is enforced at each call site in pipeline.py, exactly
    like `args_summary`'s redaction is enforced by the callers of `AuditLogger.log`, not by
-   AuditLogger itself. The canary test (tests/unit/test_tracing_secrecy.py) is the actual proof.
+   AuditLogger itself. The canary test (tests/integration/test_otel_secrecy.py) is the actual proof.
 4. **Parent-based sampling**, ratio from `ACROPOLIS_OTEL_SAMPLE_RATIO` (default 1.0). A client
    that already sampled its own trace out (a `traceparent` with the sampled flag clear) is never
    force-sampled back in here — `ParentBased(TraceIdRatioBased(ratio))` is exactly this policy:
@@ -121,7 +121,7 @@ class TracingManager:
     def init(self, exporter: Any = None) -> None:
         """`exporter`, if given, is used in place of the standard-env-var-configured
         OTLPSpanExporter — this is purely a test seam (see
-        tests/unit/test_tracing_span_shape.py and test_tracing_secrecy.py, which pass an
+        tests/integration/test_otel_span_shape.py and test_otel_secrecy.py, which pass an
         `InMemorySpanExporter` so assertions can inspect exported spans directly instead of
         standing up a real collector). app.py's real call site never passes this; production
         always gets the standard OTLP/HTTP exporter described in module decision #6."""

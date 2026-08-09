@@ -1130,9 +1130,9 @@ def build_control_plane_router(
     # returns None), so this endpoint always exists; it just always reports
     # enabled=False/active=False on a deployment that never set ACROPOLIS_OTEL_ENABLED. A test
     # or other caller that constructs this router without passing `tracing` at all gets the same
-    # "disabled" answer via the `or _DisabledTracingManager()` fallback, matching every other
-    # optional-dependency default in this router (secret_provider, pipeline, etc.).
-    _tracing_status = tracing or TracingManager(enabled=False)
+    # "disabled" answer via this fallback, matching every other optional-dependency default in
+    # this router (secret_provider, pipeline, etc.).
+    _tracing_status = tracing or TracingManager(enabled=False)  # inert: never .init()'d, .active stays False
 
     @router.get("/tracing/status", response_model=TracingStatusResponse, dependencies=[Depends(require_role("viewer"))])
     async def get_tracing_status():
