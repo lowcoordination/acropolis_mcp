@@ -90,6 +90,20 @@ quota-exceeded call — proved with the same fixture call-counter pattern
 `tests/integration/test_dlp_redaction.py`'s block tests use (a real FastMCP server whose tool
 handler increments a counter only when actually invoked).
 
+**Known, accepted limitation (found during this feature's own security-scan pass, not fixed):**
+the quota check (read `total_since`) and the usage write (`_record_usage`) are two separate
+steps with the actual upstream call in between — a classic check-then-act race. A burst of `N`
+truly concurrent requests against a key with less than `N` calls of remaining budget can all
+read the same "still under budget" total before any of them writes back, and all `N` get
+forwarded — a real overshoot past the configured limit under concurrency, not just a
+theoretical one. This is accepted, not engineered around with an atomic check-and-increment SQL
+statement, because it's consistent with the fail-open design one section down: quota is a soft
+budget control, and forwarding some calls over budget under a burst is the same order of
+"business cost, not security exposure" as the fail-open case is. Contrast this with
+`argus/rate_limiter.py`'s token bucket, which genuinely IS atomic per-check (an `asyncio.Lock`
+guards each bucket's consume) — a rate limiter's entire job is bounding bursts, so an
+un-atomic check there would defeat the feature's own purpose in a way that doesn't apply here.
+
 ## Fail-open, deliberately — and why this differs from secret-resolution's fail-closed default
 
 **If the quota check itself fails — a `gateway.db` read error, a corrupted row, anything short
@@ -145,23 +159,35 @@ TestThresholdWebhook::test_concurrent_burst_crossing_threshold_fires_webhook_exa
 it under genuine concurrency (see that test's docstring for why a naive `asyncio.gather` over
 real DB reads can accidentally mask this race, and how the test avoids that).
 
-## Who can see what: `GET /api/v1/usage` and viewer-role access
+## Who can see what: `GET /api/v1/usage` and role scoping
 
-`/api/v1/usage` is `viewer`-role accessible, the same floor `/audit` already uses. This is a
-deliberate consistency call, not an oversight: `/audit` is already queryable by `api_key_id` and
-returns per-key traffic (`server_slug`, `tool`, `decision`, timestamps) to anyone with viewer
-role. `/usage` returns strictly less information about any given key than `/audit` already does
-— a pre-aggregated call count per key/server/tool/period, with no argument content, no client
-IP, no per-request detail. A viewer who could already reconstruct "how much did key X call
-server Y" by paging through `/audit` gains no new capability from `/usage` beyond convenience.
-If a future deployment wants finer-grained separation between "can see aggregate volume" and
-"can see which specific keys exist and how much they're used," that's a real gap worth a
-dedicated design (a `usage:aggregate-only` scope, for instance) — but it would be a *new*
-restriction relative to today's `/audit` behavior, not a regression this feature introduces.
+`/api/v1/usage` is `viewer`-role accessible for the call-count data itself, the same floor
+`/audit` already uses — `/audit` is already queryable by `api_key_id` and returns per-key
+traffic (`server_slug`, `tool`, `decision`, timestamps) to anyone with viewer role, and
+`/usage`'s pre-aggregated call count per key/server/tool/period is a strict subset of that: no
+argument content, no client IP, no per-request detail.
 
-Key material itself is never exposed by `/usage`: rows carry `api_key_id`/`key_prefix` for
-display, never the hash or plaintext, same discipline as every other key-facing surface in this
-codebase (`archon/schemas.py`'s `KeyResponse`, the webhook payload above).
+**`key_prefix` is admin-only, not viewer-visible — this was a real finding from this feature's
+own self security-scan pass, not a design that was right from the start.** The first version of
+this route populated `key_prefix` (the human-identifiable, `acropolis_xxxxxx`-shaped label
+shown on the Keys page) for every caller regardless of role. That is a genuine, new leak:
+`/audit`'s `AuditEventResponse.api_key_id` is a bare integer — it never carries the prefix — and
+`GET /keys` (the endpoint that DOES return `key_prefix`) is `admin`-only, not viewer-accessible.
+A viewer calling the original `/usage` could therefore learn a piece of key metadata that
+neither existing surface they have access to would ever hand them. Fixed by gating
+`key_prefix` specifically on `principal.role == "admin"` in the route handler: a viewer or
+operator still gets the numeric `api_key_id` and the call count (exactly what `/audit` already
+shows them) with `key_prefix: null`; only an admin — who can already see prefixes via `GET
+/keys` — sees it here too. `tests/integration/test_quotas.py::TestUsageKeyPrefixSecrecy` proves
+this for both viewer and operator roles, and that admin's own visibility is unchanged.
+
+`server_slug` is not similarly gated — servers are already fully visible to a viewer via `GET
+/servers`, so there is no analogous leak on that side to close.
+
+Key material itself is never exposed by `/usage` regardless of role: rows carry `api_key_id`
+(and, admin-only, `key_prefix`) for display, never the hash or plaintext, same discipline as
+every other key-facing surface in this codebase (`archon/schemas.py`'s `KeyResponse`, the
+webhook payload above).
 
 ## Admin audit trail
 
@@ -182,6 +208,17 @@ boundary this feature has — create a key with a quota, read it back via `GET /
 patch it, read it back again — which `tests/integration/test_quotas.py::
 TestQuotaFieldsSurviveKeyReadWriteRoundTrip` covers directly against both the API and the repo
 layer.
+
+## Input validation on `quota_calls`
+
+`quota_calls` is capped at 1,000,000,000 by `archon/schemas.py`'s validator — generously above
+any real quota an operator would configure, but a real bound. This closed a self-security-scan
+finding: Pydantic's bare `int` type has no upper bound, while SQLite's `INTEGER` column is a
+64-bit signed value, so an arbitrary-precision `quota_calls` used to pass request validation
+and then raise an unhandled `OverflowError` at the database layer — caught by the app's global
+exception handler (so never a crash or an information leak, just an unnecessary 500 where a
+clean 422 belongs). Fixed at the Pydantic layer, on both `POST /api/v1/keys` and
+`PATCH /api/v1/keys/{id}/quota`.
 
 ## What this deliberately does not do
 

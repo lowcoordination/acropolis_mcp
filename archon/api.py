@@ -955,12 +955,22 @@ def build_control_plane_router(
         async def get_usage(
             api_key_id: Optional[int] = None, server_slug: Optional[str] = None,
             tool: Optional[str] = None, period: str = "day",
+            principal: Principal = Depends(require_role("viewer")),
         ):
             """Enterprise #11. viewer+ (read-only, consistent with how /audit is already scoped
-            — a viewer can already see per-key traffic there, including api_key_id and tool on
-            every row; this route surfaces the SAME attribution as a pre-aggregated total, so it
-            grants no new visibility a viewer didn't already have via /audit). See docs/quotas.md
-            for the full "does this leak anything across keys" reasoning.
+            — a viewer can already see per-key traffic there, including numeric api_key_id and
+            tool on every row; this route's CALL-COUNT data is the same order of visibility.
+
+            SECURITY (self-review finding, fixed here — see docs/quotas.md's "who can see what"
+            section for the full writeup): `key_prefix` is a piece of key metadata `/audit`
+            does NOT expose to a viewer (that response carries only the bare numeric
+            api_key_id — see AuditEventResponse) and GET /keys, which DOES expose it, is
+            admin-only. A first pass at this route populated key_prefix for every caller,
+            which would have handed a viewer something they could not get from either existing
+            surface — a real, new capability, not a re-exposure of something already visible.
+            Fixed by gating key_prefix on admin role specifically; a viewer/operator still gets
+            the numeric api_key_id and the call count (exactly what /audit already shows them),
+            just not the human-identifiable prefix.
 
             `period` selects how far back to sum: "day" (since UTC midnight today), "month"
             (since the 1st of the current UTC month), or "all" (every stored bucket — hourly
@@ -1010,7 +1020,14 @@ def build_control_plane_router(
             # and server_repo already expose a single list() call each (the same one GET /keys
             # and GET /servers use) — two bulk reads regardless of how many distinct keys/servers
             # appear in `totals`, rather than scaling with the size of the result set.
-            key_prefixes = {k.id: k.key_prefix for k in await api_keys.list()}
+            #
+            # Security fix (see this route's docstring): key_prefix is admin-only. server_slug
+            # stays available to every role — servers are already fully visible to a viewer via
+            # GET /servers, so there is no analogous leak on that side.
+            key_prefixes = (
+                {k.id: k.key_prefix for k in await api_keys.list()}
+                if principal.role == "admin" else {}
+            )
             server_slugs = {s.id: s.slug for s in await server_repo.list()}
 
             buckets = [

@@ -141,6 +141,37 @@ class TestQuotaExceeded:
         assert rows[0]["rule"] == "quota"
         assert rows[0]["decision"] == "BLOCKED"
 
+    async def test_concurrent_burst_can_overshoot_quota_a_bounded_amount(self, quota_app, upstream):
+        """Documents (does not "fix" — see argus/pipeline.py's _check_quota docstring and
+        docs/quotas.md's accepted-limitation writeup) the check-then-act race between
+        _check_quota's read and _record_usage's write: a burst of concurrent requests against a
+        key with less remaining budget than the burst size can all read "still under budget"
+        before any of them writes back, so more than quota_calls calls can be forwarded.
+
+        The claim under test is narrower than "no race exists" — it's that the overshoot is
+        BOUNDED by the burst size, not unlimited: a 20-call burst against quota_calls=5 lets
+        AT MOST 20 calls through (never more than were actually sent), and strictly more than 5
+        get through (proving the race is real, not accidentally already serialized away)."""
+        app, db, admin_client, transport, slug = quota_app
+        created = await _mint_key(admin_client, "burst-race", quota_calls=5, quota_period="day")
+        key = created["plaintext"]
+
+        responses = await asyncio.gather(*[
+            _call_tool(transport, key, slug, "echo", req_id=i) for i in range(20)
+        ])
+        allowed = sum(1 for r in responses if r.status_code == 200)
+
+        # The upstream call counter is the ground truth for "how many calls actually got
+        # forwarded" — the same fixture-counter proof this file's other quota-exceeded tests
+        # use, not an inference from status codes alone.
+        assert upstream.call_counter.get("echo") == allowed
+        assert allowed >= 5  # at least the configured budget gets through, always
+        assert allowed <= 20  # bounded by the burst size — never more calls than were sent
+        # The interesting, honest claim: under a real concurrent burst, more than the
+        # configured 5 typically get through. This is the race the docs describe, demonstrated
+        # rather than merely asserted. (Not pinned to an exact number — the precise overshoot
+        # depends on scheduling and would make this test flaky if asserted exactly.)
+
 
 # ---------------------------------------------------------------------------
 # Rollup accuracy: rollup counts must exactly match audit rows for the same window, and must
@@ -602,6 +633,28 @@ class TestQuotaConfigAdminEvent:
         )
         assert resp.status_code == 422
 
+    async def test_absurdly_large_quota_calls_is_rejected_with_422_not_500(self, quota_app):
+        """Security-scan finding: SQLite's INTEGER column is 64-bit, but Pydantic's bare `int`
+        type has no upper bound — an arbitrary-precision quota_calls used to pass model
+        validation, reach the DB layer, and raise an unhandled OverflowError there (caught by
+        the app's global exception handler, so never a crash or a leak, just an ugly 500 where
+        a clean 422 belongs). Proves both the create path and the PATCH .../quota path reject
+        it cleanly now."""
+        app, db, admin_client, transport, slug = quota_app
+
+        create_resp = await admin_client.post(
+            "/api/v1/keys",
+            json={"name": "huge-quota", "quota_calls": 99999999999999999999999999, "quota_period": "day"},
+        )
+        assert create_resp.status_code == 422
+
+        created = await _mint_key(admin_client, "patch-huge-quota")
+        patch_resp = await admin_client.patch(
+            f"/api/v1/keys/{created['id']}/quota",
+            json={"quota_calls": 99999999999999999999999999, "quota_period": "day"},
+        )
+        assert patch_resp.status_code == 422
+
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/usage — queryable by key, server, tool, and period; viewer-role accessible
@@ -645,10 +698,11 @@ class TestUsageQueryEndpoint:
         assert all(b["tool"] == "echo" for b in buckets)
 
     async def test_usage_endpoint_is_viewer_accessible_not_admin_only(self, quota_app):
-        """/audit is already viewer-scoped and exposes api_key_id per row — /usage grants no
-        NEW visibility beyond that (it's the same attribution, pre-aggregated), so it's scoped
-        the same way, consistent with the existing precedent this codebase set for read-only
-        traffic-attribution data. See docs/quotas.md for the full reasoning."""
+        """/audit is already viewer-scoped and exposes the bare numeric api_key_id per row —
+        /usage's call-count data is the same order of visibility, so the route itself is
+        viewer-accessible. See TestUsageKeyPrefixSecrecy below for the finer-grained claim
+        (key_prefix specifically is NOT included at this role) — this test is just "the route
+        doesn't 403 a viewer.\""""
         app, db, admin_client, transport, slug = quota_app
         resp = await admin_client.post(
             "/api/v1/users", json={"username": "vwr", "password": "password-12345", "role": "viewer"}
@@ -667,6 +721,92 @@ class TestUsageQueryEndpoint:
         app, db, admin_client, transport, slug = quota_app
         resp = await admin_client.get("/api/v1/usage", params={"period": "fortnight"})
         assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Security-scan finding: /usage must not hand a viewer/operator a piece of key metadata
+# (key_prefix) that neither /audit (bare numeric api_key_id only) nor GET /keys (admin-only)
+# already exposes to them. Caught during the self security-scan pass, fixed in the same PR.
+# ---------------------------------------------------------------------------
+
+class TestUsageKeyPrefixSecrecy:
+    async def test_viewer_sees_api_key_id_but_not_key_prefix(self, quota_app):
+        app, db, admin_client, transport, slug = quota_app
+        created = await _mint_key(admin_client, "prefix-secret-key")
+        key = created["plaintext"]
+        await _call_tool(transport, key, slug, "echo", req_id=1)
+        await asyncio.sleep(0.3)
+
+        resp = await admin_client.post(
+            "/api/v1/users", json={"username": "vwr2", "password": "password-12345", "role": "viewer"}
+        )
+        assert resp.status_code == 201
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as viewer_client:
+            login = await viewer_client.post(
+                "/api/v1/login", json={"username": "vwr2", "admin_password": "password-12345"}
+            )
+            assert login.status_code == 200
+            resp = await viewer_client.get(
+                "/api/v1/usage", params={"api_key_id": created["id"], "period": "all"}
+            )
+            assert resp.status_code == 200
+            buckets = resp.json()["buckets"]
+            assert len(buckets) >= 1
+            matching = [b for b in buckets if b["api_key_id"] == created["id"]]
+            assert len(matching) == 1
+            # The claim under test: api_key_id (the SAME thing /audit already shows a viewer)
+            # is present, but key_prefix — which only GET /keys (admin-only) exposes — is not.
+            assert matching[0]["key_prefix"] is None
+            # Also assert the raw serialized response text never contains the prefix string,
+            # not just the specific field — the same "serialize the whole row" discipline
+            # test_dlp_redaction.py's secrecy tests use, so a leak via a different key in the
+            # payload shape can't slip past a narrower field-only assertion.
+            assert created["key_prefix"] not in resp.text
+
+    async def test_operator_also_does_not_see_key_prefix(self, quota_app):
+        """key_prefix is admin-only, not merely 'above viewer' — operator must be excluded too,
+        matching how GET /keys itself requires admin (not operator)."""
+        app, db, admin_client, transport, slug = quota_app
+        created = await _mint_key(admin_client, "operator-blind-key")
+        key = created["plaintext"]
+        await _call_tool(transport, key, slug, "echo", req_id=1)
+        await asyncio.sleep(0.3)
+
+        resp = await admin_client.post(
+            "/api/v1/users", json={"username": "op2", "password": "password-12345", "role": "operator"}
+        )
+        assert resp.status_code == 201
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as op_client:
+            login = await op_client.post(
+                "/api/v1/login", json={"username": "op2", "admin_password": "password-12345"}
+            )
+            assert login.status_code == 200
+            resp = await op_client.get(
+                "/api/v1/usage", params={"api_key_id": created["id"], "period": "all"}
+            )
+            assert resp.status_code == 200
+            matching = [b for b in resp.json()["buckets"] if b["api_key_id"] == created["id"]]
+            assert len(matching) == 1
+            assert matching[0]["key_prefix"] is None
+
+    async def test_admin_still_sees_key_prefix(self, quota_app):
+        """The fix must not regress admin's own visibility — an admin can already see
+        key_prefix via GET /keys, so seeing it on /usage too is not a new exposure for them."""
+        app, db, admin_client, transport, slug = quota_app
+        created = await _mint_key(admin_client, "admin-visible-key")
+        key = created["plaintext"]
+        await _call_tool(transport, key, slug, "echo", req_id=1)
+        await asyncio.sleep(0.3)
+
+        resp = await admin_client.get(
+            "/api/v1/usage", params={"api_key_id": created["id"], "period": "all"}
+        )
+        assert resp.status_code == 200
+        matching = [b for b in resp.json()["buckets"] if b["api_key_id"] == created["id"]]
+        assert len(matching) == 1
+        assert matching[0]["key_prefix"] == created["key_prefix"]
 
 
 # ---------------------------------------------------------------------------

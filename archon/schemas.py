@@ -231,6 +231,16 @@ class ToolTestResponse(BaseModel):
     upstream_response: Optional[dict] = None
 
 
+# Security-scan finding: SQLite's INTEGER column is a 64-bit signed value; a quota_calls sent
+# as an arbitrary-precision Python int (Pydantic's bare `int` type has no upper bound) would
+# pass model validation, reach ApiKeyRepo.create/set_quota, and raise an unhandled
+# OverflowError on the INSERT/UPDATE — caught by the app's global exception handler (so this
+# was never a crash or an information leak, just an ugly 500 where a clean 422 belongs). This
+# cap is deliberately generous — orders of magnitude above any real quota an operator would
+# configure — while still comfortably inside SQLite's 64-bit range with room to spare.
+_MAX_QUOTA_CALLS = 1_000_000_000
+
+
 def _validate_quota_pairing(quota_calls: Optional[int], quota_period: Optional[str]) -> None:
     """Shared by KeyCreateRequest and KeyQuotaUpdateRequest (self-review fix: this validation
     was duplicated near-verbatim across both models — a single source avoids the two drifting
@@ -242,6 +252,8 @@ def _validate_quota_pairing(quota_calls: Optional[int], quota_period: Optional[s
         raise ValueError("quota_calls and quota_period must be set together, or both omitted")
     if quota_calls is not None and quota_calls <= 0:
         raise ValueError("quota_calls must be a positive integer")
+    if quota_calls is not None and quota_calls > _MAX_QUOTA_CALLS:
+        raise ValueError(f"quota_calls must not exceed {_MAX_QUOTA_CALLS}")
     if quota_period is not None and quota_period not in ("day", "month"):
         raise ValueError("quota_period must be 'day' or 'month'")
 

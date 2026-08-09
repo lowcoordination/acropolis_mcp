@@ -681,6 +681,21 @@ class Pipeline:
         configured, or if the quota check ITSELF fails (a DB error reading total_since), the
         call proceeds exactly as if no quota existed. The only way this method blocks a call is
         a clean, successful read that shows the caller genuinely over budget.
+
+        SECURITY-SCAN NOTE (accepted, not fixed): the read here (total_since) and the write in
+        _record_usage happen in two separate steps with the actual upstream forward in between
+        — a classic TOCTOU window. A burst of N concurrent requests against a key with
+        remaining_budget < N can all read the SAME "still under budget" total before any of
+        them increments, and all N get forwarded — a real overshoot past the configured limit
+        under concurrency, not merely a theoretical one. This is accepted rather than
+        engineered around (e.g. with a single atomic check-and-increment SQL statement) because
+        it is consistent with, not a violation of, this feature's own documented threat model:
+        quota is a soft budget control, and the fail-open rationale above already establishes
+        that forwarding some calls over budget is a business cost, not a security exposure.
+        RateLimiterRegistry's token bucket, by contrast, IS atomic per-check (see
+        rate_limiter.py's asyncio.Lock) because bursts are exactly the failure mode a rate
+        limiter exists to prevent — the two features have different jobs and different
+        correctness requirements as a result. Worth being explicit about rather than silent.
         """
         if self._usage is None or api_key_id is None:
             return None
@@ -731,6 +746,16 @@ class Pipeline:
         """
         if self._webhooks is None or key.quota_calls is None:
             return
+        # Security-scan check (division-by-zero on key.quota_calls): the only caller of this
+        # method is _check_quota's `if used < key.quota_calls: await
+        # self._maybe_fire_quota_webhook(...)` branch — if quota_calls were ever <= 0, that
+        # condition could only be true for a negative `used`, which total_since's
+        # COALESCE(SUM(calls), 0) can never produce. So this method is unreachable whenever
+        # quota_calls <= 0, and the division below is safe by that construction, not by luck.
+        # archon/schemas.py's _validate_quota_pairing is the actual enforcement point (rejects
+        # quota_calls <= 0 at the API boundary) — this comment documents why a hypothetical
+        # bypass of that layer (a direct ApiKeyRepo.create/set_quota call, which has no such
+        # guard) still wouldn't crash here, not a claim that this method re-validates anything.
         prior_pct = ((projected_used - 1) / key.quota_calls) * 100
         new_pct = (projected_used / key.quota_calls) * 100
         for threshold in (100, 80):
