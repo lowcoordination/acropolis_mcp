@@ -12,6 +12,7 @@ regardless, and the PR description for which of the two ran in the environment t
 """
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from archon.secrets import SecretResolutionError
@@ -141,6 +142,90 @@ async def test_outage_produces_error_never_a_returned_value():
         assert "could not reach vault" in str(exc_info.value).lower()
     finally:
         await dead_provider.aclose()
+
+
+async def _enable_approle_and_get_credentials(vault, role_name: str = "acropolis-test") -> tuple[str, str]:
+    """AppRole is a nice-to-have per the plan, not a hard requirement — but since it's
+    implemented, it gets real coverage against the same disposable dev server as everything
+    else here, not left completely untested. Enables the approle auth method and a role via raw
+    HTTP (mirroring what an operator would do with `vault auth enable approle` /
+    `vault write auth/approle/role/...`), then returns (role_id, secret_id) for
+    OpenBaoSecretProvider's AppRole login path to consume."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        headers = {"X-Vault-Token": vault.token}
+        resp = await client.post(f"{vault.url}/v1/sys/auth/approle", headers=headers, json={"type": "approle"})
+        assert resp.status_code in (200, 204), resp.text
+
+        # A real policy granting read on the KV path under test — Vault's built-in "default"
+        # policy alone does not grant access to arbitrary secret/ paths, so a role using only
+        # "default" would 403 on every read regardless of whether AppRole auth itself worked,
+        # making the test meaningless. This is the realistic operational step ("policy" here is
+        # a bit of Vault plumbing unrelated to Acropolis's own ServerPolicy), not something an
+        # Acropolis operator would skip in practice.
+        policy_hcl = 'path "secret/data/acropolis/*" { capabilities = ["read"] }'
+        resp = await client.put(
+            f"{vault.url}/v1/sys/policies/acl/acropolis-test-read", headers=headers,
+            json={"policy": policy_hcl},
+        )
+        assert resp.status_code in (200, 204), resp.text
+
+        resp = await client.post(
+            f"{vault.url}/v1/auth/approle/role/{role_name}", headers=headers,
+            json={"token_policies": "acropolis-test-read"},
+        )
+        assert resp.status_code in (200, 204), resp.text
+
+        resp = await client.get(f"{vault.url}/v1/auth/approle/role/{role_name}/role-id", headers=headers)
+        assert resp.status_code == 200, resp.text
+        role_id = resp.json()["data"]["role_id"]
+
+        resp = await client.post(f"{vault.url}/v1/auth/approle/role/{role_name}/secret-id", headers=headers)
+        assert resp.status_code == 200, resp.text
+        secret_id = resp.json()["data"]["secret_id"]
+
+    return role_id, secret_id
+
+
+@pytest.mark.asyncio
+async def test_approle_auth_resolves_against_real_dev_server():
+    async with run_dev_server() as vault:
+        role_id, secret_id = await _enable_approle_and_get_credentials(vault)
+
+        provider = OpenBaoSecretProvider(
+            base_url=vault.url, role_id=role_id, secret_id=secret_id, ttl_seconds=60.0,
+        )
+        try:
+            # Seed the secret using the root-token provider (AppRole's default policy has no
+            # write access) — the AppRole-authenticated provider only needs to READ it, which
+            # is the realistic division of privilege between "who provisions a secret" and "who
+            # an application authenticates as to read it."
+            seed_provider = OpenBaoSecretProvider(base_url=vault.url, token=vault.token, ttl_seconds=60.0)
+            try:
+                await seed_provider.store("vault://secret/acropolis/approle-test#token", "Bearer via-approle")
+            finally:
+                await seed_provider.aclose()
+
+            resolved = await provider.resolve("vault://secret/acropolis/approle-test#token")
+            assert resolved == "Bearer via-approle"
+        finally:
+            await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_approle_bad_credentials_fail_cleanly():
+    async with run_dev_server() as vault:
+        await _enable_approle_and_get_credentials(vault)  # enables the auth method, ignore the real creds
+
+        provider = OpenBaoSecretProvider(
+            base_url=vault.url, role_id="not-a-real-role-id", secret_id="not-a-real-secret-id",
+            ttl_seconds=60.0,
+        )
+        try:
+            with pytest.raises(SecretResolutionError) as exc_info:
+                await provider.resolve("vault://secret/acropolis/whatever#token")
+            assert "approle login" in str(exc_info.value).lower()
+        finally:
+            await provider.aclose()
 
 
 @pytest.mark.asyncio

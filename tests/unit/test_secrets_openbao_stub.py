@@ -168,3 +168,25 @@ def test_parse_vault_ref_rejects_malformed_strings():
     assert ref.path == "acropolis/svc"
     assert ref.key == "token"
     assert str(ref) == "vault://secret/acropolis/svc#token"
+
+
+def test_parse_vault_ref_rejects_path_traversal_segments():
+    """Defense in depth: a '..' or '.' path segment could otherwise let the request URL escape
+    the intended mount's data/ namespace after server-side normalisation (see parse_vault_ref's
+    own comment). Setting a reference already requires the admin role, so this isn't a
+    privilege-escalation fix, but it should still be rejected outright."""
+    from archon.secrets.openbao import VaultRefError, parse_vault_ref
+
+    with pytest.raises(VaultRefError):
+        parse_vault_ref("vault://secret/../sys/mounts#key")
+    with pytest.raises(VaultRefError):
+        parse_vault_ref("vault://secret/acropolis/../../sys#key")
+    with pytest.raises(VaultRefError):
+        parse_vault_ref("vault://secret/./acropolis#key")
+    with pytest.raises(VaultRefError):
+        parse_vault_ref("vault://secret//acropolis#key")  # empty segment (double slash)
+
+    # A legitimate path containing "dotted-looking" segments that aren't actually '.'/'..'
+    # itself must still work — this shouldn't overreach into rejecting valid paths.
+    ref = parse_vault_ref("vault://secret/acropolis/my..service#key")
+    assert ref.path == "acropolis/my..service"

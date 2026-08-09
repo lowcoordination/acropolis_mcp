@@ -72,7 +72,20 @@ def parse_vault_ref(ref: str) -> VaultRef:
         raise VaultRefError(
             f"not a valid vault:// reference (expected vault://<mount>/<path>#<key>): {ref!r}"
         )
-    return VaultRef(mount=match.group("mount"), path=match.group("path"), key=match.group("key"))
+    mount, path, key = match.group("mount"), match.group("path"), match.group("key")
+    # Defense in depth: `path` is deliberately permissive (KV paths are legitimately
+    # slash-separated, e.g. "acropolis/github"), but a "." or ".." PATH SEGMENT would let the
+    # request URL built from it (f"{base}/v1/{mount}/data/{path}") escape the intended mount's
+    # data/ namespace after Vault-side normalisation — e.g. "secret/../sys/mounts" reaching
+    # /v1/secret/sys/mounts instead of /v1/secret/data/.... Setting this reference already
+    # requires the "admin" role (require_role("admin") on the server create/update routes),
+    # which can already register any upstream URL and edit any policy, so this is defense in
+    # depth rather than a privilege-escalation fix — but it's cheap and correct to reject
+    # outright rather than rely on Vault's own ACLs being the only thing standing in the way.
+    segments = path.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        raise VaultRefError(f"path must not contain empty, '.', or '..' segments: {path!r}")
+    return VaultRef(mount=mount, path=path, key=key)
 
 
 class OpenBaoConfigError(Exception):

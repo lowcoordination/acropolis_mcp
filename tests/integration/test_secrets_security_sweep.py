@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -25,7 +26,17 @@ from .openbao_fixture import has_real_server, run_dev_server
 CANARY = "Bearer sk-SWEEP-CANARY-4b7e91a02c88ff33-must-not-leak"
 
 
+_TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def _all_gateway_db_text(data_dir: Path) -> str:
+    """Reads every row of every table in gateway.db as text, for a substring sweep.
+
+    Table names come from sqlite_master itself (never attacker- or network-controlled — this is
+    a local test fixture's own schema), but interpolating them into SQL still goes through an
+    identifier allowlist check first rather than directly, per this repo's own f-string-in-SQL
+    convention (see archon/secrets/openbao.py's docstring on why SQL identifiers can't be
+    parameterized the way values can — the same reasoning applies here)."""
     conn = sqlite3.connect(data_dir / "gateway.db")
     try:
         tables = [r[0] for r in conn.execute(
@@ -33,7 +44,8 @@ def _all_gateway_db_text(data_dir: Path) -> str:
         ).fetchall()]
         chunks = []
         for table in tables:
-            rows = conn.execute(f"SELECT * FROM {table}").fetchall()  # noqa: S608 (test-only, fixed table list)
+            assert _TABLE_NAME_RE.match(table), f"unexpected table name shape: {table!r}"
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()  # nosec: identifier allowlisted above
             chunks.append(str(rows))
         return "\n".join(chunks)
     finally:
