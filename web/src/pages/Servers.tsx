@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useCreateServer, useServers } from '../lib/useServers'
 import { useSettings } from '../lib/useSettings'
+import { useActiveProject } from '../lib/ProjectContext'
+import { useProjects } from '../lib/useProjects'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
 import { CredentialBadge } from '../components/CredentialBadge'
 import { Modal } from '../components/Modal'
@@ -22,15 +24,17 @@ function looksLikeReference(value: string): boolean {
   return value.startsWith('vault://') || value.startsWith('enc:v1:')
 }
 
-function AddServerModal({ onClose }: { onClose: () => void }) {
+function AddServerModal({ onClose, defaultProjectSlug }: { onClose: () => void; defaultProjectSlug?: string }) {
   const [name, setName] = useState('')
   const [slug, setSlug] = useState('')
   const [slugTouched, setSlugTouched] = useState(false)
   const [upstreamUrl, setUpstreamUrl] = useState('')
   const [upstreamAuthHeader, setUpstreamAuthHeader] = useState('')
+  const [projectSlug, setProjectSlug] = useState(defaultProjectSlug ?? 'default')
   const [error, setError] = useState<string | null>(null)
   const create = useCreateServer()
   const { data: settings } = useSettings()
+  const { data: projects } = useProjects()
 
   function handleNameChange(value: string) {
     setName(value)
@@ -45,6 +49,7 @@ function AddServerModal({ onClose }: { onClose: () => void }) {
         slug,
         name,
         upstream_url: upstreamUrl,
+        project_slug: projectSlug,
         ...(upstreamAuthHeader ? { upstream_auth_header: upstreamAuthHeader } : {}),
       },
       {
@@ -90,6 +95,25 @@ function AddServerModal({ onClose }: { onClose: () => void }) {
             Used in the endpoint URL: /mcp/{slug || '{slug}'}
           </p>
         </div>
+        {projects && projects.length > 1 && (
+          <div>
+            <label className="block text-sm font-medium mb-1" htmlFor="project">
+              Project
+            </label>
+            <select
+              id="project"
+              className="w-full rounded-md px-3 py-2 text-sm"
+              value={projectSlug}
+              onChange={(e) => setProjectSlug(e.target.value)}
+            >
+              {projects.map((p) => (
+                <option key={p.id} value={p.slug}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div>
           <label className="block text-sm font-medium mb-1" htmlFor="upstream_url">
             Upstream URL
@@ -170,8 +194,12 @@ function AddServerModal({ onClose }: { onClose: () => void }) {
 }
 
 export function Servers() {
-  const { data: servers, isLoading, isError } = useServers()
+  const { activeProjectId } = useActiveProject()
+  const { data: projects } = useProjects()
+  const { data: servers, isLoading, isError } = useServers(activeProjectId)
   const [showAdd, setShowAdd] = useState(false)
+  const showProjectColumn = !!projects && projects.length > 1
+  const activeProject = projects?.find((p) => p.id === activeProjectId)
 
   return (
     <div className="space-y-4">
@@ -203,6 +231,11 @@ export function Servers() {
                 <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
                   Slug
                 </th>
+                {showProjectColumn && (
+                  <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
+                    Project
+                  </th>
+                )}
                 <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
                   Upstream
                 </th>
@@ -228,6 +261,11 @@ export function Servers() {
                       {server.slug}
                     </Link>
                   </td>
+                  {showProjectColumn && (
+                    <td className="px-4 py-3 text-xs" style={{ color: 'var(--text-muted)' }}>
+                      {server.project_slug ?? '—'}
+                    </td>
+                  )}
                   <td className="px-4 py-3 font-mono text-xs" style={{ color: 'var(--text-muted)' }}>
                     {server.upstream_url}
                   </td>
@@ -258,7 +296,9 @@ export function Servers() {
         </div>
       )}
 
-      {showAdd && <AddServerModal onClose={() => setShowAdd(false)} />}
+      {showAdd && (
+        <AddServerModal onClose={() => setShowAdd(false)} defaultProjectSlug={activeProject?.slug} />
+      )}
     </div>
   )
 }

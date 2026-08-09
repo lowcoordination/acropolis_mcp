@@ -2,10 +2,12 @@ import { useState } from 'react'
 import { useServers } from '../lib/useServers'
 import { useKeys } from '../lib/useKeys'
 import { useUsage } from '../lib/useUsage'
+import { useActiveProject } from '../lib/ProjectContext'
 
 export function Usage() {
-  const { data: servers } = useServers()
-  const { data: keys } = useKeys()
+  const { activeProjectId } = useActiveProject()
+  const { data: servers } = useServers(activeProjectId)
+  const { data: keys } = useKeys(activeProjectId)
   const [apiKeyFilter, setApiKeyFilter] = useState('')
   const [serverFilter, setServerFilter] = useState('')
   const [toolFilter, setToolFilter] = useState('')
@@ -16,6 +18,7 @@ export function Usage() {
     server_slug: serverFilter || undefined,
     tool: toolFilter || undefined,
     period,
+    project_id: activeProjectId ?? undefined,
   })
 
   const keyName = (id: number | null) => keys?.find((k) => k.id === id)?.name ?? null

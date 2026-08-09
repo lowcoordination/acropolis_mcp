@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router'
 import { useSetupStatus } from './lib/useSetupStatus'
+import { ProjectProvider } from './lib/ProjectContext'
 import { SetupWizard } from './pages/SetupWizard'
 import { Login } from './pages/Login'
 import { Layout } from './components/Layout'
@@ -11,6 +12,7 @@ import { Usage } from './pages/Usage'
 import { Audit } from './pages/Audit'
 import { Settings } from './pages/Settings'
 import { Users } from './pages/Users'
+import { Projects } from './pages/Projects'
 
 function App() {
   const { data: setupStatus, isLoading, isError } = useSetupStatus()
@@ -36,7 +38,16 @@ function App() {
       {/* A 401 anywhere behind Layout is handled globally by the API client (see
           api/client.ts), which redirects to /login — this route just needs to exist. */}
       <Route path="/login" element={<Login />} />
-      <Route element={<Layout />}>
+      <Route
+        element={
+          // Enterprise #4: ProjectProvider wraps everything behind Layout (not the whole app) —
+          // it depends on GET /projects, which itself requires an authenticated session; wrapping
+          // /login too would just mean an always-empty, always-loading provider on that route.
+          <ProjectProvider>
+            <Layout />
+          </ProjectProvider>
+        }
+      >
         <Route index element={<Dashboard />} />
         <Route path="servers" element={<Servers />} />
         <Route path="servers/:slug" element={<ServerDetail />} />
@@ -51,6 +62,11 @@ function App() {
             404, which is honest about the route existing and matches 02-rbac.md's "403, not
             404" principle at the API layer this page is built on. */}
         <Route path="users" element={<Users />} />
+        {/* Same "no client-side gate, server enforces it" discipline as Users above — project
+            CRUD is global-admin-only server-side (POST/DELETE /projects), and a non-admin still
+            sees the list (GET /projects is viewer+) with create/delete controls that 403 if
+            somehow reached. */}
+        <Route path="projects" element={<Projects />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { useServers } from '../lib/useServers'
 import { useCreateKey, useDeleteKey, useKeys, useSetKeyEnabled, useSetKeyQuota } from '../lib/useKeys'
 import { useUsage } from '../lib/useUsage'
+import { useActiveProject } from '../lib/ProjectContext'
+import { useProjects } from '../lib/useProjects'
 import { Modal } from '../components/Modal'
 import { ApiError } from '../api/client'
 import type { KeyCreatedResponse, KeyResponse, QuotaPeriod } from '../api/types'
@@ -61,8 +63,17 @@ function QuotaFieldset({
   )
 }
 
-function CreateKeyModal({ onClose, onCreated }: { onClose: () => void; onCreated: (k: KeyCreatedResponse) => void }) {
-  const { data: servers } = useServers()
+function CreateKeyModal({
+  onClose, onCreated, defaultProjectSlug,
+}: { onClose: () => void; onCreated: (k: KeyCreatedResponse) => void; defaultProjectSlug?: string }) {
+  const { data: projects } = useProjects()
+  const [projectSlug, setProjectSlug] = useState(defaultProjectSlug ?? 'default')
+  const activeProject = projects?.find((p) => p.slug === projectSlug)
+  // Scopes are servers WITHIN the key's project — a key is project-bound (docs/projects.md), so
+  // offering a server from a different project as a "scope" would be misleading even though the
+  // backend's own project-agreement check in argus/pipeline.py would refuse it at call time
+  // regardless.
+  const { data: allServers } = useServers(activeProject?.id)
   const [name, setName] = useState('')
   const [scopeAll, setScopeAll] = useState(true)
   const [selectedScopes, setSelectedScopes] = useState<string[]>([])
@@ -71,7 +82,10 @@ function CreateKeyModal({ onClose, onCreated }: { onClose: () => void; onCreated
   const [quotaPeriod, setQuotaPeriod] = useState<QuotaPeriod>('day')
   const [error, setError] = useState<string | null>(null)
   const create = useCreateKey()
+  const servers = allServers
 
+  // Reset scopes list when unavailable in the new project — a stale checked scope from the
+  // previous project's server list must not silently be sent as a scope for the new one.
   function toggleScope(slug: string) {
     setSelectedScopes((s) => (s.includes(slug) ? s.filter((x) => x !== slug) : [...s, slug]))
   }
@@ -87,7 +101,7 @@ function CreateKeyModal({ onClose, onCreated }: { onClose: () => void; onCreated
       return
     }
     create.mutate(
-      { name, scopes: scopeAll ? undefined : selectedScopes, quota },
+      { name, scopes: scopeAll ? undefined : selectedScopes, quota, projectSlug },
       {
         onSuccess: (created) => onCreated(created),
         onError: (err) => setError(err instanceof ApiError ? err.message : 'Something went wrong'),
@@ -111,10 +125,36 @@ function CreateKeyModal({ onClose, onCreated }: { onClose: () => void; onCreated
             required
           />
         </div>
+        {projects && projects.length > 1 && (
+          <div>
+            <label className="block text-sm font-medium mb-1" htmlFor="key-project">
+              Project
+            </label>
+            <select
+              id="key-project"
+              className="w-full rounded-md px-3 py-2 text-sm"
+              value={projectSlug}
+              onChange={(e) => {
+                setProjectSlug(e.target.value)
+                setSelectedScopes([])
+              }}
+            >
+              {projects.map((p) => (
+                <option key={p.id} value={p.slug}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+              A key is bound to this project — it cannot call servers in a different project,
+              regardless of scopes below. See docs/projects.md.
+            </p>
+          </div>
+        )}
         <div>
           <label className="flex items-center gap-2 text-sm font-medium mb-2">
             <input type="checkbox" checked={scopeAll} onChange={(e) => setScopeAll(e.target.checked)} />
-            Access to all servers
+            Access to all servers in this project
           </label>
           {!scopeAll && (
             <div className="space-y-1 pl-6">
@@ -306,12 +346,16 @@ function QuotaUsageBar({ apiKey }: { apiKey: KeyResponse }) {
 }
 
 export function Keys() {
-  const { data: keys, isLoading, isError } = useKeys()
+  const { activeProjectId } = useActiveProject()
+  const { data: projects } = useProjects()
+  const { data: keys, isLoading, isError } = useKeys(activeProjectId)
   const setEnabled = useSetKeyEnabled()
   const deleteKey = useDeleteKey()
   const [showCreate, setShowCreate] = useState(false)
   const [justCreated, setJustCreated] = useState<KeyCreatedResponse | null>(null)
   const [editingQuotaFor, setEditingQuotaFor] = useState<KeyResponse | null>(null)
+  const showProjectColumn = !!projects && projects.length > 1
+  const activeProject = projects?.find((p) => p.id === activeProjectId)
 
   return (
     <div className="space-y-4">
@@ -343,6 +387,11 @@ export function Keys() {
                 <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
                   Name
                 </th>
+                {showProjectColumn && (
+                  <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
+                    Project
+                  </th>
+                )}
                 <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
                   Key
                 </th>
@@ -365,6 +414,11 @@ export function Keys() {
               {keys.map((key) => (
                 <tr key={key.id} className="border-b last:border-b-0" style={{ borderColor: 'var(--border)' }}>
                   <td className="px-4 py-3 font-medium">{key.name}</td>
+                  {showProjectColumn && (
+                    <td className="px-4 py-3 text-xs" style={{ color: 'var(--text-muted)' }}>
+                      {key.project_slug ?? '—'}
+                    </td>
+                  )}
                   <td className="px-4 py-3 font-mono text-xs" style={{ color: 'var(--text-muted)' }}>
                     {key.key_prefix}…
                   </td>
@@ -425,6 +479,7 @@ export function Keys() {
             setShowCreate(false)
             setJustCreated(created)
           }}
+          defaultProjectSlug={activeProject?.slug}
         />
       )}
       {justCreated && <ShowKeyModal created={justCreated} onClose={() => setJustCreated(null)} />}

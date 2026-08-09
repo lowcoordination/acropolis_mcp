@@ -9,7 +9,8 @@ import type {
 } from './types'
 
 export const serversApi = {
-  list: () => api.get<ServerResponse[]>('/servers'),
+  list: (projectId?: number) =>
+    api.get<ServerResponse[]>(`/servers${projectId != null ? `?project_id=${projectId}` : ''}`),
   get: (slug: string) => api.get<ServerResponse>(`/servers/${slug}`),
   create: (body: ServerCreateRequest) => api.post<ServerResponse>('/servers', body),
   update: (slug: string, body: ServerUpdateRequest) => api.put<ServerResponse>(`/servers/${slug}`, body),

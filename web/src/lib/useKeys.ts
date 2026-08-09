@@ -1,18 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { keysApi, type QuotaFields } from '../api/keys'
 
-export function useKeys() {
+export function useKeys(projectId?: number | null) {
   return useQuery({
-    queryKey: ['keys'],
-    queryFn: () => keysApi.list(),
+    queryKey: ['keys', projectId ?? 'all'],
+    queryFn: () => keysApi.list(projectId ?? undefined),
   })
 }
 
 export function useCreateKey() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ name, scopes, quota }: { name: string; scopes?: string[]; quota?: QuotaFields }) =>
-      keysApi.create(name, scopes, quota),
+    mutationFn: ({
+      name, scopes, quota, projectSlug,
+    }: { name: string; scopes?: string[]; quota?: QuotaFields; projectSlug?: string }) =>
+      keysApi.create(name, scopes, quota, projectSlug),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['keys'] }),
   })
 }
