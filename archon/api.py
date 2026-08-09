@@ -52,6 +52,7 @@ from archon.schemas import (
     StatsResponse,
     ToolTestRequest,
     ToolTestResponse,
+    TracingStatusResponse,
     UserCreateRequest,
     UserEnabledUpdateRequest,
     UserResponse,
@@ -63,6 +64,7 @@ from argus.generation import ClientGeneration
 from argus.pipeline import Pipeline
 from argus.rate_limiter import RateLimiterRegistry, server_key
 from argus.toolslist import ToolsCache
+from argus.tracing import TracingManager
 from db.database import utcnow
 from db.repo import (
     _UNSET,
@@ -137,6 +139,7 @@ def build_control_plane_router(
     config_source: Optional["ConfigSource"] = None,
     user_repo: Optional[UserRepo] = None,
     secret_provider: Optional[SecretProvider] = None,
+    tracing: Optional[TracingManager] = None,
 ) -> APIRouter:
     # enterprise #2 (RBAC): the router used to carry ONE blanket
     # dependencies=[Depends(require_admin)] gate — authenticated meant authorized for
@@ -1120,5 +1123,26 @@ def build_control_plane_router(
                 "actions": [a.describe(applied=True) for a in plan.actions],
                 "errors": plan.errors,
             }
+
+    # Enterprise #9 (OTel tracing): read-only status for the Settings page. Deliberately not
+    # gated behind `if tracing is not None` the way the GitOps block above is gated on
+    # config_source — app.py always wires a TracingManager (build_tracing_manager() never
+    # returns None), so this endpoint always exists; it just always reports
+    # enabled=False/active=False on a deployment that never set ACROPOLIS_OTEL_ENABLED. A test
+    # or other caller that constructs this router without passing `tracing` at all gets the same
+    # "disabled" answer via the `or _DisabledTracingManager()` fallback, matching every other
+    # optional-dependency default in this router (secret_provider, pipeline, etc.).
+    _tracing_status = tracing or TracingManager(enabled=False)
+
+    @router.get("/tracing/status", response_model=TracingStatusResponse, dependencies=[Depends(require_role("viewer"))])
+    async def get_tracing_status():
+        """Whether OpenTelemetry tracing is enabled/active. No span content, no configured
+        exporter endpoint (that's sourced from standard OTEL_EXPORTER_OTLP_* environment
+        variables, not from anything this API surfaces) — see docs/observability.md."""
+        return TracingStatusResponse(
+            enabled=_tracing_status.enabled,
+            active=_tracing_status.active,
+            sample_ratio=_tracing_status.sample_ratio,
+        )
 
     return router

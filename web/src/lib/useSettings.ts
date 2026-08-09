@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { settingsApi, webhooksApi, type SettingsUpdateRequest } from '../api/settings'
+import { settingsApi, tracingApi, webhooksApi, type SettingsUpdateRequest } from '../api/settings'
 
 export function useSettings() {
   return useQuery({
@@ -19,5 +19,16 @@ export function useUpdateSettings() {
 export function useSendTestWebhook() {
   return useMutation({
     mutationFn: () => webhooksApi.test(),
+  })
+}
+
+// Enterprise #9: read-only, informational — this instance never toggles tracing from the UI
+// (it's an ACROPOLIS_OTEL_ENABLED environment gate, matching the "standard OTel env vars, one
+// Acropolis-specific gate" design decision in docs/observability.md), so there's no matching
+// mutation hook here, unlike useSettings/useUpdateSettings above.
+export function useTracingStatus() {
+  return useQuery({
+    queryKey: ['tracing-status'],
+    queryFn: () => tracingApi.status(),
   })
 }

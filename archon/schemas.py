@@ -373,6 +373,17 @@ class DriftStatusResponse(BaseModel):
     errors: Optional[list[str]] = None
 
 
+class TracingStatusResponse(BaseModel):
+    """Enterprise #9. Deliberately tiny and read-only, same posture as DriftStatusResponse —
+    just enough for the Settings page to show an operator whether tracing is actually active,
+    never any span content or exporter destination detail (the OTLP endpoint is standard-env-var
+    configured, sourced from process environment, not something this API echoes back)."""
+
+    enabled: bool  # ACROPOLIS_OTEL_ENABLED, as read at process startup
+    active: bool  # enabled AND the `otel` extra was actually importable (TracingManager.active)
+    sample_ratio: float
+
+
 class ConfigImportRequest(BaseModel):
     yaml: str
     # Defaults to False so the destructive path is never the accidental one — a client that

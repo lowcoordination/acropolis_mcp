@@ -31,6 +31,7 @@ from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
 from argus.policy import evaluate
 from argus.rate_limiter import RateLimiterRegistry, server_key, tool_key
 from argus.toolslist import ToolsCache
+from argus.tracing import TracingManager, _DisabledTracingManager
 from db.models import ServerPolicy, ServerRecord
 from db.repo import ServerRepo, SettingsRepo
 
@@ -77,6 +78,7 @@ class Pipeline:
         tools_cache: Optional[ToolsCache] = None,
         settings_repo: Optional[SettingsRepo] = None,
         secret_provider: Optional[SecretProvider] = None,
+        tracing: Optional[TracingManager] = None,
     ):
         self._settings = settings
         self._servers = server_repo
@@ -91,6 +93,12 @@ class Pipeline:
         # that doesn't wire a provider through — including the entire pre-feature test suite —
         # gets byte-identical behaviour. app.py wires the real, settings-selected provider.
         self._secrets = secret_provider or LocalSecretProvider()
+        # Enterprise #9: same "defaults to an inert no-op" shape as _secrets above — every
+        # existing caller (including the whole pre-feature test suite) that doesn't wire a
+        # TracingManager through gets a manager whose .span() context managers are pure no-ops
+        # and whose .active is always False, so this constructor default is itself part of the
+        # "disabled = byte-identical to today" guarantee, not just ACROPOLIS_OTEL_ENABLED=false.
+        self._tracing = tracing or _DisabledTracingManager()
 
     @property
     def tools_cache(self) -> Optional[ToolsCache]:
@@ -121,33 +129,48 @@ class Pipeline:
         """
         start = time.monotonic()
         server: Optional[ServerRecord] = None
-        try:
-            server = await self._resolve_server(slug)
-            api_key_id = (
-                None if skip_api_key_auth else await self._authenticate(request, slug)
-            )
-            body_bytes = (
-                self._guard_body_size(body_override) if body_override is not None
-                else await self._read_body_guarded(request)
-            )
-            response = await self._process(
-                request, server, path, body_bytes, api_key_id,
-                force_generation=force_generation, origin=origin,
-            )
-            return response
-        except RoutingError as e:
-            await self._audit.log(
-                server_slug=slug,
-                tool=None,
-                decision="ERROR",
-                endpoint="per-server",
-                status_code=e.status_code,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                reason=e.body[:200],
-                client_ip=_client_ip(request),
-                origin=origin,
-            )
-            return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
+        # Enterprise #9: the root span parents under the CALLER's own inbound traceparent (if
+        # any), so a trace the calling agent already started continues through Acropolis rather
+        # than starting a new, disconnected trace here. extract_context returns None when
+        # tracing is inactive or no traceparent was sent — start_as_current_span(context=None)
+        # behaves exactly like calling it with no context kwarg at all in that case.
+        parent_ctx = self._tracing.extract_context(
+            request.headers.get("traceparent"), request.headers.get("tracestate"),
+        )
+        with self._tracing.span(
+            "request",
+            attributes={"acropolis.server_slug": slug, "http.method": request.method},
+            parent_context=parent_ctx,
+        ) as root_span:
+            try:
+                server = await self._resolve_server(slug)
+                api_key_id = (
+                    None if skip_api_key_auth else await self._authenticate(request, slug)
+                )
+                body_bytes = (
+                    self._guard_body_size(body_override) if body_override is not None
+                    else await self._read_body_guarded(request)
+                )
+                response = await self._process(
+                    request, server, path, body_bytes, api_key_id,
+                    force_generation=force_generation, origin=origin,
+                )
+                root_span.set_attribute("http.status_code", response.status_code)
+                return response
+            except RoutingError as e:
+                root_span.set_attribute("http.status_code", e.status_code)
+                await self._audit.log(
+                    server_slug=slug,
+                    tool=None,
+                    decision="ERROR",
+                    endpoint="per-server",
+                    status_code=e.status_code,
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                    reason=e.body[:200],
+                    client_ip=_client_ip(request),
+                    origin=origin,
+                )
+                return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
 
     async def _resolve_server(self, slug: str) -> ServerRecord:
         from db.repo import ServerNotFoundError
@@ -318,7 +341,7 @@ class Pipeline:
                     if blocked_response is not None:
                         return blocked_response
 
-                    decision = await evaluate(tool_name, arguments, server.name, policy)
+                    decision = await self._evaluate_with_tracing(tool_name, arguments, server, policy)
                     await self._audit.log(
                         server_slug=server.slug, tool=tool_name,
                         decision="BLOCKED" if decision.blocked else "ALLOWED",
@@ -366,6 +389,38 @@ class Pipeline:
         except self._CredentialResolutionFailed as e:
             return e.response
         return await self._forward(request, server, path, body_bytes, resolved_auth_header)
+
+    async def _evaluate_with_tracing(
+        self, tool_name: str, arguments: dict, server: ServerRecord, policy: ServerPolicy,
+    ):
+        """Wraps argus.policy.evaluate with the policy.evaluate span, plus a nested dlp.scan
+        span when (and only when) this server's policy actually has a DLP detector or custom
+        pattern configured — matching evaluate()'s own "policy.dlp_detectors or
+        policy.dlp_custom_patterns" gate (argus/policy.py), so a server with no DLP config never
+        gets a dlp.scan span at all, same as it never pays for the scan itself.
+
+        Attribute secrecy (enterprise #9 non-negotiable): only server slug, tool name, decision,
+        rule name, dlp_detector, dlp_action are ever set here — NEVER decision.matched (the
+        DLP/param-rule matched VALUE) and NEVER arguments/args_summary. This mirrors exactly
+        which Decision fields the DLP PR already deemed safe to audit/webhook (see
+        db/models.py's Decision docstring) versus which it deliberately keeps off every
+        observability surface.
+        """
+        dlp_configured = bool(policy.dlp_detectors or policy.dlp_custom_patterns)
+        with self._tracing.span(
+            "policy.evaluate",
+            attributes={"acropolis.server_slug": server.slug, "acropolis.tool": tool_name},
+        ) as policy_span:
+            if dlp_configured:
+                with self._tracing.span("dlp.scan", attributes={"acropolis.server_slug": server.slug}) as dlp_span:
+                    decision = await evaluate(tool_name, arguments, server.name, policy)
+                    dlp_span.set_attribute("acropolis.dlp_detector", decision.dlp_detector)
+                    dlp_span.set_attribute("acropolis.dlp_action", decision.dlp_action)
+            else:
+                decision = await evaluate(tool_name, arguments, server.name, policy)
+            policy_span.set_attribute("acropolis.decision", "BLOCKED" if decision.blocked else "ALLOWED")
+            policy_span.set_attribute("acropolis.rule", decision.rule)
+            return decision
 
     def _handle_discover(self, server: ServerRecord, rpc_id: Any) -> Response:
         result = synthesize_server_discover(server)
@@ -428,7 +483,7 @@ class Pipeline:
             if blocked_response is not None:
                 return blocked_response
 
-            decision = await evaluate(tool_name, arguments, server.name, policy)
+            decision = await self._evaluate_with_tracing(tool_name, arguments, server, policy)
             await self._audit.log(
                 server_slug=server.slug, tool=tool_name,
                 decision="BLOCKED" if decision.blocked else "ALLOWED",
@@ -599,14 +654,35 @@ class Pipeline:
         """
         if server.upstream_auth_header is None:
             return None
+
+        # Enterprise #9: only span this when upstream_auth_header is actually a REFERENCE
+        # (vault://..., enc:v1:...) that requires a real resolution round-trip — matching the
+        # plan's "secrets.resolve (only when the upstream credential is a reference, not a
+        # literal)". For the "local"/literal case, self._secrets.resolve() is a same-process,
+        # zero-I/O pass-through (see archon/secrets/local.py) and a span there would just be
+        # noise around a no-op, exactly what design decision #2 (manual spans, not blanket
+        # auto-instrumentation) is meant to avoid.
+        from archon.secrets import is_reference
+
+        traced = is_reference(server.upstream_auth_header)
+
+        # SECURITY: e.reason (built here, inside the try, never inside the span's own except
+        # clause) may echo back attacker- or operator-controlled shape (a malformed ref, an HTTP
+        # status code) but must NEVER contain the resolved plaintext — SecretResolutionError's
+        # own contract (see archon/secrets/__init__.py) is that its message is built only from
+        # the reference and a static reason, so this is safe to both audit-log and, when
+        # `traced`, let the span() context manager record as an exception. `_CredentialResolutionFailed`
+        # is deliberately raised OUTSIDE the `with span:` block below (not from within the except
+        # clause) — it's an internal control-flow signal carrying an already-built Response, not
+        # a real failure, and recording it as a span exception would be noise, not signal.
         try:
+            if traced:
+                with self._tracing.span(
+                    "secrets.resolve", attributes={"acropolis.server_slug": server.slug},
+                ):
+                    return await self._secrets.resolve(server.upstream_auth_header)
             return await self._secrets.resolve(server.upstream_auth_header)
         except SecretResolutionError as e:
-            # SECURITY: e.reason may echo back attacker- or operator-controlled shape (a
-            # malformed ref, an HTTP status code) but must NEVER contain the resolved plaintext
-            # — SecretResolutionError's own contract (see archon/secrets/__init__.py) is that its
-            # message is built only from the reference and a static reason, so surfacing it here
-            # in an audit row / RPC error body is safe by construction, not by caller discipline.
             reason = f"secret resolution failed: {e.reason}"
             await self._audit.log(
                 server_slug=server.slug, tool=tool_name, decision="ERROR",
@@ -648,21 +724,40 @@ class Pipeline:
             ]
             forward_headers.append((b"authorization", resolved_auth_header.encode()))
 
-        upstream_req = self._client.build_request(
-            method=request.method, url=upstream_url, content=body_bytes, headers=forward_headers,
-        )
-        # F3 fix (review 2026-08-04): self._client.send() had no exception handling — any httpx
-        # transport error (refused connection, DNS failure, TLS error) escaped as an unhandled
-        # exception, past Pipeline.handle's `except RoutingError` (the only thing that logs an
-        # audit event), all the way to Starlette as a bare 500 with a stack trace and a
-        # non-JSON-RPC body. This is the MOST LIKELY real-world event in a self-hosted
-        # deployment — an MCP server container restarting — and it broke in the ugliest
-        # possible way, with the gateway's own audit trail showing nothing happened. The
-        # bridged path (argus/bridge.py:106) already handled this correctly; matched here.
-        try:
-            r = await self._client.send(upstream_req, stream=True)
-        except httpx.HTTPError as e:
-            raise RoutingError(502, rpc_error(None, f"upstream request failed: {e}"))
+        # Enterprise #9: traceparent/tracestate are added here — deliberately, inside
+        # upstream.forward's span, and ONLY here. argus/headers.py's strip_hop_by_hop already
+        # removed any traceparent/tracestate the CLIENT sent (see that module's module-level
+        # comment on why: an unmediated client-supplied traceparent passing straight through was
+        # never a governed feature, just an accident of a denylist). What crosses the wire now is
+        # exclusively the gateway's own span context, correctly parent-chained under whatever
+        # inbound traceparent the root `request` span was told to honor (see Pipeline.handle).
+        # inject_headers() returns {} when tracing is inactive, making this an unconditional,
+        # branch-free no-op on the disabled path — see tests/integration/test_otel_propagation.py.
+        with self._tracing.span(
+            "upstream.forward", attributes={"acropolis.server_slug": server.slug},
+        ) as forward_span:
+            trace_headers = self._tracing.inject_headers()
+            if trace_headers:
+                forward_headers = forward_headers + [
+                    (k.encode(), v.encode()) for k, v in trace_headers.items()
+                ]
+
+            upstream_req = self._client.build_request(
+                method=request.method, url=upstream_url, content=body_bytes, headers=forward_headers,
+            )
+            # F3 fix (review 2026-08-04): self._client.send() had no exception handling — any
+            # httpx transport error (refused connection, DNS failure, TLS error) escaped as an
+            # unhandled exception, past Pipeline.handle's `except RoutingError` (the only thing
+            # that logs an audit event), all the way to Starlette as a bare 500 with a stack
+            # trace and a non-JSON-RPC body. This is the MOST LIKELY real-world event in a
+            # self-hosted deployment — an MCP server container restarting — and it broke in the
+            # ugliest possible way, with the gateway's own audit trail showing nothing happened.
+            # The bridged path (argus/bridge.py:106) already handled this correctly; matched here.
+            try:
+                r = await self._client.send(upstream_req, stream=True)
+            except httpx.HTTPError as e:
+                raise RoutingError(502, rpc_error(None, f"upstream request failed: {e}"))
+            forward_span.set_attribute("http.status_code", r.status_code)
 
         return StreamingResponse(
             r.aiter_raw(), status_code=r.status_code,

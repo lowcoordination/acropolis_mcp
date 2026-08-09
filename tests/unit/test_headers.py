@@ -42,6 +42,29 @@ def test_strip_hop_by_hop_case_insensitive():
     assert strip_hop_by_hop(raw) == []
 
 
+def test_strip_hop_by_hop_removes_client_traceparent_and_tracestate():
+    # Enterprise #9: the CLIENT's own inbound traceparent/tracestate must never pass straight
+    # through to the upstream unmediated — see the TRACE_CONTEXT_HEADERS comment in
+    # argus/headers.py for why this is a deliberate policy change, not incidental. The correct,
+    # gateway-derived traceparent is re-added explicitly by argus/pipeline.py's _forward, sourced
+    # from TracingManager.inject_headers(), never by letting the client's raw header survive
+    # this filter.
+    raw = [
+        (b"traceparent", b"00-11111111111111111111111111111111-2222222222222222-01"),
+        (b"tracestate", b"vendor=malicious-value"),
+        (b"x-custom", b"value"),
+    ]
+    stripped_keys = {k for k, _ in strip_hop_by_hop(raw)}
+    assert b"traceparent" not in stripped_keys
+    assert b"tracestate" not in stripped_keys
+    assert b"x-custom" in stripped_keys
+
+
+def test_strip_hop_by_hop_traceparent_case_insensitive():
+    raw = [(b"Traceparent", b"00-x-y-01"), (b"TraceState", b"a=b")]
+    assert strip_hop_by_hop(raw) == []
+
+
 def test_extract_name_tools_call():
     assert extract_name_from_params("tools/call", {"name": "read_file"}) == "read_file"
 

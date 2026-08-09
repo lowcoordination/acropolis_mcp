@@ -72,9 +72,14 @@ binary to match, or restore the backup you took before the newer version ran.
 not a human) exposes Prometheus text-format counters: audit event counts by decision over the
 last 24h, and per-server health status. Point a Prometheus scrape config or equivalent at it.
 
-Per-upstream call latency is not currently included — no latency sample is recorded anywhere in
-the request path today, so there's nothing yet to expose there. If you need it, that's a real gap
-to file, not a metrics-endpoint bug.
+Every audit row carries a gateway-total `latency_ms` (the whole request, wall-clock), but
+`/metrics` itself doesn't currently expose that as an aggregate counter/histogram, and it has no
+per-stage breakdown (policy eval vs. DLP scan vs. secret resolution vs. bridge handshake vs. the
+upstream call itself). For that level of detail, and for propagating/honoring a client's own
+`traceparent`, see **[distributed tracing](observability.md)** — `ACROPOLIS_OTEL_ENABLED=true`
+exports OTLP spans with exactly that per-stage breakdown to any standard collector (Tempo,
+Jaeger, Alloy). `/metrics` and tracing are complementary: the former for aggregate dashboards and
+alerting, the latter for "where did THIS specific call spend its time."
 
 ## Exporting and importing configuration
 

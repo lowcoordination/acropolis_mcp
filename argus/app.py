@@ -23,6 +23,7 @@ from argus.pipeline import Pipeline
 from argus.rate_limiter import RateLimiterRegistry
 from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
+from argus.tracing import build_tracing_manager
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
 from db.repo import AdminEventRepo, ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo, UserRepo
@@ -89,6 +90,13 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     # loudly at boot, the same way a missing admin_token or a bad webhook_url would, rather than
     # surfacing as a mysterious first-request failure.
     secret_provider = build_secret_provider(settings)
+    # Enterprise #9: built once at startup, same shape as secret_provider above — reads
+    # ACROPOLIS_OTEL_ENABLED / ACROPOLIS_OTEL_SAMPLE_RATIO from the environment. init() (called
+    # in lifespan below, not here) is where the actual OTel SDK / OTLP exporter gets built (or,
+    # if ACROPOLIS_OTEL_ENABLED=true but the `otel` extra isn't installed, where it degrades to
+    # a logged no-op) — kept separate from construction so tests can build a TracingManager
+    # without it trying to import opentelemetry at all when disabled.
+    tracing = build_tracing_manager()
     # F13 fix (review 2026-08-04): httpx.AsyncClient(timeout=N) applies N to ALL FOUR of
     # connect/read/write/pool — including pool acquisition wait, which has nothing to do with
     # how long a real upstream tool call should be allowed to take. With the default
@@ -110,7 +118,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     )
 
     handshake_cache = UpstreamHandshakeCache(http_client)
-    bridge = ProtocolBridge(http_client, handshake_cache)
+    bridge = ProtocolBridge(http_client, handshake_cache, tracing=tracing)
     tools_cache = ToolsCache(db, bridge)
     webhook_dispatcher = WebhookDispatcher(audit, settings_repo)
     health_poller = HealthPoller(
@@ -137,6 +145,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         tools_cache=tools_cache,
         settings_repo=settings_repo,
         secret_provider=secret_provider,
+        tracing=tracing,
     )
     aggregate_pipeline = AggregatePipeline(
         settings=settings, server_repo=server_repo, api_keys=api_keys,
@@ -145,6 +154,14 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Enterprise #9: init() is where the OTel SDK / OTLP exporter actually gets built (a
+        # no-op if ACROPOLIS_OTEL_ENABLED is unset/false — see TracingManager.init's own early
+        # return). Called first, same "fail loudly at boot rather than mysteriously on the first
+        # request" reasoning as secret_provider's construction above — though unlike a
+        # misconfigured Vault address, a bad OTel config degrades to a logged warning rather than
+        # raising, since tracing is an observability nice-to-have, not a security control the
+        # gateway should refuse to start without.
+        tracing.init()
         audit.start()
         webhook_dispatcher.start()
         if settings.health_poll_enabled:
@@ -170,6 +187,10 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
             aclose = getattr(secret_provider, "aclose", None)
             if aclose is not None:
                 await aclose()
+            # Flushes any batched-but-unexported spans before process exit. A no-op when
+            # tracing was never active (TracingManager.shutdown checks self._provider is not
+            # None first).
+            tracing.shutdown()
 
     app = FastAPI(title="Acropolis", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.middleware("http")(_security_headers_middleware)
@@ -191,6 +212,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.webhook_dispatcher = webhook_dispatcher
     app.state.config_source = config_source
     app.state.secret_provider = secret_provider
+    app.state.tracing = tracing
     app.state.pipeline = pipeline
     app.state.aggregate_pipeline = aggregate_pipeline
 
@@ -199,7 +221,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
         rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source, user_repo,
-        secret_provider=secret_provider,
+        secret_provider=secret_provider, tracing=tracing,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo, config_source))

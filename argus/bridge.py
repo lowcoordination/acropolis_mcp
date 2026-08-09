@@ -7,6 +7,7 @@ from typing import Any, Optional
 import httpx
 
 from argus.jsonrpc import UNSUPPORTED_PROTOCOL_VERSION, rpc_error, sanitize_rpc_id
+from argus.tracing import TracingManager, _DisabledTracingManager
 from argus.upstream import CLIENT_INFO, UpstreamHandshakeCache, UpstreamHandshakeError, parse_sse_body
 
 logger = logging.getLogger("argus.bridge")
@@ -45,9 +46,17 @@ class ProtocolBridge:
     scope — see _UNSUPPORTED_2026_METHODS and bridge_call()'s input_required handling.
     """
 
-    def __init__(self, client: httpx.AsyncClient, handshake_cache: UpstreamHandshakeCache):
+    def __init__(
+        self, client: httpx.AsyncClient, handshake_cache: UpstreamHandshakeCache,
+        tracing: Optional[TracingManager] = None,
+    ):
         self._client = client
         self._handshakes = handshake_cache
+        # Enterprise #9: same "defaults to an inert no-op" shape as Pipeline._tracing — every
+        # existing caller/test that constructs a ProtocolBridge without a tracing kwarg gets a
+        # manager whose .span() is a pure no-op, so this default is part of the "disabled =
+        # byte-identical to today" guarantee.
+        self._tracing = tracing or _DisabledTracingManager()
 
     async def bridge_call(
         self, server_id: int, upstream_url: str, rpc_method: str, rpc_id: Any, params: dict,
@@ -94,12 +103,16 @@ class ProtocolBridge:
         # what a client-side MCP SDK does on session loss; only give up and surface an error if
         # the retry ALSO fails, so a genuinely dead upstream doesn't retry forever.
         for attempt in range(2):
-            try:
-                handshake = await self._handshakes.get_or_handshake(
-                    server_id, upstream_url, upstream_auth_header=upstream_auth_header
-                )
-            except UpstreamHandshakeError as e:
-                raise BridgeError(502, rpc_error(rpc_id, f"upstream handshake failed: {e}"))
+            with self._tracing.span(
+                "bridge.handshake", attributes={"acropolis.bridged": True},
+            ) as handshake_span:
+                try:
+                    handshake = await self._handshakes.get_or_handshake(
+                        server_id, upstream_url, upstream_auth_header=upstream_auth_header
+                    )
+                except UpstreamHandshakeError as e:
+                    raise BridgeError(502, rpc_error(rpc_id, f"upstream handshake failed: {e}"))
+                handshake_span.set_attribute("acropolis.mcp_protocol_version", handshake.protocol_version)
 
             headers = {
                 "Content-Type": "application/json",
@@ -116,10 +129,21 @@ class ProtocolBridge:
             if upstream_auth_header:
                 headers["Authorization"] = upstream_auth_header
 
-            try:
-                resp = await self._client.post(upstream_url, json=upstream_body, headers=headers)
-            except httpx.HTTPError as e:
-                raise BridgeError(502, rpc_error(rpc_id, f"upstream request failed: {e}"))
+            with self._tracing.span(
+                "upstream.forward", attributes={"acropolis.bridged": True},
+            ) as forward_span:
+                # Enterprise #9: traceparent/tracestate are injected here, from INSIDE the
+                # upstream.forward span, so the outbound header correctly parent-chains under
+                # THIS span (not the handshake span, not the root request span) — an observer in
+                # the collector sees the upstream call as the direct parent of whatever the
+                # upstream server does next. inject_headers() returns {} when tracing is
+                # inactive, so this is a no-op merge on the disabled path.
+                headers.update(self._tracing.inject_headers())
+                try:
+                    resp = await self._client.post(upstream_url, json=upstream_body, headers=headers)
+                except httpx.HTTPError as e:
+                    raise BridgeError(502, rpc_error(rpc_id, f"upstream request failed: {e}"))
+                forward_span.set_attribute("http.status_code", resp.status_code)
 
             if resp.status_code == 404:
                 self._handshakes.invalidate(server_id)
