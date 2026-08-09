@@ -2,7 +2,7 @@
 name = "acropolis"
 version = "0.1.0"
 description = "Acropolis (Argus/Archon/Stoa) — a self-hostable MCP gateway, policy engine, and registration hub"
-license = "MIT"
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
