@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 from fastapi import Request, Response
@@ -29,11 +29,16 @@ from argus.headers import (
 )
 from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
 from argus.policy import evaluate
+from argus.quotas import period_start
 from argus.rate_limiter import RateLimiterRegistry, server_key, tool_key
 from argus.toolslist import ToolsCache
 from argus.tracing import TracingManager, _DisabledTracingManager
+from db.database import utcnow
 from db.models import ServerPolicy, ServerRecord
-from db.repo import ServerRepo, SettingsRepo
+from db.repo import ServerRepo, SettingsRepo, UsageRepo
+
+if TYPE_CHECKING:
+    from stoa.webhooks import WebhookDispatcher
 
 logger = logging.getLogger("argus.pipeline")
 
@@ -79,6 +84,8 @@ class Pipeline:
         settings_repo: Optional[SettingsRepo] = None,
         secret_provider: Optional[SecretProvider] = None,
         tracing: Optional[TracingManager] = None,
+        usage_repo: Optional[UsageRepo] = None,
+        webhook_dispatcher: Optional["WebhookDispatcher"] = None,
     ):
         self._settings = settings
         self._servers = server_repo
@@ -99,6 +106,14 @@ class Pipeline:
         # and whose .active is always False, so this constructor default is itself part of the
         # "disabled = byte-identical to today" guarantee, not just ACROPOLIS_OTEL_ENABLED=false.
         self._tracing = tracing or _DisabledTracingManager()
+        # Enterprise #11: usage_repo=None (the default every pre-feature test/call site gets)
+        # means BOTH quota enforcement and usage rollup writes are no-ops — see
+        # _check_quota/_record_usage below. This is deliberately the SAME "absent = byte-
+        # identical to today" shape as _secrets/_tracing above, not just "no quota configured
+        # on any given key" — a Pipeline built without a UsageRepo at all (as every existing
+        # test does) must behave exactly as it did before this feature existed.
+        self._usage = usage_repo
+        self._webhooks = webhook_dispatcher
 
     @property
     def tools_cache(self) -> Optional[ToolsCache]:
@@ -339,7 +354,20 @@ class Pipeline:
                         server, policy, tool_name, api_key_id, rpc_id, start, client_ip
                     )
                     if blocked_response is not None:
+                        await self._record_usage(server, tool_name, api_key_id)
                         return blocked_response
+
+                    # Enterprise #11: after auth, after rate limiting, before policy evaluation
+                    # — the non-negotiable ordering from 02-quotas-and-usage.md. A quota-exceeded
+                    # call is refused here, before evaluate() ever runs, so the upstream is never
+                    # reached and no DLP/param-rule work is wasted on a call that's about to be
+                    # rejected anyway.
+                    quota_response = await self._check_quota(
+                        server, tool_name, api_key_id, rpc_id, start, client_ip
+                    )
+                    if quota_response is not None:
+                        await self._record_usage(server, tool_name, api_key_id)
+                        return quota_response
 
                     decision = await self._evaluate_with_tracing(tool_name, arguments, server, policy)
                     await self._audit.log(
@@ -352,6 +380,7 @@ class Pipeline:
                         dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
                         dlp_match_count=decision.dlp_match_count,
                     )
+                    await self._record_usage(server, tool_name, api_key_id)
 
                     if decision.blocked:
                         return Response(
@@ -481,7 +510,17 @@ class Pipeline:
                 server, policy, tool_name, api_key_id, rpc_id, start, client_ip
             )
             if blocked_response is not None:
+                await self._record_usage(server, tool_name, api_key_id)
                 return blocked_response
+
+            # Enterprise #11: same ordering as the non-bridged path in _process — after auth,
+            # after rate limiting, before policy evaluation.
+            quota_response = await self._check_quota(
+                server, tool_name, api_key_id, rpc_id, start, client_ip
+            )
+            if quota_response is not None:
+                await self._record_usage(server, tool_name, api_key_id)
+                return quota_response
 
             decision = await self._evaluate_with_tracing(tool_name, arguments, server, policy)
             await self._audit.log(
@@ -495,6 +534,7 @@ class Pipeline:
                 dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
                 dlp_match_count=decision.dlp_match_count,
             )
+            await self._record_usage(server, tool_name, api_key_id)
             if decision.blocked:
                 return Response(
                     content=rpc_error(
@@ -622,6 +662,112 @@ class Pipeline:
                 status_code=429, media_type="application/json",
             )
         return None
+
+    async def _check_quota(
+        self, server: ServerRecord, tool_name: str, api_key_id: Optional[int],
+        rpc_id: Any, start: float, client_ip: Optional[str] = None,
+    ) -> Optional[Response]:
+        """Enterprise #11: call-count budget over a billing period, enforced AFTER auth and
+        AFTER the rate limiter, BEFORE policy evaluation — the non-negotiable ordering from
+        02-quotas-and-usage.md. Rate limiting answers "how fast"; this answers "how much, over
+        a period" — a different, complementary primitive (see argus/rate_limiter.py's own
+        module-level framing), not a replacement for it.
+
+        FAIL-OPEN, deliberately, and this is the one place in this feature that reverses every
+        other enterprise item's fail-CLOSED default (see argus/pipeline.py's
+        _resolve_credential for the fail-closed precedent this deliberately departs from, and
+        docs/quotas.md for the full rationale written out). If self._usage is None (no
+        UsageRepo wired — every pre-feature call site and test), if the key has no quota
+        configured, or if the quota check ITSELF fails (a DB error reading total_since), the
+        call proceeds exactly as if no quota existed. The only way this method blocks a call is
+        a clean, successful read that shows the caller genuinely over budget.
+        """
+        if self._usage is None or api_key_id is None:
+            return None
+        try:
+            key = await self._api_keys.get(api_key_id)
+            if key is None or key.quota_calls is None or key.quota_period is None:
+                return None
+            since = period_start(key.quota_period).isoformat()
+            used = await self._usage.total_since(api_key_id=api_key_id, since_iso=since)
+        except Exception:
+            # Fail open — see docstring. A DB hiccup on the quota check must never take down
+            # the data plane; the worst case of forwarding anyway is one call slightly over a
+            # soft budget, not a security exposure (contrast with _resolve_credential, where
+            # failing open could leak a request to an upstream expecting credentials).
+            logger.error(
+                "quota check failed for api_key_id=%s server=%s tool=%s — failing open",
+                api_key_id, server.slug, tool_name, exc_info=True,
+            )
+            return None
+
+        if used < key.quota_calls:
+            await self._maybe_fire_quota_webhook(key, used + 1, since)
+            return None
+
+        await self._audit.log(
+            server_slug=server.slug, tool=tool_name, decision="BLOCKED",
+            endpoint="per-server", rpc_method="tools/call", api_key_id=api_key_id,
+            rule="quota", reason=f"Quota exceeded: {used}/{key.quota_calls} calls this {key.quota_period}",
+            latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+        )
+        return Response(
+            content=rpc_error(
+                rpc_id, "Quota exceeded", data={"tool": tool_name, "quota_period": key.quota_period},
+            ),
+            status_code=429, media_type="application/json",
+        )
+
+    async def _maybe_fire_quota_webhook(self, key, projected_used: int, since_iso: str) -> None:
+        """Fires the `quota` webhook event at 80%/100% thresholds — see stoa/webhooks.py's
+        VALID_EVENTS and docs/quotas.md. `projected_used` is `used + 1` (the count AFTER the
+        call currently being evaluated completes), so the threshold fires on the call that
+        actually crosses it rather than one call later. Debouncing per key+period (so a busy
+        key doesn't spam one webhook per call once over a threshold) and race-safety under a
+        concurrent burst are entirely WebhookDispatcher's responsibility (see its
+        fire_quota_threshold method) — this call site only computes WHETHER a threshold was
+        newly crossed by this specific call, a pure function of (previous count, new count,
+        quota), and hands off the decision, not the debounce state.
+        """
+        if self._webhooks is None or key.quota_calls is None:
+            return
+        prior_pct = ((projected_used - 1) / key.quota_calls) * 100
+        new_pct = (projected_used / key.quota_calls) * 100
+        for threshold in (100, 80):
+            if prior_pct < threshold <= new_pct:
+                await self._webhooks.fire_quota_threshold(
+                    key_prefix=key.key_prefix, key_name=key.name, threshold=threshold,
+                    period=key.quota_period, period_start_iso=since_iso,
+                )
+                break  # only the highest newly-crossed threshold fires for a single call
+
+    async def _record_usage(
+        self, server: ServerRecord, tool_name: Optional[str], api_key_id: Optional[int],
+    ) -> None:
+        """Enterprise #11: increments the usage rollup for this call, in the SAME code path
+        that emits the tools/call audit event — called immediately alongside (never instead
+        of) self._audit.log for every tools/call decision (rate-limit block, quota block,
+        policy allow/deny alike), so a rollup total can never drift from a count of the audit
+        rows for the same window. See tests/integration/test_quotas.py's
+        TestRollupsMatchAuditRows for the test that proves this by direct comparison, and
+        AuditLogger.log's own docstring for the parallel "one write path" discipline this
+        mirrors.
+
+        Fails open exactly like _check_quota, for the same reason: a rollup WRITE failure is a
+        cost-visibility gap, not a security boundary, and must never turn into a 500 on an
+        otherwise-successful call.
+        """
+        if self._usage is None:
+            return
+        try:
+            await self._usage.increment(
+                ts_iso=utcnow(), api_key_id=api_key_id, server_id=server.id, tool=tool_name,
+            )
+        except Exception:
+            logger.error(
+                "usage rollup write failed for api_key_id=%s server=%s tool=%s",
+                api_key_id, server.slug, tool_name, exc_info=True,
+            )
 
     class _CredentialResolutionFailed(Exception):
         """Internal-only signal carrying the already-built error Response — see

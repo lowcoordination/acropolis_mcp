@@ -26,7 +26,7 @@ from argus.toolslist import ToolsCache
 from argus.tracing import build_tracing_manager
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
-from db.repo import AdminEventRepo, ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo, UserRepo
+from db.repo import AdminEventRepo, ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo, UsageRepo, UserRepo
 from stoa.gitops import ConfigSource
 from stoa.health import HealthPoller
 from stoa.retention import AuditRetentionJob
@@ -80,6 +80,11 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     audit_repo = AuditRepo(db)
     settings_repo = SettingsRepo(db)
     user_repo = UserRepo(db)
+    # Enterprise #11: usage_repo is always constructed (unlike secret_provider/tracing, there's
+    # no "disabled" build for this one — quotas/usage query availability doesn't depend on an
+    # env var) and always wired into Pipeline. The feature's own off-by-default guarantee comes
+    # from api_keys.quota_calls being NULL by default, not from omitting this repo.
+    usage_repo = UsageRepo(db)
 
     api_keys = ApiKeyService(api_key_repo)
     rate_limiter = RateLimiterRegistry()
@@ -146,6 +151,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         settings_repo=settings_repo,
         secret_provider=secret_provider,
         tracing=tracing,
+        usage_repo=usage_repo,
+        webhook_dispatcher=webhook_dispatcher,
     )
     aggregate_pipeline = AggregatePipeline(
         settings=settings, server_repo=server_repo, api_keys=api_keys,
@@ -215,13 +222,14 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.tracing = tracing
     app.state.pipeline = pipeline
     app.state.aggregate_pipeline = aggregate_pipeline
+    app.state.usage_repo = usage_repo
 
     oidc_attempts = AttemptStore()
     app.include_router(build_setup_router(settings_repo, rate_limiter, user_repo, http_client, oidc_attempts))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
         rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source, user_repo,
-        secret_provider=secret_provider, tracing=tracing,
+        secret_provider=secret_provider, tracing=tracing, usage_repo=usage_repo,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo, config_source))

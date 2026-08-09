@@ -3,13 +3,21 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiosqlite
 from pydantic import BaseModel, ValidationError
 
 from .database import Database, utcnow
-from .models import ApiKeyRecord, DlpCustomPattern, ParamRule, ServerPolicy, ServerRecord, UserRecord
+from .models import (
+    ApiKeyRecord,
+    DlpCustomPattern,
+    ParamRule,
+    ServerPolicy,
+    ServerRecord,
+    UserRecord,
+)
 
 logger = logging.getLogger("db.repo")
 
@@ -412,13 +420,17 @@ class ApiKeyRepo:
         return self._db.gateway
 
     async def create(self, name: str, key_hash: str, key_prefix: str,
-                      server_scopes: Optional[list[str]] = None) -> ApiKeyRecord:
+                      server_scopes: Optional[list[str]] = None,
+                      quota_calls: Optional[int] = None,
+                      quota_period: Optional[str] = None) -> ApiKeyRecord:
         now = utcnow()
         async with self._db.gateway_write_lock:
             cur = await self._write.execute(
-                """INSERT INTO api_keys (name, key_hash, key_prefix, server_scopes, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (name, key_hash, key_prefix, json.dumps(server_scopes) if server_scopes else None, now),
+                """INSERT INTO api_keys
+                   (name, key_hash, key_prefix, server_scopes, created_at, quota_calls, quota_period)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (name, key_hash, key_prefix, json.dumps(server_scopes) if server_scopes else None, now,
+                 quota_calls, quota_period),
             )
             await self._write.commit()
         return await self.get_by_id(cur.lastrowid)
@@ -445,6 +457,18 @@ class ApiKeyRepo:
     async def set_enabled(self, key_id: int, enabled: bool) -> None:
         async with self._db.gateway_write_lock:
             await self._write.execute("UPDATE api_keys SET enabled = ? WHERE id = ?", (int(enabled), key_id))
+            await self._write.commit()
+
+    async def set_quota(self, key_id: int, quota_calls: Optional[int], quota_period: Optional[str]) -> None:
+        """Both fields are written together, always — a NULL quota_calls with a non-NULL
+        quota_period (or vice versa) is a nonsensical half-state, so there is no partial-update
+        path here the way ServerRepo.update has per-field optionality. Callers (the PATCH
+        /keys/{id} route) pass both, always, even when clearing (None, None)."""
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                "UPDATE api_keys SET quota_calls = ?, quota_period = ? WHERE id = ?",
+                (quota_calls, quota_period, key_id),
+            )
             await self._write.commit()
 
     async def delete(self, key_id: int) -> None:
@@ -474,6 +498,8 @@ class ApiKeyRepo:
             server_scopes=json.loads(row["server_scopes"]) if row["server_scopes"] else None,
             created_at=row["created_at"],
             last_used_at=row["last_used_at"],
+            quota_calls=row["quota_calls"] if "quota_calls" in row.keys() else None,
+            quota_period=row["quota_period"] if "quota_period" in row.keys() else None,
         )
 
 
@@ -597,6 +623,170 @@ class AuditRepo:
             if deleted < batch_size:
                 break
         return total_deleted
+
+
+def _hour_bucket(ts_iso: str) -> str:
+    """Truncate an ISO8601 UTC timestamp (the same format AuditLogger/utcnow() produce
+    everywhere else in this codebase) down to the top of its hour, in UTC.
+
+    Deliberately parses and re-serializes via datetime rather than string-slicing the ISO text
+    (`ts_iso[:13] + ":00:00+00:00"`) — a naive slice breaks the instant a timestamp isn't
+    exactly the `+00:00` suffix shape (e.g. a `Z` suffix, or a differing UTC-offset
+    representation), which is exactly the class of bug stoa/retention.py's §26 fix (its own
+    header comment) had to work around for the same reason. Going through datetime.fromisoformat
+    normalizes the input shape before truncation, so this stays correct regardless of which
+    valid ISO8601 spelling produced the timestamp."""
+    dt = datetime.fromisoformat(ts_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(minute=0, second=0, microsecond=0).isoformat()
+
+
+# Sentinel values standing in for NULL on usage_rollups' NOT NULL grouping columns — see
+# 0010_usage_rollups.sql's comment on why NULL can't be used here (SQLite's UNIQUE constraint
+# treats NULL as never-equal-to-itself, which would silently defeat the upsert). 0 is never a
+# real api_keys.id/servers.id (SQLite AUTOINCREMENT starts at 1); '' is never a real tool name
+# (argus/policy.py rejects an empty tools/call name before it ever reaches this far). Translated
+# at this module boundary only — every OTHER method in this codebase that touches api_key_id/
+# tool keeps using Optional[int]/Optional[str] with real None, matching AuditLogger.log's own
+# shape, so this repo's public methods take the same Optional types callers already use
+# elsewhere and never leak the sentinel outward.
+_NO_KEY = 0
+_NO_SERVER = 0
+_NO_TOOL = ""
+
+
+def _to_key_sentinel(api_key_id: Optional[int]) -> int:
+    return api_key_id if api_key_id is not None else _NO_KEY
+
+
+def _to_server_sentinel(server_id: Optional[int]) -> int:
+    return server_id if server_id is not None else _NO_SERVER
+
+
+def _to_tool_sentinel(tool: Optional[str]) -> str:
+    return tool if tool is not None else _NO_TOOL
+
+
+class UsageRepo:
+    """Enterprise #11 (quotas + usage attribution): durable call-count rollups, one row per
+    (UTC hour bucket, api_key_id, server_id, tool).
+
+    Lives in gateway.db, NOT audit.db — see 0010_usage_rollups.sql's header comment for why
+    (the short version: AuditRetentionJob prunes audit.db on a rolling window; a usage rollup
+    that lived there would lose exactly the history an operator most wants to look back over).
+
+    `increment` is called from the SAME code path that emits the audit event
+    (argus/pipeline.py, right where AuditLogger.log() is called for an ALLOWED/BLOCKED
+    tools/call), synchronously, so a rollup count can never drift from what the audit log shows
+    for the same window — see tests/integration/test_quotas.py's
+    TestRollupsMatchAuditRows for the test that proves this by direct comparison.
+
+    Every method here is written to be called from Pipeline's fail-OPEN quota-check wrapper
+    (see Pipeline._check_quota) — a DB error surfacing out of increment/total_since is caught
+    by the CALLER, not swallowed here, so this class stays a plain, honest repo with no
+    fail-open policy baked into it; the policy decision belongs to the enforcement point, not
+    the data-access layer.
+    """
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    @property
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
+        assert self._db.gateway is not None
+        self._db.gateway.row_factory = aiosqlite.Row
+        return self._db.gateway
+
+    async def increment(
+        self, *, ts_iso: str, api_key_id: Optional[int], server_id: Optional[int],
+        tool: Optional[str], amount: int = 1,
+    ) -> None:
+        """Increments the (hour bucket, api_key_id, server_id, tool) row by `amount`, creating
+        it if it doesn't exist yet. One call per forwarded tools/call — called unconditionally
+        (even for a key with no quota configured and even for api_key_id=None under open auth
+        mode) so the usage query endpoint has real data to show regardless of whether any quota
+        is enforced; enforcement (quota check) and measurement (this rollup) are independent
+        concerns, same as how RateLimiterRegistry.check_all and AuditLogger.log are independent
+        today.
+
+        UNIQUE(period_start, api_key_id, server_id, tool) plus ON CONFLICT DO UPDATE makes this
+        a single atomic upsert rather than a read-then-write race between concurrent requests
+        landing in the same hour bucket for the same key/server/tool."""
+        period_start = _hour_bucket(ts_iso)
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                """INSERT INTO usage_rollups (period_start, period_kind, api_key_id, server_id, tool, calls)
+                   VALUES (?, 'hour', ?, ?, ?, ?)
+                   ON CONFLICT(period_start, api_key_id, server_id, tool)
+                   DO UPDATE SET calls = calls + excluded.calls""",
+                (period_start, _to_key_sentinel(api_key_id), _to_server_sentinel(server_id),
+                 _to_tool_sentinel(tool), amount),
+            )
+            await self._write.commit()
+
+    async def total_since(self, *, api_key_id: int, since_iso: str) -> int:
+        """Sum of `calls` across every hour bucket with period_start >= since_iso, for one key
+        — the quota-enforcement read. `since_iso` is the caller-computed start of the current
+        quota period (start of today or start of this month, in UTC); summing hourly buckets
+        rather than storing a running total keeps this correct across period boundaries without
+        a separate reset job (see docs/quotas.md's "why hourly buckets" section)."""
+        cur = await self._read.execute(
+            "SELECT COALESCE(SUM(calls), 0) FROM usage_rollups WHERE api_key_id = ? AND period_start >= ?",
+            (api_key_id, since_iso),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def query(
+        self, *, api_key_id: Optional[int] = None, server_id: Optional[int] = None,
+        tool: Optional[str] = None, since_iso: Optional[str] = None,
+        until_iso: Optional[str] = None,
+    ) -> list[dict]:
+        """Returns raw hourly-bucket rows matching the given filters, newest first. The
+        `/api/v1/usage` route (viewer+) sums these client-side per its `group_by` — kept here
+        as raw buckets rather than pre-aggregated SQL per grouping, since the set of useful
+        groupings (by key, by server, by tool, by day, by month) is small enough that summing
+        in Python over a bounded row set is simpler than N bespoke GROUP BY queries, and this
+        table is never expected to hold traffic-log volumes (one row per key/server/tool per
+        HOUR, not per call).
+
+        Filters use the SAME sentinel translation as increment — passing api_key_id=None means
+        "don't filter on key" (matches every row, sentinel or not), NOT "filter for the
+        no-key sentinel"; use api_key_id=0 explicitly (rare, control-plane-only) to query
+        specifically the open-auth-mode bucket."""
+        clauses, params = [], []
+        if api_key_id is not None:
+            clauses.append("api_key_id = ?")
+            params.append(api_key_id)
+        if server_id is not None:
+            clauses.append("server_id = ?")
+            params.append(server_id)
+        if tool is not None:
+            clauses.append("tool = ?")
+            params.append(tool)
+        if since_iso is not None:
+            clauses.append("period_start >= ?")
+            params.append(since_iso)
+        if until_iso is not None:
+            clauses.append("period_start <= ?")
+            params.append(until_iso)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cur = await self._read.execute(
+            f"""SELECT period_start, api_key_id, server_id, tool, calls
+                FROM usage_rollups {where} ORDER BY period_start DESC""",
+            params,
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
 
 class SettingsRepo:

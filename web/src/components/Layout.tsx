@@ -8,6 +8,7 @@ const navItems: { to: string; label: string; end?: boolean; minRole?: Role }[] =
   { to: '/', label: 'Dashboard', end: true },
   { to: '/servers', label: 'Servers' },
   { to: '/keys', label: 'API Keys', minRole: 'admin' },
+  { to: '/usage', label: 'Usage' },
   { to: '/audit', label: 'Audit' },
   { to: '/users', label: 'Users', minRole: 'admin' },
   { to: '/settings', label: 'Settings' },

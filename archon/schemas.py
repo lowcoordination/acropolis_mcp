@@ -234,6 +234,24 @@ class ToolTestResponse(BaseModel):
 class KeyCreateRequest(BaseModel):
     name: str
     server_scopes: Optional[list[str]] = None
+    # Enterprise #11: both nullable, both default None = unlimited (the off-by-default
+    # regression-guard this codebase applies to every optional feature — see
+    # tests/integration/test_quotas.py::TestNoQuotaConfiguredIsUnchangedBehavior).
+    quota_calls: Optional[int] = None
+    quota_period: Optional[str] = None  # "day" | "month"
+
+    @model_validator(mode="after")
+    def _quota_fields_are_paired(self) -> "KeyCreateRequest":
+        # A quota_calls with no quota_period (or vice versa) is a half-configured, ambiguous
+        # state — reject it at the API boundary rather than let it reach the DB as a row
+        # db/models.py's ApiKeyRecord would itself refuse to construct on the way back out.
+        if (self.quota_calls is None) != (self.quota_period is None):
+            raise ValueError("quota_calls and quota_period must be set together, or both omitted")
+        if self.quota_calls is not None and self.quota_calls <= 0:
+            raise ValueError("quota_calls must be a positive integer")
+        if self.quota_period is not None and self.quota_period not in ("day", "month"):
+            raise ValueError("quota_period must be 'day' or 'month'")
+        return self
 
 
 class KeyCreatedResponse(BaseModel):
@@ -251,6 +269,47 @@ class KeyResponse(BaseModel):
     server_scopes: Optional[list[str]]
     created_at: str
     last_used_at: Optional[str]
+    quota_calls: Optional[int] = None
+    quota_period: Optional[str] = None
+
+
+class KeyQuotaUpdateRequest(BaseModel):
+    """Body for PATCH /keys/{id}/quota. A separate request model (rather than folding onto the
+    existing `enabled: bool` query-param PATCH /keys/{id}) because that route is unusual in
+    this codebase already (a bare query param, not a body) and quota is a materially different
+    kind of update (two fields, paired, admin-audited with its own action name) — keeping it a
+    distinct route/model avoids overloading one PATCH handler with two unrelated shapes of
+    partial update."""
+    quota_calls: Optional[int] = None
+    quota_period: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _quota_fields_are_paired(self) -> "KeyQuotaUpdateRequest":
+        if (self.quota_calls is None) != (self.quota_period is None):
+            raise ValueError("quota_calls and quota_period must be set together, or both null")
+        if self.quota_calls is not None and self.quota_calls <= 0:
+            raise ValueError("quota_calls must be a positive integer")
+        if self.quota_period is not None and self.quota_period not in ("day", "month"):
+            raise ValueError("quota_period must be 'day' or 'month'")
+        return self
+
+
+class UsageBucketResponse(BaseModel):
+    """One aggregated usage row — already summed over whatever period the query requested
+    (day/month/all), NOT a raw hourly bucket (see UsageRepo.query's docstring on why raw
+    buckets are stored but callers usually want them summed)."""
+    api_key_id: Optional[int]
+    key_prefix: Optional[str] = None  # populated when api_key_id is a real key; never the hash/plaintext
+    server_id: Optional[int]
+    server_slug: Optional[str] = None
+    tool: Optional[str]
+    calls: int
+
+
+class UsageResponse(BaseModel):
+    period: str  # "day" | "month" | "all"
+    since: Optional[str]
+    buckets: list[UsageBucketResponse]
 
 
 class SettingsResponse(BaseModel):

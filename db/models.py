@@ -201,6 +201,9 @@ class ServerRecord(BaseModel):
         return slug
 
 
+_VALID_QUOTA_PERIODS = {"day", "month"}
+
+
 class ApiKeyRecord(BaseModel):
     id: int
     name: str
@@ -209,6 +212,24 @@ class ApiKeyRecord(BaseModel):
     server_scopes: Optional[list[str]] = None
     created_at: str
     last_used_at: Optional[str] = None
+    # Enterprise #11 (quotas + usage attribution): a call-count budget over quota_period,
+    # enforced alongside (not instead of) argus.rate_limiter's burst-per-window limiter — see
+    # docs/quotas.md for why these are two different, complementary primitives. Both nullable;
+    # NULL quota_calls = unlimited, which is the default, same off-by-default discipline as
+    # server_policies.rate_limit and DLP's dlp_detectors — a key with no quota configured must
+    # behave byte-identically to pre-feature Acropolis (see
+    # tests/integration/test_quotas.py::TestNoQuotaConfiguredIsUnchangedBehavior).
+    quota_calls: Optional[int] = None
+    quota_period: Optional[str] = None  # "day" | "month", required iff quota_calls is set
+
+    @field_validator("quota_period")
+    @classmethod
+    def _validate_quota_period(cls, quota_period: Optional[str]) -> Optional[str]:
+        if quota_period is not None and quota_period not in _VALID_QUOTA_PERIODS:
+            raise ValueError(
+                f"quota_period must be one of {sorted(_VALID_QUOTA_PERIODS)}, got {quota_period!r}"
+            )
+        return quota_period
 
 
 class UserRecord(BaseModel):

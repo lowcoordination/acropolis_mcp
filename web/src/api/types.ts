@@ -93,6 +93,8 @@ export interface PolicyResponse {
   dlp_custom_patterns: DlpCustomPattern[]
 }
 
+export type QuotaPeriod = 'day' | 'month'
+
 export interface KeyResponse {
   id: number
   name: string
@@ -101,6 +103,9 @@ export interface KeyResponse {
   server_scopes: string[] | null
   created_at: string
   last_used_at: string | null
+  // Enterprise #11: nullable, null = unlimited (the default) — see docs/quotas.md.
+  quota_calls: number | null
+  quota_period: QuotaPeriod | null
 }
 
 export interface KeyCreatedResponse {
@@ -108,6 +113,21 @@ export interface KeyCreatedResponse {
   name: string
   key_prefix: string
   plaintext: string
+}
+
+export interface UsageBucketResponse {
+  api_key_id: number | null
+  key_prefix: string | null
+  server_id: number | null
+  server_slug: string | null
+  tool: string | null
+  calls: number
+}
+
+export interface UsageResponse {
+  period: 'day' | 'month' | 'all'
+  since: string | null
+  buckets: UsageBucketResponse[]
 }
 
 export interface SettingsResponse {

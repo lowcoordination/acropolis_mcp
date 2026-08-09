@@ -12,7 +12,7 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _GATEWAY_MIGRATIONS = [
     "0001_init.sql", "0002_tighten_slug_check.sql", "0003_add_upstream_credential.sql",
     "0006_admin_events.sql", "0007_users.sql", "0008_gateway_dlp_config.sql",
-    "0009_server_health_reason.sql",
+    "0009_server_health_reason.sql", "0010_usage_rollups.sql",
 ]
 _AUDIT_MIGRATIONS = [
     "0001_init_audit.sql", "0004_audit_api_key_index.sql", "0005_audit_origin.sql",
