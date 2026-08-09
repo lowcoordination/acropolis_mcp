@@ -14,6 +14,8 @@ from .models import (
     ApiKeyRecord,
     DlpCustomPattern,
     ParamRule,
+    ProjectMemberRecord,
+    ProjectRecord,
     ServerPolicy,
     ServerRecord,
     UserRecord,
@@ -73,6 +75,14 @@ class UsernameConflictError(Exception):
     pass
 
 
+class ProjectNotFoundError(Exception):
+    pass
+
+
+class ProjectSlugConflictError(Exception):
+    pass
+
+
 def _row_to_server(row: aiosqlite.Row) -> ServerRecord:
     return ServerRecord(
         id=row["id"],
@@ -89,6 +99,7 @@ def _row_to_server(row: aiosqlite.Row) -> ServerRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         upstream_auth_header=row["upstream_auth_header"],
+        project_id=row["project_id"] if "project_id" in row.keys() else None,
     )
 
 
@@ -115,7 +126,7 @@ class ServerRepo:
         self._db.gateway.row_factory = aiosqlite.Row
         return self._db.gateway
 
-    async def list(self) -> list[ServerRecord]:
+    async def list(self, project_id: Optional[int] = None) -> list[ServerRecord]:
         # F4 fix (review 2026-08-04): defense-in-depth half. The CREATE path now validates the
         # slug (archon/schemas.py's _validate_slug) so a bad row shouldn't be writable anymore
         # — but this is the method that used to turn any bad row already in the DB (from before
@@ -125,7 +136,16 @@ class ServerRepo:
         # to even see the bad row to delete it. Skip-and-log instead of propagating, so one bad
         # row degrades to "one server invisible" rather than "everything that calls list() is
         # down."
-        cur = await self._read.execute("SELECT * FROM servers ORDER BY slug")
+        #
+        # Enterprise #4: `project_id=None` means "no project filter" (every existing caller pre-
+        # this-feature, and every instance-wide use like the health poller) — NOT "servers with
+        # no project". Pass a real project id explicitly to scope.
+        if project_id is not None:
+            cur = await self._read.execute(
+                "SELECT * FROM servers WHERE project_id = ? ORDER BY slug", (project_id,)
+            )
+        else:
+            cur = await self._read.execute("SELECT * FROM servers ORDER BY slug")
         rows = await cur.fetchall()
         result = []
         for r in rows:
@@ -159,6 +179,7 @@ class ServerRepo:
         enabled: bool = True,
         in_aggregate: bool = True,
         upstream_auth_header: Optional[str] = None,
+        project_id: Optional[int] = None,
     ) -> ServerRecord:
         # F7: two-table write (servers + server_policies) — serialize against other gateway.db
         # writers so a concurrent commit can't land between the INSERT and its paired policy row.
@@ -173,10 +194,10 @@ class ServerRepo:
                 cur = await self._write.execute(
                     """INSERT INTO servers
                        (slug, name, upstream_url, enabled, in_aggregate, upstream_auth_header,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        created_at, updated_at, project_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (slug, name, upstream_url, int(enabled), int(in_aggregate),
-                     upstream_auth_header, now, now),
+                     upstream_auth_header, now, now, project_id),
                 )
                 await self._write.execute(
                     "INSERT INTO server_policies (server_id, mode, updated_at) VALUES (?, 'passthrough', ?)",
@@ -233,6 +254,22 @@ class ServerRepo:
         async with self._db.gateway_write_lock:
             await self._write.execute("DELETE FROM servers WHERE id = ?", (current.id,))
             await self._write.commit()
+
+    async def set_project(self, slug: str, project_id: int) -> ServerRecord:
+        """Enterprise #4: reassign an EXISTING server to a different project. Deliberately a
+        separate, narrow method rather than a field on `update()` — reassignment is rare (config
+        import with a changed project_slug, or a future explicit "move server" admin action),
+        and keeping it out of update()'s general field list avoids a project_id=None sentinel
+        ambiguity (unlike upstream_auth_header, "don't reassign" here is simply "don't call
+        this method" — there's no legitimate "clear the project" operation)."""
+        current = await self.get(slug)
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                "UPDATE servers SET project_id = ?, updated_at = ? WHERE id = ?",
+                (project_id, utcnow(), current.id),
+            )
+            await self._write.commit()
+        return await self.get(slug)
 
     async def set_health(
         self, slug: str, health_status: str, upstream_protocol: Optional[str] = None,
@@ -422,15 +459,17 @@ class ApiKeyRepo:
     async def create(self, name: str, key_hash: str, key_prefix: str,
                       server_scopes: Optional[list[str]] = None,
                       quota_calls: Optional[int] = None,
-                      quota_period: Optional[str] = None) -> ApiKeyRecord:
+                      quota_period: Optional[str] = None,
+                      project_id: Optional[int] = None) -> ApiKeyRecord:
         now = utcnow()
         async with self._db.gateway_write_lock:
             cur = await self._write.execute(
                 """INSERT INTO api_keys
-                   (name, key_hash, key_prefix, server_scopes, created_at, quota_calls, quota_period)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (name, key_hash, key_prefix, server_scopes, created_at, quota_calls, quota_period,
+                    project_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (name, key_hash, key_prefix, json.dumps(server_scopes) if server_scopes else None, now,
-                 quota_calls, quota_period),
+                 quota_calls, quota_period, project_id),
             )
             await self._write.commit()
         return await self.get_by_id(cur.lastrowid)
@@ -449,8 +488,14 @@ class ApiKeyRepo:
         row = await cur.fetchone()
         return self._row_to_record(row) if row else None
 
-    async def list(self) -> list[ApiKeyRecord]:
-        cur = await self._read.execute("SELECT * FROM api_keys ORDER BY created_at DESC")
+    async def list(self, project_id: Optional[int] = None) -> list[ApiKeyRecord]:
+        # Enterprise #4: same None-means-unfiltered convention as ServerRepo.list.
+        if project_id is not None:
+            cur = await self._read.execute(
+                "SELECT * FROM api_keys WHERE project_id = ? ORDER BY created_at DESC", (project_id,)
+            )
+        else:
+            cur = await self._read.execute("SELECT * FROM api_keys ORDER BY created_at DESC")
         rows = await cur.fetchall()
         return [self._row_to_record(r) for r in rows]
 
@@ -500,6 +545,7 @@ class ApiKeyRepo:
             last_used_at=row["last_used_at"],
             quota_calls=row["quota_calls"] if "quota_calls" in row.keys() else None,
             quota_period=row["quota_period"] if "quota_period" in row.keys() else None,
+            project_id=row["project_id"] if "project_id" in row.keys() else None,
         )
 
 
@@ -533,7 +579,7 @@ class AuditRepo:
         tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
         api_key_id: Optional[int] = None, after: Optional[str] = None,
         before: Optional[str] = None, search: Optional[str] = None,
-        origin: object = _UNSET,
+        origin: object = _UNSET, server_slug_in: Optional[list[str]] = None,
     ) -> list[dict]:
         """Newest-first. `before_id` is keyset pagination — pass the smallest `id` from the
         previous page to fetch the next (older) page, rather than an OFFSET (which re-scans
@@ -546,11 +592,28 @@ class AuditRepo:
         `origin` uses the `_UNSET` sentinel (like `ServerRepo.update`'s `upstream_auth_header`)
         because `None` is a meaningful value here — "give me only normal traffic" — distinct from
         "don't filter on origin at all" (the default, returning both normal and 'test' rows).
-        A plain `Optional[str] = None` couldn't express the first case."""
+        A plain `Optional[str] = None` couldn't express the first case.
+
+        `server_slug_in` (enterprise #4): audit_events lives in audit.db, a SEPARATE SQLite file/
+        connection from gateway.db where servers/projects live — there is no SQL JOIN across
+        them. Project-scoped callers (archon/api.py's GET /audit etc.) resolve their project's
+        server slugs via ServerRepo.list(project_id=...) first, then pass that slug set here as
+        an `IN (...)` filter, composing with (not replacing) the single-slug `server_slug` filter
+        above. An empty list means "this project has zero servers" and must match ZERO rows, not
+        every row — handled explicitly below since `IN ()` is invalid SQL."""
         clauses, params = [], []
         if server_slug:
             clauses.append("server_slug = ?")
             params.append(server_slug)
+        if server_slug_in is not None:
+            if not server_slug_in:
+                # Zero servers in this project -> zero possible audit rows. `1=0` short-circuits
+                # without needing special-case Python-side handling of an empty result set.
+                clauses.append("1=0")
+            else:
+                placeholders = ",".join("?" for _ in server_slug_in)
+                clauses.append(f"server_slug IN ({placeholders})")
+                params.extend(server_slug_in)
         if decision:
             clauses.append("decision = ?")
             params.append(decision)
@@ -588,13 +651,23 @@ class AuditRepo:
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-    async def count_since(self, since_iso: str, decision: Optional[str] = None) -> int:
+    async def count_since(
+        self, since_iso: str, decision: Optional[str] = None,
+        server_slug_in: Optional[list[str]] = None,
+    ) -> int:
         # Always excludes origin='test' (Try-it calls) — this backs /stats, and a dashboard
         # counter that moves every time an operator tests their own policy would be useless.
         clauses, params = ["ts >= ?", "origin IS NULL"], [since_iso]
         if decision:
             clauses.append("decision = ?")
             params.append(decision)
+        if server_slug_in is not None:
+            if not server_slug_in:
+                clauses.append("1=0")
+            else:
+                placeholders = ",".join("?" for _ in server_slug_in)
+                clauses.append(f"server_slug IN ({placeholders})")
+                params.extend(server_slug_in)
         cur = await self._conn.execute(
             f"SELECT COUNT(*) FROM audit_events WHERE {' AND '.join(clauses)}", params
         )
@@ -708,7 +781,7 @@ class UsageRepo:
 
     async def increment(
         self, *, ts_iso: str, api_key_id: Optional[int], server_id: Optional[int],
-        tool: Optional[str], amount: int = 1,
+        tool: Optional[str], amount: int = 1, project_id: Optional[int] = None,
     ) -> None:
         """Increments the (hour bucket, api_key_id, server_id, tool) row by `amount`, creating
         it if it doesn't exist yet. One call per forwarded tools/call — called unconditionally
@@ -720,16 +793,26 @@ class UsageRepo:
 
         UNIQUE(period_start, api_key_id, server_id, tool) plus ON CONFLICT DO UPDATE makes this
         a single atomic upsert rather than a read-then-write race between concurrent requests
-        landing in the same hour bucket for the same key/server/tool."""
+        landing in the same hour bucket for the same key/server/tool.
+
+        `project_id` (enterprise #4) is NOT part of the UNIQUE constraint — a given
+        (period_start, api_key_id, server_id, tool) combination has exactly one project_id in
+        practice (a server belongs to exactly one project), so it rides along as a plain column,
+        set on insert and refreshed on conflict via COALESCE so an existing pre-migration row
+        (project_id NULL, backfilled separately by 0011_projects.sql) gets populated by the next
+        real increment rather than staying NULL forever if the backfill's own UPDATE somehow
+        missed it."""
         period_start = _hour_bucket(ts_iso)
         async with self._db.gateway_write_lock:
             await self._write.execute(
-                """INSERT INTO usage_rollups (period_start, period_kind, api_key_id, server_id, tool, calls)
-                   VALUES (?, 'hour', ?, ?, ?, ?)
+                """INSERT INTO usage_rollups
+                   (period_start, period_kind, api_key_id, server_id, tool, calls, project_id)
+                   VALUES (?, 'hour', ?, ?, ?, ?, ?)
                    ON CONFLICT(period_start, api_key_id, server_id, tool)
-                   DO UPDATE SET calls = calls + excluded.calls""",
+                   DO UPDATE SET calls = calls + excluded.calls,
+                       project_id = COALESCE(usage_rollups.project_id, excluded.project_id)""",
                 (period_start, _to_key_sentinel(api_key_id), _to_server_sentinel(server_id),
-                 _to_tool_sentinel(tool), amount),
+                 _to_tool_sentinel(tool), amount, project_id),
             )
             await self._write.commit()
 
@@ -749,7 +832,7 @@ class UsageRepo:
     async def query(
         self, *, api_key_id: Optional[int] = None, server_id: Optional[int] = None,
         tool: Optional[str] = None, since_iso: Optional[str] = None,
-        until_iso: Optional[str] = None,
+        until_iso: Optional[str] = None, project_id: Optional[int] = None,
     ) -> list[dict]:
         """Returns raw hourly-bucket rows matching the given filters, newest first. The
         `/api/v1/usage` route (viewer+) sums these client-side per its `group_by` — kept here
@@ -762,7 +845,12 @@ class UsageRepo:
         Filters use the SAME sentinel translation as increment — passing api_key_id=None means
         "don't filter on key" (matches every row, sentinel or not), NOT "filter for the
         no-key sentinel"; use api_key_id=0 explicitly (rare, control-plane-only) to query
-        specifically the open-auth-mode bucket."""
+        specifically the open-auth-mode bucket.
+
+        `project_id` (enterprise #4): filters on the rollup's own project_id column (populated
+        at increment-time and by 0011_projects.sql's backfill) — unlike AuditRepo, usage_rollups
+        lives in gateway.db alongside servers/projects, so this can be a real column filter
+        rather than needing a slug-set IN-list."""
         clauses, params = [], []
         if api_key_id is not None:
             clauses.append("api_key_id = ?")
@@ -779,6 +867,9 @@ class UsageRepo:
         if until_iso is not None:
             clauses.append("period_start <= ?")
             params.append(until_iso)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         cur = await self._read.execute(
             f"""SELECT period_start, api_key_id, server_id, tool, calls
@@ -1170,3 +1261,143 @@ class UserRepo:
                 if suffix > 50:
                     # Pathological collision storm — fail loudly rather than loop forever.
                     raise
+
+
+def _row_to_project(row: aiosqlite.Row) -> ProjectRecord:
+    return ProjectRecord(id=row["id"], slug=row["slug"], name=row["name"], created_at=row["created_at"])
+
+
+class ProjectRepo:
+    """CRUD for `projects` (enterprise #4, issue #5). Deliberately thin — no membership logic
+    here (see ProjectMemberRepo below); this repo only owns the project row itself."""
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    @property
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
+        assert self._db.gateway is not None
+        self._db.gateway.row_factory = aiosqlite.Row
+        return self._db.gateway
+
+    async def list(self) -> list[ProjectRecord]:
+        cur = await self._read.execute("SELECT * FROM projects ORDER BY slug")
+        rows = await cur.fetchall()
+        return [_row_to_project(r) for r in rows]
+
+    async def get(self, slug: str) -> ProjectRecord:
+        cur = await self._read.execute("SELECT * FROM projects WHERE slug = ?", (slug,))
+        row = await cur.fetchone()
+        if row is None:
+            raise ProjectNotFoundError(slug)
+        return _row_to_project(row)
+
+    async def get_by_id(self, project_id: int) -> ProjectRecord:
+        cur = await self._read.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
+        row = await cur.fetchone()
+        if row is None:
+            raise ProjectNotFoundError(str(project_id))
+        return _row_to_project(row)
+
+    async def create(self, slug: str, name: str) -> ProjectRecord:
+        async with self._db.gateway_write_lock:
+            existing = await self._write.execute("SELECT 1 FROM projects WHERE slug = ?", (slug,))
+            if await existing.fetchone() is not None:
+                raise ProjectSlugConflictError(slug)
+            now = utcnow()
+            cur = await self._write.execute(
+                "INSERT INTO projects (slug, name, created_at) VALUES (?, ?, ?)",
+                (slug, name, now),
+            )
+            await self._write.commit()
+        return await self.get_by_id(cur.lastrowid)
+
+    async def delete(self, slug: str) -> None:
+        # ON DELETE CASCADE on project_members handles membership cleanup. Servers/keys are NOT
+        # cascade-deleted (no ON DELETE clause on their project_id FK) — deleting a project that
+        # still owns servers/keys is refused at the API layer (archon/api.py) with a clear error
+        # rather than silently orphaning or cascading away real infrastructure; see that route's
+        # own comment for the exact check.
+        current = await self.get(slug)
+        async with self._db.gateway_write_lock:
+            await self._write.execute("DELETE FROM projects WHERE id = ?", (current.id,))
+            await self._write.commit()
+
+
+def _row_to_member(row: aiosqlite.Row) -> ProjectMemberRecord:
+    return ProjectMemberRecord(user_id=row["user_id"], project_id=row["project_id"], role=row["role"])
+
+
+class ProjectMemberRepo:
+    """CRUD for `project_members` — the (user_id, project_id) -> role membership table backing
+    archon/project_rbac.py's `require_project_role`. Every read here is the DB-is-authoritative
+    lookup that dependency performs on every request (no caching), same discipline as
+    archon/admin_auth.py's auth_mode/session_version checks."""
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    @property
+    def _read(self) -> aiosqlite.Connection:
+        assert self._db.gateway_read is not None
+        self._db.gateway_read.row_factory = aiosqlite.Row
+        return self._db.gateway_read
+
+    @property
+    def _write(self) -> aiosqlite.Connection:
+        assert self._db.gateway is not None
+        self._db.gateway.row_factory = aiosqlite.Row
+        return self._db.gateway
+
+    async def get_membership(self, *, user_id: int, project_id: int) -> Optional[ProjectMemberRecord]:
+        cur = await self._read.execute(
+            "SELECT * FROM project_members WHERE user_id = ? AND project_id = ?",
+            (user_id, project_id),
+        )
+        row = await cur.fetchone()
+        return _row_to_member(row) if row else None
+
+    async def list_for_project(self, project_id: int) -> list[ProjectMemberRecord]:
+        cur = await self._read.execute(
+            "SELECT * FROM project_members WHERE project_id = ? ORDER BY user_id", (project_id,)
+        )
+        rows = await cur.fetchall()
+        return [_row_to_member(r) for r in rows]
+
+    async def list_for_user(self, user_id: int) -> list[ProjectMemberRecord]:
+        """Every project a user has an explicit membership row in. NOTE: this does NOT include
+        projects a global admin can access via the superset short-circuit — that's not a
+        membership row, by design (see archon/project_rbac.py's module docstring). A global
+        admin calling this sees only their EXPLICIT memberships, if any; callers that need "every
+        project this principal can act on" (e.g. the frontend's project switcher) must special-
+        case principal.role == 'admin' -> list every project, same as
+        resolve_project_role does for a single project."""
+        cur = await self._read.execute(
+            "SELECT * FROM project_members WHERE user_id = ? ORDER BY project_id", (user_id,)
+        )
+        rows = await cur.fetchall()
+        return [_row_to_member(r) for r in rows]
+
+    async def upsert(self, *, user_id: int, project_id: int, role: str) -> ProjectMemberRecord:
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                """INSERT INTO project_members (user_id, project_id, role) VALUES (?, ?, ?)
+                   ON CONFLICT(user_id, project_id) DO UPDATE SET role = excluded.role""",
+                (user_id, project_id, role),
+            )
+            await self._write.commit()
+        return await self.get_membership(user_id=user_id, project_id=project_id)
+
+    async def remove(self, *, user_id: int, project_id: int) -> None:
+        async with self._db.gateway_write_lock:
+            await self._write.execute(
+                "DELETE FROM project_members WHERE user_id = ? AND project_id = ?",
+                (user_id, project_id),
+            )
+            await self._write.commit()

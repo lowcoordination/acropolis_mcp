@@ -192,6 +192,12 @@ class ServerRecord(BaseModel):
     # Never echoed back in API responses that a non-admin could read; see ServerResponse in
     # archon/schemas.py, which deliberately omits this field entirely.
     upstream_auth_header: Optional[str] = None
+    # Enterprise #4 (multi-tenancy, issue #5): the project this server belongs to. Nullable at
+    # the type level only because a pre-migration/hand-edited row could theoretically have NULL
+    # here (see 0011_projects.sql's header comment) — the application always sets this at create
+    # time (ServerRepo.create requires project_id) and treats a NULL as "belongs to no project",
+    # which fails closed in every project-scoping filter (matches no project's queries).
+    project_id: Optional[int] = None
 
     @field_validator("slug")
     @classmethod
@@ -221,6 +227,13 @@ class ApiKeyRecord(BaseModel):
     # tests/integration/test_quotas.py::TestNoQuotaConfiguredIsUnchangedBehavior).
     quota_calls: Optional[int] = None
     quota_period: Optional[str] = None  # "day" | "month", required iff quota_calls is set
+    # Enterprise #4 (multi-tenancy): the project this key belongs to (design decision 7 in
+    # 03-multi-tenancy.md — keys are project-bound TRANSITIVELY, stored directly here rather than
+    # derived from server_scopes, since server_scopes is optional/multi-valued and a key with no
+    # scopes configured still needs an unambiguous single project to be checked against in
+    # argus/pipeline.py's key/server project-agreement check). Same nullable-in-type-only /
+    # fail-closed-if-somehow-NULL treatment as ServerRecord.project_id above.
+    project_id: Optional[int] = None
 
     @field_validator("quota_period")
     @classmethod
@@ -252,3 +265,30 @@ class UserRecord(BaseModel):
     session_version: int = 0  # per-user revocation counter, independent of the global one
     created_at: str
     last_login_at: Optional[str] = None
+
+
+class ProjectRecord(BaseModel):
+    """Enterprise #4 (multi-tenancy, issue #5). "Projects," not "tenants" — one scoping level,
+    explicitly NOT an isolation guarantee (no separate crypto domains, no per-project QoS). See
+    docs/projects.md."""
+    id: int
+    slug: str
+    name: str
+    created_at: str
+
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug(cls, slug: str) -> str:
+        if not SLUG_RE.match(slug):
+            raise ValueError(f"slug must match [a-z0-9-]+: {slug!r}")
+        return slug
+
+
+class ProjectMemberRecord(BaseModel):
+    """A (user_id, project_id) -> role row. `role` is a bare str for the same reason
+    UserRecord.role is (see that model's docstring) — validity/hierarchy lives at the
+    application layer (archon/project_rbac.py's PROJECT_ROLE_RANK), not the schema layer, and an
+    unrecognized value must be treated as no access everywhere, never a permissive default."""
+    user_id: int
+    project_id: int
+    role: str  # viewer | poweruser | admin (validated in app)

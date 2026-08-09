@@ -25,6 +25,12 @@ from archon.auth.apikeys import ApiKeyService
 from archon.config_io import export_config, plan_import
 from archon.passwords import hash_password
 from archon.rbac import ROLE_RANK, is_valid_role, require_role
+from archon.project_rbac import (
+    PROJECT_ROLE_RANK,
+    is_valid_project_role,
+    require_project_role,
+    resolve_project_role,
+)
 from archon.secrets import SecretProvider, is_reference, provider_tier_name, store_upstream_auth_header
 from archon.secrets.local import LocalSecretProvider
 from archon.schemas import (
@@ -42,6 +48,10 @@ from archon.schemas import (
     KeyResponse,
     PolicyResponse,
     PolicyUpdateRequest,
+    ProjectCreateRequest,
+    ProjectMemberResponse,
+    ProjectMemberUpsertRequest,
+    ProjectResponse,
     ServerCreateRequest,
     ServerHealthSummary,
     ServerResponse,
@@ -74,6 +84,10 @@ from db.repo import (
     _UNSET,
     AdminEventRepo,
     AuditRepo,
+    ProjectMemberRepo,
+    ProjectNotFoundError,
+    ProjectRepo,
+    ProjectSlugConflictError,
     ServerNotFoundError,
     ServerRepo,
     SettingsRepo,
@@ -100,7 +114,8 @@ _SETTINGS_DEFAULTS = {
 }
 
 
-def _server_to_response(server) -> ServerResponse:
+def _server_to_response(server, project_slugs_by_id: Optional[dict[int, str]] = None) -> ServerResponse:
+    project_slugs_by_id = project_slugs_by_id or {}
     return ServerResponse(
         slug=server.slug, name=server.name, upstream_url=server.upstream_url,
         enabled=server.enabled, in_aggregate=server.in_aggregate,
@@ -114,20 +129,42 @@ def _server_to_response(server) -> ServerResponse:
         # never resolves" split the plan calls out as the thing that keeps secrets out of the UI.
         upstream_auth_header_is_reference=is_reference(server.upstream_auth_header),
         health_reason=server.health_reason,
+        project_id=server.project_id,
+        project_slug=project_slugs_by_id.get(server.project_id) if server.project_id else None,
     )
 
 
-def _key_to_response(key) -> KeyResponse:
+def _key_to_response(key, project_slugs_by_id: Optional[dict[int, str]] = None) -> KeyResponse:
+    project_slugs_by_id = project_slugs_by_id or {}
     return KeyResponse(
         id=key.id, name=key.name, key_prefix=key.key_prefix, enabled=key.enabled,
         server_scopes=key.server_scopes, created_at=key.created_at, last_used_at=key.last_used_at,
         quota_calls=key.quota_calls, quota_period=key.quota_period,
+        project_id=key.project_id,
+        project_slug=project_slugs_by_id.get(key.project_id) if key.project_id else None,
     )
 
 
 async def _get_settings_with_defaults(settings_repo: SettingsRepo) -> dict[str, str]:
     stored = await settings_repo.get_all()
     return {**_SETTINGS_DEFAULTS, **stored}
+
+
+async def _resolve_project_id(project_repo: ProjectRepo, project_slug: str) -> int:
+    """Enterprise #4: shared by every route that accepts a project_slug in its request body
+    (server/key create) — 404s on an unknown slug rather than letting a typo silently create a
+    NULL-project row (see 0011_projects.sql's header comment on why that must fail closed)."""
+    try:
+        project = await project_repo.get(project_slug)
+    except ProjectNotFoundError:
+        raise HTTPException(status_code=404, detail=f"project '{project_slug}' not found")
+    return project.id
+
+
+async def _project_slug_map(project_repo: ProjectRepo) -> dict[int, str]:
+    """id -> slug for every project, used to populate ServerResponse/KeyResponse.project_slug
+    without an N+1 lookup per row."""
+    return {p.id: p.slug for p in await project_repo.list()}
 
 
 def build_control_plane_router(
@@ -147,6 +184,8 @@ def build_control_plane_router(
     secret_provider: Optional[SecretProvider] = None,
     tracing: Optional[TracingManager] = None,
     usage_repo: Optional["UsageRepo"] = None,
+    project_repo: Optional[ProjectRepo] = None,
+    project_member_repo: Optional[ProjectMemberRepo] = None,
 ) -> APIRouter:
     # enterprise #2 (RBAC): the router used to carry ONE blanket
     # dependencies=[Depends(require_admin)] gate — authenticated meant authorized for
@@ -175,16 +214,43 @@ def build_control_plane_router(
     # archon/setup.py's router, which is deliberately never behind require_admin — see that
     # module for the actual route.
 
+    # Enterprise #4 (multi-tenancy, issue #5): servers are a PROJECT-owned resource — every route
+    # below that touches one switches from require_role (global) to require_project_role
+    # (project-scoped). GET /servers with no project filter is the one exception among the
+    # "list" routes: it stays require_role("viewer") + returns EVERY server regardless of
+    # project, because a project_id isn't derivable from the route itself (there's no
+    # {project_id}/{slug} in the URL) — the frontend passes a `project_id` QUERY param to scope
+    # it client-side-requested, and a caller who omits it gets the instance-wide list, same
+    # shape as GET /users (also instance-wide, also viewer+). This does NOT leak project-scoped
+    # authority: /servers is `viewer`-gated globally same as before, and a global viewer could
+    # already see every server pre-this-feature (RBAC's ROLE_RANK never had a per-server
+    # dimension until now) — enumerating project_slug alongside each row is strictly less new
+    # information than the slug/upstream_url/policy every viewer already saw. Project-scoped
+    # WRITE routes below are what actually enforce the new boundary.
     @router.get("/servers", response_model=list[ServerResponse], dependencies=[Depends(require_role("viewer"))])
-    async def list_servers():
-        servers = await server_repo.list()
-        return [_server_to_response(s) for s in servers]
+    async def list_servers(project_id: Optional[int] = None):
+        servers = await server_repo.list(project_id=project_id)
+        project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
+        return [_server_to_response(s, project_slugs) for s in servers]
 
     @router.post("/servers", response_model=ServerResponse, status_code=201)
     async def create_server(
         body: ServerCreateRequest, request: Request,
-        principal: Principal = Depends(require_role("admin")),
+        principal: Principal = Depends(require_admin),
     ):
+        # Enterprise #4: the project is named in the REQUEST BODY (project_slug), not the URL
+        # path, so this can't use require_project_role's path-param resolvers as a route
+        # dependency the way slug-keyed routes below do — the body has to be parsed first. Same
+        # fail-closed resolve_project_role() call those dependencies use internally, just
+        # invoked directly here after resolving project_slug -> project_id. Creating a server
+        # requires project-admin in the TARGET project (or global admin, via the superset).
+        project_id = await _resolve_project_id(project_repo, body.project_slug)
+        role = await resolve_project_role(
+            principal=principal, project_id=project_id, project_member_repo=project_member_repo,
+        )
+        if PROJECT_ROLE_RANK.get(role) is None or PROJECT_ROLE_RANK[role] < PROJECT_ROLE_RANK["admin"]:
+            raise HTTPException(status_code=403, detail="insufficient project role")
+
         # Enterprise #5: what actually lands in the DB may differ from what the operator typed —
         # a literal typed while the `encrypted` tier is selected is encrypted here BEFORE it
         # ever reaches server_repo.create; a vault:// reference or a literal under `local`/
@@ -195,6 +261,7 @@ def build_control_plane_router(
                 slug=body.slug, name=body.name, upstream_url=body.upstream_url,
                 enabled=body.enabled, in_aggregate=body.in_aggregate,
                 upstream_auth_header=stored_auth_header,
+                project_id=project_id,
             )
         except SlugConflictError:
             raise HTTPException(status_code=409, detail=f"server slug '{body.slug}' already exists")
@@ -237,9 +304,13 @@ def build_control_plane_router(
                 pass  # best-effort; the background poller will retry on its own schedule
             server = await server_repo.get(server.slug)
 
-        return _server_to_response(server)
+        project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
+        return _server_to_response(server, project_slugs)
 
-    @router.post("/servers/{slug}/probe", response_model=ServerResponse, dependencies=[Depends(require_role("operator"))])
+    @router.post(
+        "/servers/{slug}/probe", response_model=ServerResponse,
+        dependencies=[Depends(require_project_role("poweruser", project_id_param=None, server_slug_param="slug"))],
+    )
     async def probe_server_now(slug: str):
         try:
             server = await server_repo.get(slug)
@@ -271,20 +342,27 @@ def build_control_plane_router(
                     )
                 except asyncio.TimeoutError:
                     pass
-        return _server_to_response(await server_repo.get(slug))
+        project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
+        return _server_to_response(await server_repo.get(slug), project_slugs)
 
-    @router.get("/servers/{slug}", response_model=ServerResponse, dependencies=[Depends(require_role("viewer"))])
+    @router.get(
+        "/servers/{slug}", response_model=ServerResponse,
+        dependencies=[Depends(require_project_role("viewer", project_id_param=None, server_slug_param="slug"))],
+    )
     async def get_server(slug: str):
         try:
             server = await server_repo.get(slug)
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
-        return _server_to_response(server)
+        project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
+        return _server_to_response(server, project_slugs)
 
     @router.put("/servers/{slug}", response_model=ServerResponse)
     async def update_server(
         slug: str, body: ServerUpdateRequest, request: Request,
-        principal: Principal = Depends(require_role("admin")),
+        principal: Principal = Depends(
+            require_project_role("admin", project_id_param=None, server_slug_param="slug")
+        ),
     ):
         # F23: upstream_auth_header needs three states (unset/set-to-value/cleared-to-null),
         # which a plain `Optional[str] = None` field can't distinguish on its own — checking
@@ -355,12 +433,15 @@ def build_control_plane_router(
                     actor=principal.actor, client_ip=request.client.host if request.client else None,
                 )
 
-        return _server_to_response(server)
+        project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
+        return _server_to_response(server, project_slugs)
 
     @router.delete("/servers/{slug}", status_code=204)
     async def delete_server(
         slug: str, request: Request,
-        principal: Principal = Depends(require_role("admin")),
+        principal: Principal = Depends(
+            require_project_role("admin", project_id_param=None, server_slug_param="slug")
+        ),
     ):
         try:
             # Fetch before state for audit
@@ -395,7 +476,10 @@ def build_control_plane_router(
             # bucket (and its old consumed-token state) must not still be registered under it.
             rate_limiter.unregister(server_key(slug))
 
-    @router.get("/servers/{slug}/tools", response_model=ServerToolsResponse, dependencies=[Depends(require_role("viewer"))])
+    @router.get(
+        "/servers/{slug}/tools", response_model=ServerToolsResponse,
+        dependencies=[Depends(require_project_role("viewer", project_id_param=None, server_slug_param="slug"))],
+    )
     async def get_server_tools(slug: str, force_refresh: bool = False):
         try:
             server = await server_repo.get(slug)
@@ -435,14 +519,16 @@ def build_control_plane_router(
     if pipeline is not None:
         @router.post(
             "/servers/{slug}/test-call", response_model=ToolTestResponse,
-            dependencies=[Depends(require_role("operator"))],
+            dependencies=[Depends(
+                require_project_role("poweruser", project_id_param=None, server_slug_param="slug")
+            )],
         )
         async def test_call(slug: str, request: Request, body: ToolTestRequest):
             # Feature #1 (in-UI tool tester): dispatches through the REAL pipeline — real rate
             # limiting, real policy evaluation, real audit logging — rather than a second
             # evaluator that could drift from the one actually enforcing. `skip_api_key_auth`
             # bypasses only the data plane's bearer-token check (the caller is already
-            # authenticated with at least operator role via require_role above); `force_generation`
+            # authenticated with at least project-poweruser via require_project_role above); `force_generation`
             # forces the bridged path so this always goes through the same evaluate() call a
             # real 2026-generation client's tools/call would. `origin="test"` tags the resulting
             # audit row so it never counts toward /stats or the default Audit page view.
@@ -491,7 +577,10 @@ def build_control_plane_router(
                 upstream_response=upstream_response,
             )
 
-    @router.get("/servers/{slug}/policy", response_model=PolicyResponse, dependencies=[Depends(require_role("viewer"))])
+    @router.get(
+        "/servers/{slug}/policy", response_model=PolicyResponse,
+        dependencies=[Depends(require_project_role("viewer", project_id_param=None, server_slug_param="slug"))],
+    )
     async def get_policy(slug: str):
         try:
             server = await server_repo.get(slug)
@@ -503,7 +592,9 @@ def build_control_plane_router(
     @router.put("/servers/{slug}/policy", response_model=PolicyResponse)
     async def set_policy(
         slug: str, body: PolicyUpdateRequest, request: Request,
-        principal: Principal = Depends(require_role("operator")),
+        principal: Principal = Depends(
+            require_project_role("poweruser", project_id_param=None, server_slug_param="slug")
+        ),
     ):
         try:
             server = await server_repo.get(slug)
@@ -534,24 +625,56 @@ def build_control_plane_router(
 
         return PolicyResponse(**after_policy.model_dump())
 
-    @router.get("/keys", response_model=list[KeyResponse], dependencies=[Depends(require_role("admin"))])
-    async def list_keys():
-        keys = await api_keys.list()
-        return [_key_to_response(k) for k in keys]
+    # Enterprise #4: keys are project-owned (design decision 7 — project-bound transitively).
+    # GET /keys with no project filter stays global-admin-only exactly as before (a full,
+    # cross-project key listing is instance-wide sensitive information, unlike GET /servers'
+    # already-visible-to-viewers shape above) — a project admin sees their OWN project's keys via
+    # the `project_id` query param on this SAME route, gated by resolve_project_role inline below
+    # since a bare `require_role("admin")` would wrongly exclude a project-admin-but-global-viewer
+    # from ever listing their own project's keys, and require_project_role's path-param
+    # resolvers don't fit a query-param-scoped list route.
+    @router.get("/keys", response_model=list[KeyResponse])
+    async def list_keys(
+        project_id: Optional[int] = None,
+        principal: Principal = Depends(require_admin),
+    ):
+        if project_id is None:
+            if principal.role != "admin":
+                raise HTTPException(status_code=403, detail="insufficient role")
+            keys = await api_keys.list()
+        else:
+            role = await resolve_project_role(
+                principal=principal, project_id=project_id, project_member_repo=project_member_repo,
+            )
+            if PROJECT_ROLE_RANK.get(role) is None or PROJECT_ROLE_RANK[role] < PROJECT_ROLE_RANK["admin"]:
+                raise HTTPException(status_code=403, detail="insufficient project role")
+            keys = await api_keys.list(project_id=project_id)
+        project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
+        return [_key_to_response(k, project_slugs) for k in keys]
 
     @router.post("/keys", response_model=KeyCreatedResponse, status_code=201)
     async def create_key(
         body: KeyCreateRequest, request: Request,
-        principal: Principal = Depends(require_role("admin")),
+        principal: Principal = Depends(require_admin),
     ):
-        # 02-rbac.md design decision 3: key minting is admin-only, not merely because keys feel
-        # sensitive — an operator who could mint a key could use it against the DATA plane and
-        # act entirely outside their control-plane role, which would make the operator/admin
-        # boundary trivially bypassable. require_role("admin") above is what actually enforces
-        # this; see tests/integration/test_rbac.py's "operator cannot mint a key" case.
+        # 02-rbac.md design decision 3: key minting is a privileged action, not merely because
+        # keys feel sensitive — a caller who could mint a key could use it against the DATA
+        # plane and act entirely outside their control-plane role, which would make the
+        # poweruser/admin boundary trivially bypassable. Enterprise #4: now project-admin (of
+        # the TARGET project) rather than unconditionally global-admin — see
+        # tests/integration/test_rbac.py's "operator cannot mint a key" case for the global-role
+        # analogue this mirrors at the project level.
+        project_id = await _resolve_project_id(project_repo, body.project_slug)
+        role = await resolve_project_role(
+            principal=principal, project_id=project_id, project_member_repo=project_member_repo,
+        )
+        if PROJECT_ROLE_RANK.get(role) is None or PROJECT_ROLE_RANK[role] < PROJECT_ROLE_RANK["admin"]:
+            raise HTTPException(status_code=403, detail="insufficient project role")
+
         generated = await api_keys.create(
             name=body.name, server_scopes=body.server_scopes,
             quota_calls=body.quota_calls, quota_period=body.quota_period,
+            project_id=project_id,
         )
 
         if admin_event_repo is not None:
@@ -584,7 +707,9 @@ def build_control_plane_router(
     @router.patch("/keys/{key_id}", response_model=KeyResponse)
     async def patch_key(
         key_id: int, enabled: bool, request: Request,
-        principal: Principal = Depends(require_role("admin")),
+        principal: Principal = Depends(
+            require_project_role("admin", project_id_param=None, key_id_param="key_id")
+        ),
     ):
         # Fetch before state for audit
         key_before = await api_keys.get(key_id)
@@ -614,15 +739,21 @@ def build_control_plane_router(
 
         return _key_to_response(key_after)
 
-    @router.patch("/keys/{key_id}/quota", response_model=KeyResponse, dependencies=[Depends(require_role("admin"))])
+    @router.patch(
+        "/keys/{key_id}/quota", response_model=KeyResponse,
+        dependencies=[Depends(
+            require_project_role("admin", project_id_param=None, key_id_param="key_id")
+        )],
+    )
     async def patch_key_quota(
         key_id: int, body: KeyQuotaUpdateRequest, request: Request,
-        principal: Principal = Depends(require_role("admin")),
+        principal: Principal = Depends(require_admin),
     ):
         """Enterprise #11: sets or clears a key's quota. A separate route from PATCH /keys/{id}
-        (see KeyQuotaUpdateRequest's docstring) — admin-only, same as every other key-mutating
-        route (02-rbac.md design decision 3: a key is a data-plane credential, so changing what
-        it can do is as sensitive as minting one)."""
+        (see KeyQuotaUpdateRequest's docstring) — project-admin-only, same as every other
+        key-mutating route (02-rbac.md design decision 3: a key is a data-plane credential, so
+        changing what it can do is as sensitive as minting one; enterprise #4 moves the floor
+        from global-admin to project-admin, same as key minting above)."""
         key_before = await api_keys.get(key_id)
         if key_before is None:
             raise HTTPException(status_code=404, detail="key not found")
@@ -652,7 +783,9 @@ def build_control_plane_router(
     @router.delete("/keys/{key_id}", status_code=204)
     async def delete_key(
         key_id: int, request: Request,
-        principal: Principal = Depends(require_role("admin")),
+        principal: Principal = Depends(
+            require_project_role("admin", project_id_param=None, key_id_param="key_id")
+        ),
     ):
         # Fetch before state for audit
         key_before = await api_keys.get(key_id)
@@ -771,7 +904,8 @@ def build_control_plane_router(
             ):
                 raise HTTPException(status_code=403, detail="include_credentials requires admin role")
             result = await export_config(
-                server_repo, settings_repo, include_credentials=include_credentials
+                server_repo, settings_repo, include_credentials=include_credentials,
+                project_repo=project_repo,
             )
             filename = f"acropolis-config-{utcnow().replace(':', '').split('.')[0]}.yaml"
             headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
@@ -791,7 +925,12 @@ def build_control_plane_router(
             # 02-rbac.md design decision 1: config import is admin-only even though it edits
             # policies (which operators may do directly) — one import rewrites the entire
             # instance in one shot, a different blast radius from a single server's policy.
-            plan = await plan_import(server_repo, settings_repo, body.yaml, apply=body.apply)
+            # Enterprise #4: stays global-admin-only, UNCHANGED gate — a project admin does not
+            # get config-import authority merely by being a project admin (03-multi-tenancy.md
+            # design decision 8). Only the YAML shape changes (project_slug per server).
+            plan = await plan_import(
+                server_repo, settings_repo, body.yaml, apply=body.apply, project_repo=project_repo,
+            )
 
             # Record config import as ONE event, not one per touched server — otherwise a
             # routine import drowns the log it's supposed to make legible.
@@ -830,19 +969,34 @@ def build_control_plane_router(
             return WebhookTestResponse(ok=ok, status_code=status_code, error=error)
 
     if audit_repo is not None:
+        # Enterprise #4: /stats stays GLOBAL-viewer-gated and instance-wide by default — a
+        # judgment call, documented here since the plan doesn't spell this specific route out.
+        # Rationale: it's a dashboard SUMMARY (counts only, no individual server/key identity
+        # beyond what a global viewer already saw pre-feature via GET /servers), and every prior
+        # enterprise item's byte-identical-on-upgrade guarantee means an existing dashboard
+        # integration calling this with no project_id must keep returning the SAME instance-wide
+        # numbers it always has. `project_id` is an OPTIONAL filter for the frontend's
+        # project-scoped dashboard view — a caller who passes it still only needs global-viewer
+        # (not project-viewer), matching this route's existing instance-wide gate; a stricter
+        # project-role-gated variant was considered and rejected as inconsistent with GET
+        # /servers' own "global viewer sees everything" call directly above.
         @router.get("/stats", response_model=StatsResponse, dependencies=[Depends(require_role("viewer"))])
-        async def get_stats():
+        async def get_stats(project_id: Optional[int] = None):
             from datetime import datetime, timedelta, timezone
 
             since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-            requests_24h = await audit_repo.count_since(since)
-            blocked_24h = await audit_repo.count_since(since, decision="BLOCKED")
-            allowed_24h = await audit_repo.count_since(since, decision="ALLOWED")
+            servers = await server_repo.list(project_id=project_id)
+            server_slug_in = [s.slug for s in servers] if project_id is not None else None
+
+            requests_24h = await audit_repo.count_since(since, server_slug_in=server_slug_in)
+            blocked_24h = await audit_repo.count_since(since, decision="BLOCKED", server_slug_in=server_slug_in)
+            allowed_24h = await audit_repo.count_since(since, decision="ALLOWED", server_slug_in=server_slug_in)
             # Excludes origin='test' for the same reason count_since does — the dashboard
             # shouldn't surface an operator's own Try-it calls as if they were real traffic.
-            recent_blocked = await audit_repo.query(decision="BLOCKED", limit=10, origin=None)
+            recent_blocked = await audit_repo.query(
+                decision="BLOCKED", limit=10, origin=None, server_slug_in=server_slug_in,
+            )
 
-            servers = await server_repo.list()
             healthy = sum(1 for s in servers if s.health_status == "healthy")
             unhealthy = sum(1 for s in servers if s.health_status == "unhealthy")
 
@@ -858,23 +1012,31 @@ def build_control_plane_router(
                 recent_blocked=recent_blocked,
             )
 
+        # Enterprise #4: same instance-wide-by-default, optional project_id filter shape as
+        # /stats above — audit_events lives in audit.db (a separate connection from
+        # servers/projects), so project scoping here resolves the project's server slugs first
+        # and passes them as server_slug_in (see AuditRepo.query's own docstring on why this is
+        # a slug-set filter rather than a JOIN).
         @router.get("/audit", response_model=list[AuditEventResponse], dependencies=[Depends(require_role("viewer"))])
         async def query_audit(
             server_slug: Optional[str] = None, decision: Optional[str] = None,
             tool: Optional[str] = None, before_id: Optional[int] = None, limit: int = 100,
             api_key_id: Optional[int] = None, after: Optional[str] = None,
             before: Optional[str] = None, search: Optional[str] = None,
-            include_test: bool = False,
+            include_test: bool = False, project_id: Optional[int] = None,
         ):
             # Feature #1 (tool tester): Try-it calls are tagged origin='test' and excluded from
             # the default history view, same as they're excluded from /stats — an operator
             # testing their own policy shouldn't see it appear as if it were real traffic unless
             # they explicitly ask to (include_test=true).
+            server_slug_in = None
+            if project_id is not None:
+                server_slug_in = [s.slug for s in await server_repo.list(project_id=project_id)]
             events = await audit_repo.query(
                 server_slug=server_slug, decision=decision, tool=tool,
                 before_id=before_id, limit=min(limit, 500),
                 api_key_id=api_key_id, after=after, before=before, search=search,
-                origin=_UNSET if include_test else None,
+                origin=_UNSET if include_test else None, server_slug_in=server_slug_in,
             )
             return [AuditEventResponse(**{**e, "bridged": bool(e["bridged"])}) for e in events]
 
@@ -884,7 +1046,11 @@ def build_control_plane_router(
             tool: Optional[str] = None, api_key_id: Optional[int] = None,
             after: Optional[str] = None, before: Optional[str] = None,
             search: Optional[str] = None, include_test: bool = False,
+            project_id: Optional[int] = None,
         ):
+            server_slug_in = None
+            if project_id is not None:
+                server_slug_in = [s.slug for s in await server_repo.list(project_id=project_id)]
             columns = [
                 "id", "ts", "server_slug", "api_key_id", "client_ip", "endpoint", "rpc_method",
                 "tool", "decision", "rule", "matched", "reason", "args_summary", "bridged",
@@ -914,7 +1080,7 @@ def build_control_plane_router(
                         server_slug=server_slug, decision=decision, tool=tool,
                         before_id=before_id, limit=500, api_key_id=api_key_id,
                         after=after, before=before, search=search,
-                        origin=_UNSET if include_test else None,
+                        origin=_UNSET if include_test else None, server_slug_in=server_slug_in,
                     )
                     if not events:
                         break
@@ -932,6 +1098,14 @@ def build_control_plane_router(
             )
 
         if audit_logger is not None:
+            # Enterprise #4: NOT project-scoped — a deliberate, documented call. This is a live
+            # SSE tail of the in-process AuditLogger broadcast queue (see AuditLogger.subscribe),
+            # not a DB query; filtering it per-project would mean holding a snapshot of the
+            # project's server slugs for the lifetime of the connection and filtering each event
+            # against it, which is a reasonable future enhancement but adds real complexity for a
+            # live-tail feature that's already global-viewer-gated (same visibility a global
+            # viewer already has via polling /audit with no project_id). Left instance-wide here;
+            # documented rather than silently scoped or silently left ambiguous.
             @router.get("/audit/tail", dependencies=[Depends(require_role("viewer"))])
             async def audit_tail(request: Request):
                 async def event_stream():
@@ -954,7 +1128,7 @@ def build_control_plane_router(
         @router.get("/usage", response_model=UsageResponse, dependencies=[Depends(require_role("viewer"))])
         async def get_usage(
             api_key_id: Optional[int] = None, server_slug: Optional[str] = None,
-            tool: Optional[str] = None, period: str = "day",
+            tool: Optional[str] = None, period: str = "day", project_id: Optional[int] = None,
             principal: Principal = Depends(require_role("viewer")),
         ):
             """Enterprise #11. viewer+ (read-only, consistent with how /audit is already scoped
@@ -978,6 +1152,11 @@ def build_control_plane_router(
             how long this Acropolis instance has been running). This is a QUERY window,
             independent of any key's configured quota_period — a key with no quota at all can
             still be queried here.
+
+            `project_id` (enterprise #4, optional) filters to one project's rollups directly on
+            usage_rollups.project_id — unlike /audit, this table lives in gateway.db alongside
+            servers/projects, so no slug-set indirection is needed. Same instance-wide-by-default
+            shape as /stats and /audit above.
             """
             if period not in ("day", "month", "all"):
                 raise HTTPException(status_code=400, detail="period must be 'day', 'month', or 'all'")
@@ -995,6 +1174,7 @@ def build_control_plane_router(
 
             raw = await usage_repo.query(
                 api_key_id=api_key_id, server_id=server_id, tool=tool, since_iso=since_iso,
+                project_id=project_id,
             )
 
             # Sum the raw hourly buckets down to one row per (key, server, tool) — see
@@ -1077,6 +1257,205 @@ def build_control_plane_router(
             user_id=principal.user_id, username=principal.username,
             role=principal.role, auth_source=principal.auth_source,
         )
+
+    # Enterprise #4 (multi-tenancy, issue #5): project CRUD is INSTANCE-WIDE and GLOBAL-ADMIN-
+    # ONLY (creating/deleting a project is instance-level authority per design decision 2/3 of
+    # 03-multi-tenancy.md) — these stay on require_role, never require_project_role. Membership
+    # management (who holds what PROJECT role) is the one place a project-admin (not necessarily
+    # a global admin) gets write access, gated by require_project_role("admin", ...) below.
+    if project_repo is not None and project_member_repo is not None:
+        @router.get("/projects", response_model=list[ProjectResponse], dependencies=[Depends(require_role("viewer"))])
+        async def list_projects(principal: Principal = Depends(require_admin)):
+            # viewer+ globally can SEE every project (same "list is cheap, low-sensitivity"
+            # reasoning as GET /servers/GET /users) — this is what populates the frontend's
+            # project switcher for every signed-in user, not just those with explicit
+            # memberships (a global admin with zero membership rows still needs to see every
+            # project to exercise the superset). A non-admin's per-project AUTHORITY is still
+            # fully gated by require_project_role on the actual project-scoped routes; this list
+            # route only discloses project id/slug/name, which is not sensitive on its own.
+            return [
+                ProjectResponse(id=p.id, slug=p.slug, name=p.name, created_at=p.created_at)
+                for p in await project_repo.list()
+            ]
+
+        @router.post("/projects", response_model=ProjectResponse, status_code=201)
+        async def create_project(
+            body: ProjectCreateRequest, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
+            try:
+                project = await project_repo.create(slug=body.slug, name=body.name)
+            except ProjectSlugConflictError:
+                raise HTTPException(status_code=409, detail=f"project slug '{body.slug}' already exists")
+
+            if admin_event_repo is not None:
+                await record(
+                    admin_event_repo,
+                    action="project.create",
+                    summary=f"created project '{body.slug}'",
+                    actor=principal.actor,
+                    target_type="project",
+                    target_id=body.slug,
+                    after={"slug": body.slug, "name": body.name},
+                    client_ip=request.client.host if request.client else None,
+                )
+            return ProjectResponse(
+                id=project.id, slug=project.slug, name=project.name, created_at=project.created_at
+            )
+
+        @router.delete("/projects/{project_slug}", status_code=204)
+        async def delete_project(
+            project_slug: str, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
+            try:
+                project = await project_repo.get(project_slug)
+            except ProjectNotFoundError:
+                raise HTTPException(status_code=404, detail="project not found")
+
+            # Refuse rather than orphan/cascade: servers.project_id and api_keys.project_id have
+            # NO ON DELETE clause (see 0011_projects.sql), so deleting a project that still owns
+            # real infrastructure would leave those rows pointing at a project_id that no longer
+            # exists — every project-scoping filter would then silently exclude them from every
+            # list, an "infrastructure vanished" bug far worse than a blocked delete. The 'default'
+            # project itself is not special-cased beyond this same check: it can be deleted once
+            # it holds nothing, exactly like any other project.
+            remaining_servers = await server_repo.list(project_id=project.id)
+            remaining_keys = await api_keys.list(project_id=project.id)
+            if remaining_servers or remaining_keys:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"project '{project_slug}' still has {len(remaining_servers)} server(s) and "
+                        f"{len(remaining_keys)} key(s) — move or delete them first"
+                    ),
+                )
+
+            await project_repo.delete(project_slug)
+            if admin_event_repo is not None:
+                await record(
+                    admin_event_repo,
+                    action="project.delete",
+                    summary=f"deleted project '{project_slug}'",
+                    actor=principal.actor,
+                    target_type="project",
+                    target_id=project_slug,
+                    before={"slug": project.slug, "name": project.name},
+                    client_ip=request.client.host if request.client else None,
+                )
+
+        @router.get(
+            "/projects/{project_id}/members", response_model=list[ProjectMemberResponse],
+            dependencies=[Depends(require_project_role("viewer", project_id_param="project_id"))],
+        )
+        async def list_project_members(project_id: int):
+            try:
+                await project_repo.get_by_id(project_id)
+            except ProjectNotFoundError:
+                raise HTTPException(status_code=404, detail="project not found")
+            members = await project_member_repo.list_for_project(project_id)
+            if not members or user_repo is None:
+                return [
+                    ProjectMemberResponse(user_id=m.user_id, username=f"user#{m.user_id}", role=m.role)
+                    for m in members
+                ]
+            # Bulk-resolve usernames — same N+1 avoidance discipline as GET /usage's
+            # key_prefixes/server_slugs lookups above (one list() call, not one get_by_id per
+            # member).
+            usernames = {u.id: u.username for u in await user_repo.list()}
+            return [
+                ProjectMemberResponse(
+                    user_id=m.user_id, username=usernames.get(m.user_id, f"user#{m.user_id}"), role=m.role,
+                )
+                for m in members
+            ]
+
+        @router.put(
+            "/projects/{project_id}/members", response_model=ProjectMemberResponse,
+            dependencies=[Depends(require_project_role("admin", project_id_param="project_id"))],
+        )
+        async def upsert_project_member(
+            project_id: int, body: ProjectMemberUpsertRequest, request: Request,
+            principal: Principal = Depends(require_admin),
+        ):
+            """Add a member or change an existing member's role — project-admin-or-global-admin,
+            per design decision 3 (membership management is where a project admin, not just a
+            global admin, gets real write authority)."""
+            try:
+                project = await project_repo.get_by_id(project_id)
+            except ProjectNotFoundError:
+                raise HTTPException(status_code=404, detail="project not found")
+            if user_repo is not None:
+                try:
+                    target_user = await user_repo.get_by_id(body.user_id)
+                except UserNotFoundError:
+                    raise HTTPException(status_code=404, detail="user not found")
+            else:
+                target_user = None
+
+            existing = await project_member_repo.get_membership(user_id=body.user_id, project_id=project_id)
+            member = await project_member_repo.upsert(
+                user_id=body.user_id, project_id=project_id, role=body.role,
+            )
+
+            if admin_event_repo is not None:
+                action = "project.member_role_change" if existing is not None else "project.member_add"
+                username = target_user.username if target_user is not None else f"user#{body.user_id}"
+                summary = (
+                    f"{'changed' if existing else 'added'} member '{username}' in project "
+                    f"'{project.slug}'" + (f": {existing.role} -> {body.role}" if existing else f" as {body.role}")
+                )
+                await record(
+                    admin_event_repo,
+                    action=action,
+                    summary=summary,
+                    actor=principal.actor,
+                    target_type="project_member",
+                    target_id=f"{project.slug}:{body.user_id}",
+                    before={"role": existing.role} if existing is not None else None,
+                    after={"role": body.role},
+                    client_ip=request.client.host if request.client else None,
+                )
+
+            username = target_user.username if target_user is not None else f"user#{body.user_id}"
+            return ProjectMemberResponse(user_id=member.user_id, username=username, role=member.role)
+
+        @router.delete(
+            "/projects/{project_id}/members/{user_id}", status_code=204,
+            dependencies=[Depends(require_project_role("admin", project_id_param="project_id"))],
+        )
+        async def remove_project_member(
+            project_id: int, user_id: int, request: Request,
+            principal: Principal = Depends(require_admin),
+        ):
+            try:
+                project = await project_repo.get_by_id(project_id)
+            except ProjectNotFoundError:
+                raise HTTPException(status_code=404, detail="project not found")
+
+            existing = await project_member_repo.get_membership(user_id=user_id, project_id=project_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="membership not found")
+
+            await project_member_repo.remove(user_id=user_id, project_id=project_id)
+
+            if admin_event_repo is not None:
+                username = f"user#{user_id}"
+                if user_repo is not None:
+                    try:
+                        username = (await user_repo.get_by_id(user_id)).username
+                    except UserNotFoundError:
+                        pass
+                await record(
+                    admin_event_repo,
+                    action="project.member_remove",
+                    summary=f"removed member '{username}' from project '{project.slug}'",
+                    actor=principal.actor,
+                    target_type="project_member",
+                    target_id=f"{project.slug}:{user_id}",
+                    before={"role": existing.role},
+                    client_ip=request.client.host if request.client else None,
+                )
 
     # User management — enterprise #1/#2. All admin-only: creating a user, changing a role, or
     # disabling an account are exactly the "irreversible or security-lowering" actions

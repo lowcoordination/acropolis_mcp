@@ -26,7 +26,17 @@ from argus.toolslist import ToolsCache
 from argus.tracing import build_tracing_manager
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
-from db.repo import AdminEventRepo, ApiKeyRepo, AuditRepo, ServerRepo, SettingsRepo, UsageRepo, UserRepo
+from db.repo import (
+    AdminEventRepo,
+    ApiKeyRepo,
+    AuditRepo,
+    ProjectMemberRepo,
+    ProjectRepo,
+    ServerRepo,
+    SettingsRepo,
+    UsageRepo,
+    UserRepo,
+)
 from stoa.gitops import ConfigSource
 from stoa.health import HealthPoller
 from stoa.retention import AuditRetentionJob
@@ -80,6 +90,11 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     audit_repo = AuditRepo(db)
     settings_repo = SettingsRepo(db)
     user_repo = UserRepo(db)
+    # Enterprise #4 (multi-tenancy, issue #5): always constructed, same "no disabled build"
+    # shape as usage_repo above — project scoping is on unconditionally post-migration (every
+    # instance has at least the backfilled 'default' project).
+    project_repo = ProjectRepo(db)
+    project_member_repo = ProjectMemberRepo(db)
     # Enterprise #11: usage_repo is always constructed (unlike secret_provider/tracing, there's
     # no "disabled" build for this one — quotas/usage query availability doesn't depend on an
     # env var) and always wired into Pipeline. The feature's own off-by-default guarantee comes
@@ -136,7 +151,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         audit_repo, settings_repo,
         check_interval_seconds=settings.audit_retention_check_interval_seconds,
     )
-    config_source = ConfigSource(server_repo, settings_repo)
+    config_source = ConfigSource(server_repo, settings_repo, project_repo=project_repo)
     config_source.set_webhook_dispatcher(webhook_dispatcher)
 
     pipeline = Pipeline(
@@ -223,6 +238,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.pipeline = pipeline
     app.state.aggregate_pipeline = aggregate_pipeline
     app.state.usage_repo = usage_repo
+    app.state.project_repo = project_repo
+    app.state.project_member_repo = project_member_repo
 
     oidc_attempts = AttemptStore()
     app.include_router(build_setup_router(settings_repo, rate_limiter, user_repo, http_client, oidc_attempts))
@@ -230,6 +247,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
         rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source, user_repo,
         secret_provider=secret_provider, tracing=tracing, usage_repo=usage_repo,
+        project_repo=project_repo, project_member_repo=project_member_repo,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo, config_source))

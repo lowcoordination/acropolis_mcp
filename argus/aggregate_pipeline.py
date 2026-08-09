@@ -77,7 +77,7 @@ class AggregatePipeline:
         # and would otherwise skip authentication entirely regardless of auth_mode. Check
         # up front, before even parsing the body, so every method on this endpoint is gated.
         try:
-            await self._per_server.authenticate_no_scope(request)
+            api_key_id = await self._per_server.authenticate_no_scope(request)
         except RoutingError as e:
             await self._audit.log(
                 server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
@@ -126,11 +126,11 @@ class AggregatePipeline:
         params = body_json.get("params", {}) or {}
 
         if rpc_method == "tools/list":
-            return await self._handle_tools_list(rpc_id, start, client_ip)
+            return await self._handle_tools_list(rpc_id, start, client_ip, api_key_id)
         if rpc_method == "tools/call":
             return await self._handle_tools_call(request, body_json, rpc_id, params)
         if rpc_method == "server/discover":
-            return await self._handle_discover(rpc_id)
+            return await self._handle_discover(rpc_id, api_key_id)
 
         await self._audit.log(
             server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
@@ -142,8 +142,25 @@ class AggregatePipeline:
             status_code=501, media_type="application/json",
         )
 
-    async def _handle_discover(self, rpc_id: Any) -> Response:
-        servers = await self._servers.list()
+    async def _caller_project_id(self, api_key_id: Optional[int]) -> Optional[int]:
+        """Enterprise #4 (multi-tenancy, issue #5): resolves which project the aggregate view
+        should be scoped to. `None` (open auth_mode, no key at all) means "no project filter" —
+        an unauthenticated/keyless deployment has no notion of a calling project, so the
+        aggregate stays instance-wide in that mode, same as it always has. A real key ALWAYS
+        scopes to its own project — this is the deliberate behavior change from pre-feature
+        Acropolis (see docs/projects.md): the aggregate tools/list/discover used to span every
+        registered server regardless of which key called it; now it spans only that key's
+        project's servers. There is no global-admin-superset concept on the data plane (see
+        Pipeline._authenticate's own comment on why) — a key's project is a property of the KEY
+        row, full stop, regardless of what global/project role its owner happens to hold."""
+        if api_key_id is None:
+            return None
+        key = await self._api_keys.get(api_key_id)
+        return key.project_id if key is not None else None
+
+    async def _handle_discover(self, rpc_id: Any, api_key_id: Optional[int] = None) -> Response:
+        project_id = await self._caller_project_id(api_key_id)
+        servers = await self._servers.list(project_id=project_id)
         result = synthesize_gateway_discover(servers)
         return Response(
             content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": result}),
@@ -186,7 +203,9 @@ class AggregatePipeline:
                 )
         return namespaced_tools
 
-    async def _handle_tools_list(self, rpc_id: Any, start: float, client_ip=None) -> Response:
+    async def _handle_tools_list(
+        self, rpc_id: Any, start: float, client_ip=None, api_key_id: Optional[int] = None,
+    ) -> Response:
         # F14 fix: this used to be a plain `for server in servers: await get_policy(...); await
         # get_filtered_tools(...)` loop — every server's cost (a full upstream handshake plus a
         # tools/list round-trip on a cache miss) was SUMMED, sequentially. With 8 registered
@@ -194,7 +213,14 @@ class AggregatePipeline:
         # one client tools/list call could block ~4 minutes — and agents typically call
         # tools/list first, so this was the very first thing a user experienced. Also: the
         # aggregate path never audited at all, unlike the per-server path.
-        servers = [s for s in (await self._servers.list()) if s.enabled and s.in_aggregate]
+        #
+        # Enterprise #4: project_id=None (open auth_mode) means unfiltered, matching pre-feature
+        # instance-wide behavior in that mode; a real key scopes to its own project — see
+        # _caller_project_id's docstring for why this is a deliberate, documented behavior change.
+        project_id = await self._caller_project_id(api_key_id)
+        servers = [
+            s for s in (await self._servers.list(project_id=project_id)) if s.enabled and s.in_aggregate
+        ]
         policies = await self._servers.get_policies_for([s.id for s in servers])
 
         results = await asyncio.gather(
