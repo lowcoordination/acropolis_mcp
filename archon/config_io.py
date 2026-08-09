@@ -168,6 +168,17 @@ def _policy_diff(current: ServerPolicy, incoming: ServerPolicy) -> list[str]:
         deltas.append(
             f"param_rules: {len(current.param_rules)} -> {len(incoming.param_rules)} tool(s) with rules"
         )
+    # Enterprise #10 (DLP) — kept in sync with archon/admin_audit.py's copy of this function
+    # (see that module's docstring on why this is duplicated rather than imported).
+    if current.dlp_detectors != incoming.dlp_detectors:
+        deltas.append(
+            f"dlp_detectors: {len(current.dlp_detectors)} -> {len(incoming.dlp_detectors)} configured"
+        )
+    if current.dlp_custom_patterns != incoming.dlp_custom_patterns:
+        deltas.append(
+            f"dlp_custom_patterns: {len(current.dlp_custom_patterns)} -> "
+            f"{len(incoming.dlp_custom_patterns)} configured"
+        )
     return deltas
 
 

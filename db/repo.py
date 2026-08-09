@@ -9,11 +9,44 @@ import aiosqlite
 from pydantic import BaseModel, ValidationError
 
 from .database import Database, utcnow
-from .models import ApiKeyRecord, ParamRule, ServerPolicy, ServerRecord, UserRecord
+from .models import ApiKeyRecord, DlpCustomPattern, ParamRule, ServerPolicy, ServerRecord, UserRecord
 
 logger = logging.getLogger("db.repo")
 
 _UNSET = object()  # sentinel: distinguishes "argument omitted" from "argument is None"
+
+
+# Enterprise #10 (DLP): dlp_detectors + dlp_custom_patterns are stored as ONE JSON TEXT column
+# (server_policies.dlp_config, migration 0008_gateway_dlp_config.sql) rather than further
+# normalized tables — see that migration's comment for why this departs from the original
+# plan doc's "no migration needed" premise, and why JSON-in-a-column (not per-detector rows)
+# was the call made here.
+def _encode_dlp_config(
+    detectors: dict[str, str], custom_patterns: list[DlpCustomPattern]
+) -> Optional[str]:
+    if not detectors and not custom_patterns:
+        # Keep the common (DLP entirely unconfigured) case as a NULL column rather than a
+        # literal '{"detectors": {}, "custom_patterns": []}' string — cosmetic, but matches
+        # this schema's existing convention of NULL-for-unset over empty-JSON-for-unset
+        # (e.g. server_policies.rate_limit, tool_policies.rate_limit).
+        return None
+    return json.dumps({
+        "detectors": detectors,
+        "custom_patterns": [p.model_dump() for p in custom_patterns],
+    })
+
+
+def _decode_dlp_config(raw: Optional[str]) -> tuple[dict[str, str], list[DlpCustomPattern]]:
+    if not raw:
+        return {}, []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("server_policies.dlp_config contained invalid JSON — treating as unset")
+        return {}, []
+    detectors = data.get("detectors") or {}
+    custom_patterns = [DlpCustomPattern(**p) for p in (data.get("custom_patterns") or [])]
+    return detectors, custom_patterns
 
 
 class ServerNotFoundError(Exception):
@@ -208,11 +241,12 @@ class ServerRepo:
 
     async def get_policy(self, server_id: int) -> ServerPolicy:
         cur = await self._read.execute(
-            "SELECT mode, rate_limit FROM server_policies WHERE server_id = ?", (server_id,)
+            "SELECT mode, rate_limit, dlp_config FROM server_policies WHERE server_id = ?", (server_id,)
         )
         row = await cur.fetchone()
         mode = row["mode"] if row else "passthrough"
         rate_limit = row["rate_limit"] if row else None
+        dlp_detectors, dlp_custom_patterns = _decode_dlp_config(row["dlp_config"] if row else None)
 
         cur = await self._read.execute(
             "SELECT tool_name, action FROM tool_policies WHERE server_id = ?", (server_id,)
@@ -238,7 +272,8 @@ class ServerRepo:
             )
 
         return ServerPolicy(
-            mode=mode, rate_limit=rate_limit, allowed=allowed, denied=denied, param_rules=param_rules
+            mode=mode, rate_limit=rate_limit, allowed=allowed, denied=denied, param_rules=param_rules,
+            dlp_detectors=dlp_detectors, dlp_custom_patterns=dlp_custom_patterns,
         )
 
     async def get_policies_for(self, server_ids: list[int]) -> dict[int, ServerPolicy]:
@@ -253,7 +288,7 @@ class ServerRepo:
         placeholders = ",".join("?" for _ in server_ids)
 
         cur = await self._read.execute(
-            f"SELECT server_id, mode, rate_limit FROM server_policies WHERE server_id IN ({placeholders})",
+            f"SELECT server_id, mode, rate_limit, dlp_config FROM server_policies WHERE server_id IN ({placeholders})",
             server_ids,
         )
         policy_rows = {r["server_id"]: r for r in await cur.fetchall()}
@@ -285,12 +320,15 @@ class ServerRepo:
         result = {}
         for sid in server_ids:
             row = policy_rows.get(sid)
+            dlp_detectors, dlp_custom_patterns = _decode_dlp_config(row["dlp_config"] if row else None)
             result[sid] = ServerPolicy(
                 mode=row["mode"] if row else "passthrough",
                 rate_limit=row["rate_limit"] if row else None,
                 allowed=allowed_by_id[sid],
                 denied=denied_by_id[sid],
                 param_rules=param_rules_by_id[sid],
+                dlp_detectors=dlp_detectors,
+                dlp_custom_patterns=dlp_custom_patterns,
             )
         return result
 
@@ -302,12 +340,14 @@ class ServerRepo:
         async with self._db.gateway_write_lock:
             await self._write.execute("BEGIN IMMEDIATE")
             try:
+                dlp_config_json = _encode_dlp_config(policy.dlp_detectors, policy.dlp_custom_patterns)
                 await self._write.execute(
-                    """INSERT INTO server_policies (server_id, mode, rate_limit, updated_at)
-                       VALUES (?, ?, ?, ?)
+                    """INSERT INTO server_policies (server_id, mode, rate_limit, dlp_config, updated_at)
+                       VALUES (?, ?, ?, ?, ?)
                        ON CONFLICT(server_id) DO UPDATE SET mode=excluded.mode,
-                           rate_limit=excluded.rate_limit, updated_at=excluded.updated_at""",
-                    (server_id, policy.mode, policy.rate_limit, utcnow()),
+                           rate_limit=excluded.rate_limit, dlp_config=excluded.dlp_config,
+                           updated_at=excluded.updated_at""",
+                    (server_id, policy.mode, policy.rate_limit, dlp_config_json, utcnow()),
                 )
                 await self._write.execute("DELETE FROM tool_policies WHERE server_id = ?", (server_id,))
                 for tool_name in policy.allowed:
@@ -446,10 +486,10 @@ class AuditRepo:
             """INSERT INTO audit_events
                (ts, server_slug, api_key_id, client_ip, endpoint, rpc_method, tool,
                 decision, rule, matched, reason, args_summary, bridged, status_code, latency_ms,
-                origin)
+                origin, dlp_detector, dlp_action, dlp_match_count)
                VALUES (:ts, :server_slug, :api_key_id, :client_ip, :endpoint, :rpc_method, :tool,
                        :decision, :rule, :matched, :reason, :args_summary, :bridged, :status_code,
-                       :latency_ms, :origin)""",
+                       :latency_ms, :origin, :dlp_detector, :dlp_action, :dlp_match_count)""",
             events,
         )
         await self._conn.commit()

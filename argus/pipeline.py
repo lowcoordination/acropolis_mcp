@@ -319,6 +319,8 @@ class Pipeline:
                         rule=decision.rule, matched=decision.matched,
                         args_summary=decision.args_summary, reason=decision.reason,
                         latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+                        dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
+                        dlp_match_count=decision.dlp_match_count,
                     )
 
                     if decision.blocked:
@@ -329,6 +331,19 @@ class Pipeline:
                             ),
                             status_code=403, media_type="application/json",
                         )
+
+                    # DLP redact (enterprise #10): the redacted body MUST be what actually
+                    # leaves the process — re-serialize the JSON-RPC envelope with the redacted
+                    # arguments substituted in and forward THAT, never the original body_bytes.
+                    # This is the third consumer of the body_override seam (after
+                    # AggregatePipeline's de-namespacing rewrite and the tool tester), reusing
+                    # it rather than inventing a parallel forwarding path.
+                    if decision.dlp_redacted_arguments is not None:
+                        rewritten = dict(body_json)
+                        rewritten_params = dict(params)
+                        rewritten_params["arguments"] = decision.dlp_redacted_arguments
+                        rewritten["params"] = rewritten_params
+                        body_bytes = json.dumps(rewritten).encode("utf-8")
                 else:
                     await self._audit.log(
                         server_slug=server.slug, tool=body_name, decision="PASSTHROUGH",
@@ -401,6 +416,8 @@ class Pipeline:
                 args_summary=decision.args_summary, reason=decision.reason,
                 latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
                 client_ip=client_ip, origin=origin,
+                dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
+                dlp_match_count=decision.dlp_match_count,
             )
             if decision.blocked:
                 return Response(
@@ -410,6 +427,18 @@ class Pipeline:
                     ),
                     status_code=403, media_type="application/json",
                 )
+            # DLP redact (enterprise #10): the bridged path forwards `params` directly to
+            # ProtocolBridge.bridge_call rather than raw body bytes, so redaction here means
+            # substituting the redacted arguments into `params` before that call — no
+            # body_override needed on this path. Deliberately placed AFTER the blocked-return
+            # above (matching the non-bridged path's structure in _process) — a block never
+            # carries dlp_redacted_arguments (see argus/policy.py's evaluate: the redact branch
+            # always has blocked=False), so this ordering is not currently load-bearing for
+            # correctness, but keeping "can this call still be blocked" resolved before "what do
+            # we forward" is the safer invariant to read and to preserve under future changes.
+            if decision.dlp_redacted_arguments is not None:
+                params = dict(params)
+                params["arguments"] = decision.dlp_redacted_arguments
         else:
             await self._audit.log(
                 server_slug=server.slug, tool=None, decision="PASSTHROUGH",

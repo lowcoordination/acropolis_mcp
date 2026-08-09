@@ -70,6 +70,47 @@ def _validate_rate_limit_spec(spec: str) -> None:
         raise ValueError(f"invalid rate limit {spec!r}: period must be one of {sorted(_RATE_LIMIT_PERIODS)}")
 
 
+_VALID_DLP_ACTIONS = {"allow", "redact", "block"}
+# Kept in sync with argus.dlp.BUILTIN_DETECTORS' keys by test_models.py's
+# test_dlp_detector_names_match_builtin_registry — not imported directly here to avoid db/
+# depending on argus/ (db sits below argus in this codebase's layering, same reasoning as
+# rate_limiter's spec grammar being duplicated rather than imported in _validate_rate_limit_spec
+# above).
+_VALID_DLP_DETECTOR_NAMES = {
+    "credit_card", "email", "us_ssn", "aws_access_key", "private_key_pem", "high_entropy_string",
+}
+_MAX_CUSTOM_PATTERN_LENGTH = 200
+
+
+class DlpCustomPattern(BaseModel):
+    name: str
+    pattern: str
+    action: str = "block"
+
+    @field_validator("pattern")
+    @classmethod
+    def _validate_pattern(cls, pattern: str) -> str:
+        # Same compile-on-write ReDoS mitigation as ParamRule.block_patterns: cap length and
+        # reject anything that doesn't even compile. This does NOT by itself prevent
+        # catastrophic backtracking (see ParamRule's comment on the same point) — the runtime
+        # protection is argus.dlp routing every custom-pattern match through
+        # argus.policy._match_with_timeout's forkserver machinery, never raw `re` directly.
+        if len(pattern) > _MAX_CUSTOM_PATTERN_LENGTH:
+            raise ValueError(f"custom pattern too long (max {_MAX_CUSTOM_PATTERN_LENGTH} chars): {pattern!r}")
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as e:
+            raise ValueError(f"invalid regex {pattern!r}: {e}") from e
+        return pattern
+
+    @field_validator("action")
+    @classmethod
+    def _validate_action(cls, action: str) -> str:
+        if action not in _VALID_DLP_ACTIONS:
+            raise ValueError(f"action must be one of {sorted(_VALID_DLP_ACTIONS)}, got {action!r}")
+        return action
+
+
 class ServerPolicy(BaseModel):
     mode: str = "passthrough"  # passthrough | allowlist | denylist
     rate_limit: Optional[str] = None
@@ -77,6 +118,17 @@ class ServerPolicy(BaseModel):
     denied: list[str] = []
     # tool_name -> param_name -> ParamRule
     param_rules: dict[str, dict[str, ParamRule]] = {}
+    # Enterprise #10 (DLP): detector name -> "allow" | "redact" | "block". EVERY detector
+    # defaults to off — a server with an empty dict here (the default) runs zero DLP scanning
+    # and behaves byte-identically to pre-DLP Acropolis; see test_dlp.py's
+    # test_no_dlp_config_is_byte_identical_to_pre_dlp_behavior. Rides the existing JSON policy
+    # column — no migration needed (config export/import carries it for free, see
+    # test_config_io.py's DLP round-trip test).
+    dlp_detectors: dict[str, str] = {}
+    # Operator-defined regex patterns, evaluated in addition to the named built-in detectors.
+    # UNTRUSTED input — see argus/dlp.py's module docstring on why every match against these
+    # goes through the F2 ReDoS-safe forkserver path, never raw `re`.
+    dlp_custom_patterns: list[DlpCustomPattern] = []
 
     @field_validator("mode")
     @classmethod
@@ -102,6 +154,18 @@ class ServerPolicy(BaseModel):
         if rate_limit is not None:
             _validate_rate_limit_spec(rate_limit)
         return rate_limit
+
+    @field_validator("dlp_detectors")
+    @classmethod
+    def _validate_dlp_detectors(cls, detectors: dict[str, str]) -> dict[str, str]:
+        for name, action in detectors.items():
+            if name not in _VALID_DLP_DETECTOR_NAMES:
+                raise ValueError(
+                    f"unknown dlp detector {name!r} (known: {sorted(_VALID_DLP_DETECTOR_NAMES)})"
+                )
+            if action not in _VALID_DLP_ACTIONS:
+                raise ValueError(f"dlp_detectors[{name!r}] action must be one of {sorted(_VALID_DLP_ACTIONS)}, got {action!r}")
+        return detectors
 
 
 class ServerRecord(BaseModel):
