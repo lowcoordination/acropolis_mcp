@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
 from archon.auth.apikeys import ApiKeyService
+from archon.secrets import SecretProvider, SecretResolutionError
+from archon.secrets.local import LocalSecretProvider
 from archon.settings import Settings
 from argus.audit import AuditLogger
 from argus.bridge import BridgeError, ProtocolBridge
@@ -74,6 +76,7 @@ class Pipeline:
         bridge: Optional[ProtocolBridge] = None,
         tools_cache: Optional[ToolsCache] = None,
         settings_repo: Optional[SettingsRepo] = None,
+        secret_provider: Optional[SecretProvider] = None,
     ):
         self._settings = settings
         self._servers = server_repo
@@ -84,6 +87,10 @@ class Pipeline:
         self._bridge = bridge
         self._tools_cache = tools_cache
         self._settings_repo = settings_repo
+        # Enterprise #5: defaults to LocalSecretProvider (pass-through) so every existing caller
+        # that doesn't wire a provider through — including the entire pre-feature test suite —
+        # gets byte-identical behaviour. app.py wires the real, settings-selected provider.
+        self._secrets = secret_provider or LocalSecretProvider()
 
     @property
     def tools_cache(self) -> Optional[ToolsCache]:
@@ -351,7 +358,14 @@ class Pipeline:
                         latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
                     )
 
-        return await self._forward(request, server, path, body_bytes)
+        try:
+            resolved_auth_header = await self._resolve_credential(
+                server, rpc_method=rpc_method, rpc_id=rpc_id, tool_name=tool_name,
+                api_key_id=api_key_id, start=start, client_ip=client_ip, origin=origin,
+            )
+        except self._CredentialResolutionFailed as e:
+            return e.response
+        return await self._forward(request, server, path, body_bytes, resolved_auth_header)
 
     def _handle_discover(self, server: ServerRecord, rpc_id: Any) -> Response:
         result = synthesize_server_discover(server)
@@ -364,9 +378,16 @@ class Pipeline:
         self, server: ServerRecord, rpc_id: Any, api_key_id: Optional[int], start: float,
         client_ip: Optional[str] = None,
     ) -> Response:
+        try:
+            resolved_auth_header = await self._resolve_credential(
+                server, rpc_method="tools/list", rpc_id=rpc_id, tool_name=None,
+                api_key_id=api_key_id, start=start, client_ip=client_ip,
+            )
+        except self._CredentialResolutionFailed as e:
+            return e.response
         policy = await self._servers.get_policy(server.id)
         tools = await self._tools_cache.get_filtered_tools(
-            server.id, server.upstream_url, policy, upstream_auth_header=server.upstream_auth_header
+            server.id, server.upstream_url, policy, upstream_auth_header=resolved_auth_header
         )
         await self._audit.log(
             server_slug=server.slug, tool=None, decision="PASSTHROUGH",
@@ -448,10 +469,18 @@ class Pipeline:
             )
 
         try:
+            resolved_auth_header = await self._resolve_credential(
+                server, rpc_method=rpc_method, rpc_id=rpc_id,
+                tool_name=params.get("name") if rpc_method == "tools/call" else None,
+                api_key_id=api_key_id, start=start, client_ip=client_ip, origin=origin, bridged=True,
+            )
+        except self._CredentialResolutionFailed as e:
+            return e.response
+        try:
             status, body = await self._bridge.bridge_call(
                 server_id=server.id, upstream_url=server.upstream_url, rpc_method=rpc_method,
                 rpc_id=rpc_id, params=params, meta=meta,
-                upstream_auth_header=server.upstream_auth_header,
+                upstream_auth_header=resolved_auth_header,
             )
         except BridgeError as e:
             await self._audit.log(
@@ -539,8 +568,60 @@ class Pipeline:
             )
         return None
 
+    class _CredentialResolutionFailed(Exception):
+        """Internal-only signal carrying the already-built error Response — see
+        _resolve_credential's docstring on why this doesn't reuse RoutingError (which handle()'s
+        top-level except block would audit-log a SECOND time)."""
+
+        def __init__(self, response: Response):
+            self.response = response
+
+    async def _resolve_credential(
+        self, server: ServerRecord, *, rpc_method: str, rpc_id: Any, tool_name: Optional[str],
+        api_key_id: Optional[int], start: float, client_ip: Optional[str],
+        origin: Optional[str] = None, bridged: bool = False,
+    ) -> Optional[str]:
+        """Resolves `server.upstream_auth_header` (a literal OR a reference) to the plaintext
+        credential that must be sent to the upstream, via the configured SecretProvider.
+
+        Enterprise #5's non-negotiable: failure here must be an explicit ERROR, NEVER a silent
+        fall-through to forwarding without the credential — that would risk leaking a request to
+        an upstream that expects auth, or turn a Vault blip into a confusing unauthenticated-401
+        storm. Every call site (bridged tools/call, raw passthrough forward, tools/list) routes
+        through this one method so that guarantee can't drift between them; see
+        tests/integration/test_secret_resolution_failure.py's regression test proving this.
+
+        Raises _CredentialResolutionFailed (never RoutingError) on failure, after logging the
+        ERROR audit event itself — mirroring how _check_header_consistency's mismatch case
+        logs-then-returns-a-Response directly rather than raising, so the call site can simply
+        `return e.response` without handle()'s top-level `except RoutingError` double-logging
+        the same failure.
+        """
+        if server.upstream_auth_header is None:
+            return None
+        try:
+            return await self._secrets.resolve(server.upstream_auth_header)
+        except SecretResolutionError as e:
+            # SECURITY: e.reason may echo back attacker- or operator-controlled shape (a
+            # malformed ref, an HTTP status code) but must NEVER contain the resolved plaintext
+            # — SecretResolutionError's own contract (see archon/secrets/__init__.py) is that its
+            # message is built only from the reference and a static reason, so surfacing it here
+            # in an audit row / RPC error body is safe by construction, not by caller discipline.
+            reason = f"secret resolution failed: {e.reason}"
+            await self._audit.log(
+                server_slug=server.slug, tool=tool_name, decision="ERROR",
+                endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
+                reason=reason, status_code=502,
+                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+                origin=origin, bridged=bridged,
+            )
+            raise self._CredentialResolutionFailed(
+                Response(content=rpc_error(rpc_id, reason), status_code=502, media_type="application/json")
+            )
+
     async def _forward(
-        self, request: Request, server: ServerRecord, path: str, body_bytes: bytes
+        self, request: Request, server: ServerRecord, path: str, body_bytes: bytes,
+        resolved_auth_header: Optional[str] = None,
     ) -> Response:
         # SECURITY: httpx.URL normalises dot segments during parsing, so
         # f"{upstream}/mcp/../../admin" resolves OUTSIDE the configured upstream endpoint —
@@ -561,11 +642,11 @@ class Pipeline:
         # mechanism the design gap was about. Appended AFTER strip_hop_by_hop, and as a plain
         # list append rather than a header-merge, so it always wins even though the client's
         # own Authorization was already stripped (F5) — there should never be two.
-        if server.upstream_auth_header:
+        if resolved_auth_header:
             forward_headers = [
                 (k, v) for k, v in forward_headers if k.lower() != b"authorization"
             ]
-            forward_headers.append((b"authorization", server.upstream_auth_header.encode()))
+            forward_headers.append((b"authorization", resolved_auth_header.encode()))
 
         upstream_req = self._client.build_request(
             method=request.method, url=upstream_url, content=body_bytes, headers=forward_headers,

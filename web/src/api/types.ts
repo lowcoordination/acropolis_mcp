@@ -8,9 +8,20 @@ export interface ServerResponse {
   in_aggregate: boolean
   upstream_protocol: string | null
   health_status: 'unknown' | 'healthy' | 'unhealthy'
+  // Enterprise #5: set only when health_status === 'unhealthy' AND the specific cause was a
+  // secret-resolution failure — distinguishable from a plain network-level outage, which
+  // leaves this null. Never contains the resolved plaintext credential.
+  health_reason: string | null
   last_seen_at: string | null
   created_at: string
   updated_at: string
+  // F23: whether a credential is configured at all — true for both a literal and an enterprise
+  // #5 reference. Never the value itself.
+  has_upstream_auth_header: boolean
+  // Enterprise #5: true when the configured credential is a vault://... or enc:v1:... reference
+  // rather than a literal — lets the UI show "externalized" vs "literal" without ever exposing
+  // the value. Meaningless (false) when has_upstream_auth_header is false.
+  upstream_auth_header_is_reference: boolean
 }
 
 export interface ServerCreateRequest {
@@ -19,6 +30,9 @@ export interface ServerCreateRequest {
   upstream_url: string
   enabled?: boolean
   in_aggregate?: boolean
+  // Enterprise #5: either a literal Authorization header value or a vault://<mount>/<path>#<key>
+  // reference — never returned back by any GET/list response, see ServerResponse above.
+  upstream_auth_header?: string
 }
 
 export interface ServerUpdateRequest {
@@ -26,6 +40,10 @@ export interface ServerUpdateRequest {
   upstream_url?: string
   enabled?: boolean
   in_aggregate?: boolean
+  // Omit the key entirely to leave the credential untouched; explicit null clears it; any other
+  // value replaces it (literal or vault:// reference) — mirrors archon/schemas.py's
+  // ServerUpdateRequest three-state handling (see that model's comment on model_fields_set).
+  upstream_auth_header?: string | null
 }
 
 export interface ParamRule {
@@ -103,6 +121,10 @@ export interface SettingsResponse {
   webhook_events: string[]
   webhook_allow_private: boolean
   has_webhook_secret: boolean
+  // Enterprise #5: which SecretProvider tier is active — read-only, informational (hints which
+  // shape of value the server form should expect: a literal under 'local'/'encrypted', a
+  // vault://... reference under 'openbao').
+  secret_provider: 'local' | 'encrypted' | 'openbao' | string
 }
 
 export interface WebhookTestResponse {

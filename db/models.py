@@ -177,6 +177,11 @@ class ServerRecord(BaseModel):
     in_aggregate: bool
     upstream_protocol: Optional[str] = None
     health_status: str = "unknown"
+    # Enterprise #5: set when health_status == "unhealthy" AND the cause was specifically a
+    # secret-resolution failure (never for a plain network-level probe failure, which stays
+    # unhealthy with this None — see stoa/health.py's probe_server). Never contains the
+    # resolved plaintext credential; only SecretResolutionError's static reason string.
+    health_reason: Optional[str] = None
     last_seen_at: Optional[str] = None
     discover_json: Optional[str] = None
     created_at: str

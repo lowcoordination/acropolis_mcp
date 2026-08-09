@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useCreateServer, useServers } from '../lib/useServers'
+import { useSettings } from '../lib/useSettings'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
+import { CredentialBadge } from '../components/CredentialBadge'
 import { Modal } from '../components/Modal'
 import { ApiError } from '../api/client'
 
@@ -13,13 +15,22 @@ function slugify(name: string): string {
     .replace(/^-+|-+$/g, '')
 }
 
+// Enterprise #5: a bare heuristic for "does this look like a vault:// reference" purely to
+// adjust the placeholder/hint text as the operator types — NOT validation (the backend is the
+// real authority on the shape; archon/secrets/openbao.py's parse_vault_ref is the actual parser).
+function looksLikeReference(value: string): boolean {
+  return value.startsWith('vault://') || value.startsWith('enc:v1:')
+}
+
 function AddServerModal({ onClose }: { onClose: () => void }) {
   const [name, setName] = useState('')
   const [slug, setSlug] = useState('')
   const [slugTouched, setSlugTouched] = useState(false)
   const [upstreamUrl, setUpstreamUrl] = useState('')
+  const [upstreamAuthHeader, setUpstreamAuthHeader] = useState('')
   const [error, setError] = useState<string | null>(null)
   const create = useCreateServer()
+  const { data: settings } = useSettings()
 
   function handleNameChange(value: string) {
     setName(value)
@@ -30,7 +41,12 @@ function AddServerModal({ onClose }: { onClose: () => void }) {
     e.preventDefault()
     setError(null)
     create.mutate(
-      { slug, name, upstream_url: upstreamUrl },
+      {
+        slug,
+        name,
+        upstream_url: upstreamUrl,
+        ...(upstreamAuthHeader ? { upstream_auth_header: upstreamAuthHeader } : {}),
+      },
       {
         onSuccess: onClose,
         onError: (err) => setError(err instanceof ApiError ? err.message : 'Something went wrong'),
@@ -86,6 +102,50 @@ function AddServerModal({ onClose }: { onClose: () => void }) {
             placeholder="http://localhost:8010/mcp"
             required
           />
+        </div>
+        <div>
+          <label className="block text-sm font-medium mb-1" htmlFor="upstream_auth_header">
+            Upstream credential <span style={{ color: 'var(--text-muted)' }}>(optional)</span>
+          </label>
+          <input
+            id="upstream_auth_header"
+            className="w-full rounded-md px-3 py-2 text-sm font-mono"
+            value={upstreamAuthHeader}
+            onChange={(e) => setUpstreamAuthHeader(e.target.value)}
+            placeholder={
+              settings?.secret_provider === 'openbao'
+                ? 'vault://secret/acropolis/<slug>#token'
+                : 'Bearer sk-... (or vault://mount/path#key)'
+            }
+            autoComplete="off"
+          />
+          <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+            {settings?.secret_provider === 'openbao' ? (
+              <>
+                Active provider: <span className="font-mono">openbao</span> — paste a{' '}
+                <span className="font-mono">vault://mount/path#key</span> reference to a secret you've
+                already written to Vault/OpenBao. A literal value is stored as-is, unresolved.
+              </>
+            ) : settings?.secret_provider === 'encrypted' ? (
+              <>
+                Active provider: <span className="font-mono">encrypted</span> — a literal Authorization
+                header value is encrypted at rest automatically. A{' '}
+                <span className="font-mono">vault://</span> reference is stored as-is.
+              </>
+            ) : (
+              <>
+                Sent as the <span className="font-mono">Authorization</span> header on requests to this
+                server's upstream. Never shown again after saving.
+              </>
+            )}
+            {upstreamAuthHeader && looksLikeReference(upstreamAuthHeader) && (
+              <>
+                {' '}
+                This looks like a secret reference, not a literal credential — it will be exported and
+                displayed as configuration, not treated as a secret.
+              </>
+            )}
+          </p>
         </div>
         {error && (
           <p className="text-sm" style={{ color: 'var(--danger)' }}>
@@ -153,6 +213,9 @@ export function Servers() {
                   Health
                 </th>
                 <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
+                  Credential
+                </th>
+                <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
                   Enabled
                 </th>
               </tr>
@@ -173,6 +236,19 @@ export function Servers() {
                   </td>
                   <td className="px-4 py-3">
                     <HealthBadge status={server.health_status} />
+                    {server.health_status === 'unhealthy' && server.health_reason && (
+                      <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }} title={server.health_reason}>
+                        {server.health_reason.length > 40
+                          ? `${server.health_reason.slice(0, 40)}…`
+                          : server.health_reason}
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-4 py-3">
+                    <CredentialBadge
+                      hasCredential={server.has_upstream_auth_header}
+                      isReference={server.upstream_auth_header_is_reference}
+                    />
                   </td>
                   <td className="px-4 py-3">{server.enabled ? 'Yes' : 'No'}</td>
                 </tr>

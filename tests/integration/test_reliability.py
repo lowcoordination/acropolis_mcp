@@ -183,7 +183,7 @@ class TestF12HealthPollerIsolation:
                     enabled=True, in_aggregate=True, created_at="now", updated_at="now",
                 )
                 # Must not raise — guarded parse should report unhealthy, not crash the caller.
-                health_status, protocol, discover_json = await probe_server(
+                health_status, protocol, discover_json, health_reason = await probe_server(
                     client, handshake_cache, fake_server
                 )
                 assert health_status == "unhealthy"

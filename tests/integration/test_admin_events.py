@@ -332,12 +332,26 @@ async def test_secret_exclusion_on_server_with_auth_header(client):
 
     events = await client.get("/api/v1/admin-events")
     data = events.json()
-    assert len(data) == 1
-    event = data[0]
+    # Enterprise #5: server.create now fires TWO events — the general server.create event
+    # (which never included the credential, per the assertions below) and a dedicated
+    # server.secret_reference_change event (record_secret_reference_change in
+    # archon/admin_audit.py) that records only that a credential was configured, never its
+    # value — see that event's own assertions further down.
+    assert len(data) == 2
+    events_by_action = {e["action"]: e for e in data}
+
+    create_event = events_by_action["server.create"]
     # Check the SERIALIZED JSON text, not the parsed dict (before is None on create)
-    assert event["before"] is None  # create has no before state
-    assert "sk-live-secret-token-12345" not in event["after"]
-    assert "upstream_auth_header" not in event["after"]
+    assert create_event["before"] is None  # create has no before state
+    assert "sk-live-secret-token-12345" not in create_event["after"]
+    assert "upstream_auth_header" not in create_event["after"]
+
+    secret_event = events_by_action["server.secret_reference_change"]
+    assert "sk-live-secret-token-12345" not in json.dumps(secret_event)
+    assert secret_event["after"] is not None
+    after_shape = json.loads(secret_event["after"])
+    assert after_shape["upstream_auth_header"]["configured"] is True
+    assert after_shape["upstream_auth_header"]["is_reference"] is False
 
 
 async def test_secret_exclusion_on_settings_with_webhook_secret(client):

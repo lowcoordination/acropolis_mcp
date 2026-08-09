@@ -9,12 +9,138 @@ import {
   useServer,
   useServerPolicy,
   useServerTools,
+  useUpdateServer,
 } from '../lib/useServers'
+import { useSettings } from '../lib/useSettings'
 import { POLICY_PRESETS } from '../lib/policyPresets'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
+import { CredentialBadge } from '../components/CredentialBadge'
 import { ToolTester } from '../components/ToolTester'
 import { DlpEditor } from '../components/DlpEditor'
-import type { ParamRule, PolicyMode, PolicyResponse } from '../api/types'
+import type { ParamRule, PolicyMode, PolicyResponse, ServerResponse } from '../api/types'
+
+// Enterprise #5: mirrors the identical helper in pages/Servers.tsx — a display-only heuristic
+// for hint text, not validation.
+function looksLikeReference(value: string): boolean {
+  return value.startsWith('vault://') || value.startsWith('enc:v1:')
+}
+
+function CredentialSection({ slug, server }: { slug: string; server: ServerResponse }) {
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const { data: settings } = useSettings()
+  const updateServer = useUpdateServer(slug)
+
+  function startEdit() {
+    setValue('')
+    setError(null)
+    setEditing(true)
+  }
+
+  function handleSave(e: React.FormEvent) {
+    e.preventDefault()
+    setError(null)
+    updateServer.mutate(
+      { upstream_auth_header: value },
+      {
+        onSuccess: () => setEditing(false),
+        onError: (err) => setError(err instanceof ApiError ? err.message : 'Something went wrong'),
+      },
+    )
+  }
+
+  function handleClear() {
+    setError(null)
+    updateServer.mutate(
+      { upstream_auth_header: null },
+      { onError: (err) => setError(err instanceof ApiError ? err.message : 'Something went wrong') },
+    )
+  }
+
+  return (
+    <div className="card p-5 space-y-3">
+      <h2 className="text-sm font-semibold">Upstream credential</h2>
+      {!editing ? (
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <CredentialBadge
+              hasCredential={server.has_upstream_auth_header}
+              isReference={server.upstream_auth_header_is_reference}
+            />
+            <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+              {server.has_upstream_auth_header
+                ? server.upstream_auth_header_is_reference
+                  ? 'A secret reference is configured — the value is never shown.'
+                  : 'A literal credential is configured — the value is never shown.'
+                : 'No credential configured.'}
+            </span>
+          </div>
+          <div className="flex gap-3">
+            <button type="button" onClick={startEdit} className="text-xs font-medium" style={{ color: 'var(--accent)' }}>
+              {server.has_upstream_auth_header ? 'Replace' : 'Configure'}
+            </button>
+            {server.has_upstream_auth_header && (
+              <button
+                type="button"
+                onClick={handleClear}
+                disabled={updateServer.isPending}
+                className="text-xs font-medium disabled:opacity-60"
+                style={{ color: 'var(--danger)' }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <form onSubmit={handleSave} className="space-y-2">
+          <input
+            className="w-full rounded-md px-3 py-2 text-sm font-mono"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder={
+              settings?.secret_provider === 'openbao'
+                ? 'vault://secret/acropolis/<slug>#token'
+                : 'Bearer sk-... (or vault://mount/path#key)'
+            }
+            autoComplete="off"
+            autoFocus
+          />
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            Active provider: <span className="font-mono">{settings?.secret_provider ?? 'local'}</span>.{' '}
+            {settings?.secret_provider === 'encrypted' &&
+              'A literal value is encrypted at rest automatically.'}
+            {settings?.secret_provider === 'openbao' &&
+              'Paste a vault:// reference to a secret already written to Vault/OpenBao.'}
+            {value && looksLikeReference(value) && ' This looks like a secret reference, not a literal.'}
+          </p>
+          {error && (
+            <p className="text-xs" style={{ color: 'var(--danger)' }}>
+              {error}
+            </p>
+          )}
+          <div className="flex gap-2">
+            <button
+              type="submit"
+              disabled={updateServer.isPending || !value}
+              className="btn-primary rounded-md px-3 py-1.5 text-xs font-medium disabled:opacity-60"
+            >
+              {updateServer.isPending ? 'Saving…' : 'Save'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditing(false)}
+              className="btn-secondary rounded-md px-3 py-1.5 text-xs font-medium"
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+    </div>
+  )
+}
 
 function relativeTime(isoTimestamp: string): string {
   const seconds = Math.max(0, (Date.now() - new Date(isoTimestamp).getTime()) / 1000)
@@ -267,8 +393,15 @@ export function ServerDetail() {
           <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
             Endpoint: <CopyableEndpoint slug={slug} />
           </div>
+          {server?.health_status === 'unhealthy' && server.health_reason && (
+            <div className="text-xs" style={{ color: 'var(--danger)' }}>
+              Unhealthy: {server.health_reason}
+            </div>
+          )}
         </div>
       </div>
+
+      {server && <CredentialSection slug={slug} server={server} />}
 
       <div className="card p-5 space-y-4">
         <h2 className="text-sm font-semibold">Policy</h2>

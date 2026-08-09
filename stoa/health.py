@@ -7,6 +7,8 @@ from typing import Optional
 
 import httpx
 
+from archon.secrets import SecretProvider, SecretResolutionError
+from archon.secrets.local import LocalSecretProvider
 from argus.upstream import CLIENT_INFO, UpstreamHandshakeCache, UpstreamHandshakeError, parse_sse_body
 from db.models import ServerRecord
 from db.repo import ServerNotFoundError, ServerRepo
@@ -20,22 +22,50 @@ DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 # upstream should fail fast, not stall the whole poll cycle for every other registered server.
 PROBE_TIMEOUT_SECONDS = 10.0
 
+# Enterprise #5: the reason string stored on servers.health_reason when a probe fails
+# specifically because the configured secret couldn't be resolved — distinguishable, by a
+# human or by test assertions, from a plain network-level probe failure (which leaves
+# health_reason None; see the docstring on probe_server below).
+SECRET_RESOLUTION_FAILURE_PREFIX = "secret resolution failed: "
+
 
 async def probe_server(
-    client: httpx.AsyncClient, handshake_cache: UpstreamHandshakeCache, server: ServerRecord
-) -> tuple[str, str | None, dict | None]:
+    client: httpx.AsyncClient, handshake_cache: UpstreamHandshakeCache, server: ServerRecord,
+    secret_provider: SecretProvider | None = None,
+) -> tuple[str, str | None, dict | None, str | None]:
     """Probe one server's generation and health.
 
     Tries `server/discover` first (mandatory RPC for 2026-generation servers per the spec);
     on method-not-found, falls back to the 2025-generation `initialize` handshake. Returns
-    (health_status, upstream_protocol, discover_json_dict).
+    (health_status, upstream_protocol, discover_json_dict, health_reason).
+
+    `health_reason` is None for a normal healthy probe AND for a normal (network-level)
+    unhealthy probe — it is only ever set when the specific cause was a secret-resolution
+    failure (enterprise #5), so a server whose credential won't resolve reads unhealthy with a
+    reason distinguishable from "upstream is just down", rather than a generic/opaque failure.
+    Callers (HealthPoller) must not guess a reason from health_status alone; this is the one
+    source of truth for whether THIS was a secrets problem.
     """
+    secrets = secret_provider or LocalSecretProvider()
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     # F23 fix (review 2026-08-04): a server with a configured upstream credential needs it on
     # the health probe too, or every registered server requiring auth would show permanently
     # unhealthy regardless of whether tools/call itself works.
+    #
+    # Enterprise #5: this now goes through the configured SecretProvider — resolve() returns the
+    # literal unchanged under `local` (byte-identical to the F23 behaviour above), or resolves a
+    # `vault://`/`enc:v1:` reference under the other tiers. A resolution failure must NEVER be
+    # treated the same as "no credential configured" (which would probe unauthenticated and
+    # either misreport health or, worse, look healthy against an upstream that doesn't actually
+    # need auth) — it is reported as its own distinguishable unhealthy reason instead.
+    resolved_auth_header: str | None = None
     if server.upstream_auth_header:
-        headers["Authorization"] = server.upstream_auth_header
+        try:
+            resolved_auth_header = await secrets.resolve(server.upstream_auth_header)
+        except SecretResolutionError as e:
+            logger.info("probe for '%s' could not resolve its credential: %s", server.slug, e.reason)
+            return ("unhealthy", None, None, f"{SECRET_RESOLUTION_FAILURE_PREFIX}{e.reason}")
+        headers["Authorization"] = resolved_auth_header
     discover_body = {
         "jsonrpc": "2.0", "id": "acropolis-discover", "method": "server/discover",
         "params": {"clientInfo": CLIENT_INFO},
@@ -47,7 +77,7 @@ async def probe_server(
         )
     except httpx.HTTPError as e:
         logger.info("probe for '%s' failed to connect: %s", server.slug, e)
-        return ("unhealthy", None, None)
+        return ("unhealthy", None, None, None)
 
     if resp.status_code == 200:
         # F12 fix (review 2026-08-04): json.loads(resp.text) was unguarded — a 200 response
@@ -69,7 +99,7 @@ async def probe_server(
 
         if parsed and "result" in parsed:
             # A real server/discover response — this is a 2026-generation server.
-            return ("healthy", "2026-07-28", parsed["result"])
+            return ("healthy", "2026-07-28", parsed["result"], None)
         # F12 fix, second half: parsed.get("error", {}) raised AttributeError when "error" was
         # present but explicitly null (dict.get's default only applies when the KEY is absent,
         # not when its value is None) — `(parsed.get("error") or {})` handles both cases.
@@ -84,18 +114,18 @@ async def probe_server(
     try:
         handshake = await handshake_cache.get_or_handshake(
             server.id, server.upstream_url, timeout=PROBE_TIMEOUT_SECONDS,
-            upstream_auth_header=server.upstream_auth_header,
+            upstream_auth_header=resolved_auth_header,
         )
     except UpstreamHandshakeError as e:
         logger.info("probe for '%s' failed initialize fallback: %s", server.slug, e)
-        return ("unhealthy", None, None)
+        return ("unhealthy", None, None, None)
 
     discover_json = {
         "protocolVersion": handshake.protocol_version,
         "serverInfo": handshake.server_info,
         "capabilities": handshake.capabilities,
     }
-    return ("healthy", handshake.protocol_version, discover_json)
+    return ("healthy", handshake.protocol_version, discover_json, None)
 
 
 class HealthPoller:
@@ -109,6 +139,7 @@ class HealthPoller:
         handshake_cache: UpstreamHandshakeCache,
         interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         webhook_dispatcher: Optional[WebhookDispatcher] = None,
+        secret_provider: Optional[SecretProvider] = None,
     ):
         self._repo = server_repo
         self._client = client
@@ -116,6 +147,9 @@ class HealthPoller:
         self._interval = interval_seconds
         self._task: asyncio.Task | None = None
         self._webhooks = webhook_dispatcher
+        # Defaults to LocalSecretProvider (pass-through) — see Pipeline's identical default and
+        # rationale; app.py wires the real, settings-selected provider.
+        self._secrets = secret_provider or LocalSecretProvider()
 
     def start(self) -> None:
         if self._task is None:
@@ -164,12 +198,13 @@ class HealthPoller:
             await self._probe_and_store(server)
 
     async def _probe_and_store(self, server: ServerRecord) -> None:
-        health_status, protocol, discover_json = await probe_server(
-            self._client, self._handshakes, server
+        health_status, protocol, discover_json, health_reason = await probe_server(
+            self._client, self._handshakes, server, secret_provider=self._secrets
         )
         await self._repo.set_health(
             server.slug, health_status=health_status, upstream_protocol=protocol,
             discover_json=json.dumps(discover_json) if discover_json else None,
+            health_reason=health_reason,
         )
         # Item 3 (features_08_05_26): fire only on the EDGE (healthy/unknown -> unhealthy), using
         # the status this same ServerRecord carried going INTO this probe — never on every poll

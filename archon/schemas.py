@@ -168,8 +168,20 @@ class ServerResponse(BaseModel):
     created_at: str
     updated_at: str
     # F23: whether a credential is configured, WITHOUT ever exposing its value — lets the UI
-    # show "credential configured" state without a round-trip that could leak the secret.
+    # show "credential configured" state without a round-trip that could leak the secret. This
+    # stays true whether upstream_auth_header holds a literal or an enterprise #5 reference
+    # (vault://..., enc:v1:...) — a reference means "configured" exactly as a literal does.
     has_upstream_auth_header: bool = False
+    # Enterprise #5: True when the configured credential is a REFERENCE (vault://, enc:v1:)
+    # rather than a literal — never exposes the reference string itself, only this boolean, so
+    # the UI can show "externalized" vs "literal" state at a glance without any way to derive
+    # the value. False (not just absent) when has_upstream_auth_header is also False — there is
+    # no credential to be a reference to.
+    upstream_auth_header_is_reference: bool = False
+    # Enterprise #5: mirrors servers.health_reason — set only when health_status == "unhealthy"
+    # AND the specific cause was a secret-resolution failure (see stoa/health.py's probe_server).
+    # Never contains the resolved plaintext credential.
+    health_reason: Optional[str] = None
 
 
 class PolicyResponse(BaseModel):
@@ -254,6 +266,11 @@ class SettingsResponse(BaseModel):
     # Whether a signing secret exists — never the secret itself, same has_x pattern as F23's
     # has_upstream_auth_header.
     has_webhook_secret: bool
+    # Enterprise #5: which SecretProvider tier is currently active ("local" | "encrypted" |
+    # "openbao") — read-only here (selected via the ACROPOLIS_SECRET_PROVIDER env var / process
+    # settings, not editable through this API), surfaced purely so the server form can hint
+    # which shape of value ("a literal" vs "a vault://... reference") is expected right now.
+    secret_provider: str
 
 
 class SettingsUpdateRequest(BaseModel):
