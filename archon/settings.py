@@ -33,3 +33,31 @@ class Settings(BaseSettings):
     # in the test suite for the same reason health_poll_enabled is.
     audit_retention_enabled: bool = True
     audit_retention_check_interval_seconds: float = 3600.0
+
+    # Enterprise #5: pluggable secret backends. "local" (default) is byte-identical to
+    # pre-feature behaviour — `upstream_auth_header` is read/written as a literal, no
+    # resolution step at all. "encrypted" and "openbao" resolve a reference
+    # (`enc:v1:...` / `vault://...#...`) to its plaintext at call time — see
+    # archon/secrets/__init__.py's build_secret_provider() and docs/secrets.md.
+    secret_provider: str = "local"
+
+    # encrypted provider key sourcing (ACROPOLIS_SECRET_KEY / ACROPOLIS_SECRET_KEY_FILE) is read
+    # directly from os.environ by archon/secrets/encrypted.py rather than modeled as a Settings
+    # field — deliberately, so the raw key material never round-trips through a pydantic model
+    # that could end up in a repr(), a debug log, or (if this class were ever serialized for
+    # any reason) a dumped settings snapshot. Settings fields below are the non-secret ones.
+
+    # openbao provider (a generic Vault KV v2 client — see archon/secrets/openbao.py's module
+    # docstring on why "openbao" here names a wire protocol, not a specific product).
+    vault_addr: str | None = None
+    # vault_token is Optional[str] like admin_token above: real deployments should prefer the
+    # ACROPOLIS_VAULT_TOKEN env var over a checked-in default, but pydantic-settings already
+    # reads env vars for every field on this model via env_prefix, so this field IS how
+    # ACROPOLIS_VAULT_TOKEN gets in — there's no separate raw os.environ read here the way the
+    # encrypted provider's key is handled, since a Vault token is inherently short-lived /
+    # revocable (unlike a data-encryption key, leaking it is a rotate-and-move-on event, not a
+    # rewrite-every-secret event), so the same care doesn't apply.
+    vault_token: str | None = None
+    vault_role_id: str | None = None
+    vault_secret_id: str | None = None
+    vault_ttl_seconds: float = 60.0

@@ -16,6 +16,7 @@ from typing import Any, Optional
 import yaml
 
 from archon.schemas import _validate_upstream_url
+from archon.secrets import is_reference
 from db.database import utcnow
 from db.models import ServerPolicy
 from db.repo import ServerNotFoundError, ServerRepo, SettingsRepo
@@ -103,9 +104,18 @@ async def export_config(
 ) -> ExportResult:
     """Build the versioned export envelope.
 
-    `upstream_auth_header` (F23) is a LIVE credential in plaintext, so it is omitted by default
-    and the affected servers are named in a warning — an operator who reimports this file needs
-    to know it is incomplete rather than discovering it when an upstream starts 401ing.
+    `upstream_auth_header` (F23) is normally a LIVE credential in plaintext, so a LITERAL value
+    is omitted by default and the affected servers are named in a warning — an operator who
+    reimports this file needs to know it is incomplete rather than discovering it when an
+    upstream starts 401ing.
+
+    Enterprise #5: a REFERENCE (`vault://...`, `enc:v1:...` — see archon/secrets.is_reference)
+    is not itself a secret — it's meaningless without separate access to the Vault/OpenBao
+    instance or the encryption key it points at — so it is always exported, regardless of
+    include_credentials, and never triggers the PLAINTEXT warning. This is the strongest
+    argument for the whole secret-backends item per the plan: it's what makes committed
+    policy-as-code (enterprise #6/#7) viable with real credentials rather than a deliberately
+    incomplete file.
     """
     result = ExportResult(data={})
     servers_out: list[dict[str, Any]] = []
@@ -124,9 +134,13 @@ async def export_config(
             "policy": policy.model_dump(exclude_none=True),
         }
         if server.upstream_auth_header is not None:
-            servers_with_credentials.append(server.slug)
-            if include_credentials:
+            if is_reference(server.upstream_auth_header):
+                # Not a secret — always safe to include, no warning.
                 entry["upstream_auth_header"] = server.upstream_auth_header
+            else:
+                servers_with_credentials.append(server.slug)
+                if include_credentials:
+                    entry["upstream_auth_header"] = server.upstream_auth_header
         servers_out.append(entry)
 
     stored = await settings_repo.get_all()

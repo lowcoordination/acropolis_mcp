@@ -292,3 +292,124 @@ async def test_export_import_export_is_stable_modulo_timestamp(client):
     first.pop("exported_at")
     second.pop("exported_at")
     assert first == second
+
+
+# --------------------------------------------------------------------------- enterprise #5: secret references
+
+async def test_reference_exports_without_plaintext_warning(client):
+    """A vault:// reference is not a secret — it must be exported even WITHOUT
+    include_credentials, and must never trigger the PLAINTEXT warning that a literal does."""
+    resp = await client.post("/api/v1/servers", json={
+        "slug": "vaulted", "name": "Vaulted", "upstream_url": "http://127.0.0.1:9004/mcp",
+        "upstream_auth_header": "vault://secret/acropolis/vaulted#token",
+    })
+    assert resp.status_code == 201
+
+    export_resp = await client.get("/api/v1/config/export")  # include_credentials defaults False
+    body = export_resp.text
+    assert "vault://secret/acropolis/vaulted#token" in body
+    assert "PLAINTEXT" not in body
+    # The warning header (if present at all) must not name 'vaulted' as an omitted-credential
+    # server — its reference WAS included.
+    warnings_header = export_resp.headers.get("X-Acropolis-Export-Warnings", "")
+    assert "vaulted" not in warnings_header
+
+
+async def test_literal_still_triggers_plaintext_warning_alongside_a_reference(client):
+    """A reference server and a literal server in the same export: the literal is omitted and
+    warned about exactly as today; the reference is included and silent — proving the two
+    behaviours coexist correctly rather than one accidentally suppressing the other."""
+    await client.post("/api/v1/servers", json={
+        "slug": "vaulted2", "name": "Vaulted2", "upstream_url": "http://127.0.0.1:9005/mcp",
+        "upstream_auth_header": "vault://secret/acropolis/vaulted2#token",
+    })
+    # 'shell' (from the fixture) already has a literal credential.
+
+    export_resp = await client.get("/api/v1/config/export")
+    body = export_resp.text
+    assert "vault://secret/acropolis/vaulted2#token" in body
+    assert "upstream_auth_header" not in _server_block(body, "shell")
+    warnings_header = export_resp.headers.get("X-Acropolis-Export-Warnings", "")
+    assert "shell" in warnings_header
+    assert "vaulted2" not in warnings_header
+
+
+def _server_block(yaml_text: str, slug: str) -> str:
+    """Crude but sufficient: the export is one server-entry-per-block YAML list (`- slug: x`);
+    slice out just the lines for one slug so an assertion about 'no upstream_auth_header for X'
+    can't be satisfied by a DIFFERENT server's key existing anywhere else in the same file."""
+    lines = yaml_text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == f"- slug: {slug}")
+    end = start + 1
+    while end < len(lines) and (lines[end].startswith("  ") or lines[end].strip() == ""):
+        end += 1
+    return "\n".join(lines[start:end])
+
+
+async def test_encrypted_ciphertext_reference_also_exports_without_warning(client):
+    """enc:v1: ciphertext is the OTHER reference shape recognized by is_reference() — same
+    export behaviour as vault://: included by default, no PLAINTEXT warning."""
+    fake_ciphertext_ref = "enc:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+    resp = await client.post("/api/v1/servers", json={
+        "slug": "encrypted-server", "name": "Encrypted", "upstream_url": "http://127.0.0.1:9006/mcp",
+        "upstream_auth_header": fake_ciphertext_ref,
+    })
+    assert resp.status_code == 201
+
+    export_resp = await client.get("/api/v1/config/export")
+    body = export_resp.text
+    assert fake_ciphertext_ref in body
+    assert "PLAINTEXT" not in body
+
+
+async def test_reference_round_trips_through_import(client):
+    """Importing a config with a vault:// reference on another instance pointing at the same
+    Vault should just work — the reference string round-trips byte-for-byte, unresolved, exactly
+    like any other opaque field on the server entry."""
+    await client.post("/api/v1/servers", json={
+        "slug": "roundtrip", "name": "Roundtrip", "upstream_url": "http://127.0.0.1:9007/mcp",
+        "upstream_auth_header": "vault://secret/acropolis/roundtrip#token",
+    })
+    exported = yaml.safe_load((await client.get("/api/v1/config/export")).text)
+
+    # Simulate "another instance pointing at the same Vault": delete the server locally, then
+    # reimport the exported file — this must recreate it with the SAME reference string.
+    await client.delete("/api/v1/servers/roundtrip")
+
+    import_resp = await client.post(
+        "/api/v1/config/import", json={"yaml": yaml.safe_dump(exported), "apply": True}
+    )
+    assert import_resp.status_code == 200
+    assert import_resp.json()["ok"] is True
+
+    server_resp = await client.get("/api/v1/servers/roundtrip")
+    assert server_resp.status_code == 200
+    assert server_resp.json()["has_upstream_auth_header"] is True
+    assert server_resp.json()["upstream_auth_header_is_reference"] is True
+    # The raw reference value is never in the API response — only recoverable by directly
+    # inspecting the DB, which the encrypted/openbao-specific tests do elsewhere.
+
+
+async def test_has_upstream_auth_header_true_for_reference_same_as_literal(client):
+    """A reference means 'configured', exactly as a literal does today — has_upstream_auth_header
+    must not distinguish between the two; upstream_auth_header_is_reference is what does that."""
+    await client.post("/api/v1/servers", json={
+        "slug": "ref-configured", "name": "Ref", "upstream_url": "http://127.0.0.1:9008/mcp",
+        "upstream_auth_header": "vault://secret/acropolis/ref-configured#token",
+    })
+    resp = await client.get("/api/v1/servers/ref-configured")
+    body = resp.json()
+    assert body["has_upstream_auth_header"] is True
+    assert body["upstream_auth_header_is_reference"] is True
+
+    # 'shell' from the fixture is a LITERAL — has_upstream_auth_header true, is_reference false.
+    shell_resp = await client.get("/api/v1/servers/shell")
+    shell_body = shell_resp.json()
+    assert shell_body["has_upstream_auth_header"] is True
+    assert shell_body["upstream_auth_header_is_reference"] is False
+
+    # 'fetch' from the fixture has no credential at all — both false.
+    fetch_resp = await client.get("/api/v1/servers/fetch")
+    fetch_body = fetch_resp.json()
+    assert fetch_body["has_upstream_auth_header"] is False
+    assert fetch_body["upstream_auth_header_is_reference"] is False

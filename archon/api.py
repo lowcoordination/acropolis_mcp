@@ -19,11 +19,14 @@ from archon.admin_audit import (
     record,
     record_config_import,
     record_policy_change,
+    record_secret_reference_change,
 )
 from archon.auth.apikeys import ApiKeyService
 from archon.config_io import export_config, plan_import
 from archon.passwords import hash_password
 from archon.rbac import ROLE_RANK, is_valid_role, require_role
+from archon.secrets import SecretProvider, is_reference, provider_tier_name, store_upstream_auth_header
+from archon.secrets.local import LocalSecretProvider
 from archon.schemas import (
     AdminEventResponse,
     AuditEventResponse,
@@ -97,6 +100,13 @@ def _server_to_response(server) -> ServerResponse:
         upstream_protocol=server.upstream_protocol, health_status=server.health_status,
         last_seen_at=server.last_seen_at, created_at=server.created_at, updated_at=server.updated_at,
         has_upstream_auth_header=server.upstream_auth_header is not None,
+        # Enterprise #5: this is the ONLY place server.upstream_auth_header's VALUE is ever
+        # inspected on this control-plane read path — and only to classify its shape (does it
+        # look like a reference?), never to resolve or return it. is_reference() is a pure
+        # string-prefix check with no I/O, no provider call, so this stays true to the "list/get
+        # never resolves" split the plan calls out as the thing that keeps secrets out of the UI.
+        upstream_auth_header_is_reference=is_reference(server.upstream_auth_header),
+        health_reason=server.health_reason,
     )
 
 
@@ -126,6 +136,7 @@ def build_control_plane_router(
     admin_event_repo: Optional[AdminEventRepo] = None,
     config_source: Optional["ConfigSource"] = None,
     user_repo: Optional[UserRepo] = None,
+    secret_provider: Optional[SecretProvider] = None,
 ) -> APIRouter:
     # enterprise #2 (RBAC): the router used to carry ONE blanket
     # dependencies=[Depends(require_admin)] gate — authenticated meant authorized for
@@ -137,6 +148,14 @@ def build_control_plane_router(
     # never run) rather than silently permissive, which is the fail-safe direction for a mistake
     # to fail in even though the parametrised test suite is what's meant to catch it for real.
     router = APIRouter(prefix="/api/v1")
+    # Enterprise #5: defaults to LocalSecretProvider (pass-through) so a router built without an
+    # explicit provider — as every pre-feature test and call site does — stores/reads literals
+    # exactly as before. argus/app.py wires the real, settings-selected provider.
+    # Named distinctly from the stdlib `secrets` module (imported at top of file, used by
+    # update_settings below for secrets.token_hex) — this function's own scope would otherwise
+    # shadow it for the rest of the closure, breaking any call to the stdlib module made
+    # anywhere inside build_control_plane_router after this point.
+    secret_backend = secret_provider or LocalSecretProvider()
 
     # F21 fix (review 2026-08-04): /api/v1/health used to live HERE, behind require_admin —
     # but both the Dockerfile HEALTHCHECK and the k8s liveness/readiness probes target it
@@ -156,11 +175,16 @@ def build_control_plane_router(
         body: ServerCreateRequest, request: Request,
         principal: Principal = Depends(require_role("admin")),
     ):
+        # Enterprise #5: what actually lands in the DB may differ from what the operator typed —
+        # a literal typed while the `encrypted` tier is selected is encrypted here BEFORE it
+        # ever reaches server_repo.create; a vault:// reference or a literal under `local`/
+        # `openbao` is stored exactly as typed. See store_upstream_auth_header's docstring.
+        stored_auth_header = await store_upstream_auth_header(secret_backend, body.upstream_auth_header)
         try:
             server = await server_repo.create(
                 slug=body.slug, name=body.name, upstream_url=body.upstream_url,
                 enabled=body.enabled, in_aggregate=body.in_aggregate,
-                upstream_auth_header=body.upstream_auth_header,
+                upstream_auth_header=stored_auth_header,
             )
         except SlugConflictError:
             raise HTTPException(status_code=409, detail=f"server slug '{body.slug}' already exists")
@@ -181,6 +205,15 @@ def build_control_plane_router(
                     "in_aggregate": body.in_aggregate,
                 }),
                 client_ip=request.client.host if request.client else None,
+            )
+            # Enterprise #5: a distinct event from server.create above — see
+            # record_secret_reference_change's docstring on why the credential's change is
+            # tracked separately from the rest of the server fields (never the value, in either
+            # event).
+            await record_secret_reference_change(
+                admin_event_repo, server_slug=body.slug,
+                before_value=None, after_value=stored_auth_header,
+                actor=principal.actor, client_ip=request.client.host if request.client else None,
             )
 
         if health_poller is not None:
@@ -249,6 +282,11 @@ def build_control_plane_router(
         auth_header_update = (
             body.upstream_auth_header if "upstream_auth_header" in body.model_fields_set else _UNSET
         )
+        # Enterprise #5: same store-before-persist treatment as create_server — only when the
+        # field was actually part of this request (a bare _UNSET must never be passed through
+        # store_upstream_auth_header, which only understands Optional[str]).
+        if auth_header_update is not _UNSET:
+            auth_header_update = await store_upstream_auth_header(secret_backend, auth_header_update)
         try:
             # Fetch before state for audit diff
             before_server = await server_repo.get(slug)
@@ -293,6 +331,19 @@ def build_control_plane_router(
                 after=after_dict,
                 client_ip=request.client.host if request.client else None,
             )
+            # Enterprise #5: fires only when upstream_auth_header was actually part of this
+            # request (auth_header_update is _UNSET otherwise, which never reaches server_repo.
+            # update as a change and must not be reported as one here either — before_server's
+            # value equals server's in that case, so record_secret_reference_change's own
+            # no-op-if-unchanged check makes this safe even without the extra condition, but the
+            # condition documents the intent explicitly).
+            if "upstream_auth_header" in body.model_fields_set:
+                await record_secret_reference_change(
+                    admin_event_repo, server_slug=slug,
+                    before_value=before_server.upstream_auth_header,
+                    after_value=server.upstream_auth_header,
+                    actor=principal.actor, client_ip=request.client.host if request.client else None,
+                )
 
         return _server_to_response(server)
 
@@ -577,6 +628,7 @@ def build_control_plane_router(
                 webhook_events=values["webhook_events"].split(","),
                 webhook_allow_private=values.get("webhook_allow_private") == "true",
                 has_webhook_secret=bool(values.get("webhook_secret")),
+                secret_provider=provider_tier_name(secret_backend),
             )
 
         @router.put("/settings", response_model=SettingsResponse)

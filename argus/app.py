@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from archon.api import build_control_plane_router
 from archon.auth.apikeys import ApiKeyService
 from archon.oidc import AttemptStore
+from archon.secrets import build_secret_provider
 from archon.settings import Settings
 from archon.setup import build_setup_router
 from argus.aggregate_pipeline import AggregatePipeline
@@ -82,6 +83,12 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     api_keys = ApiKeyService(api_key_repo)
     rate_limiter = RateLimiterRegistry()
     audit = AuditLogger(audit_repo)
+    # Enterprise #5: selected once at startup from settings.secret_provider ("local" by default,
+    # byte-identical to pre-feature behaviour). Constructed here — not lazily per-request — so a
+    # misconfigured key/Vault address (EncryptedProviderConfigError / OpenBaoConfigError) fails
+    # loudly at boot, the same way a missing admin_token or a bad webhook_url would, rather than
+    # surfacing as a mysterious first-request failure.
+    secret_provider = build_secret_provider(settings)
     # F13 fix (review 2026-08-04): httpx.AsyncClient(timeout=N) applies N to ALL FOUR of
     # connect/read/write/pool — including pool acquisition wait, which has nothing to do with
     # how long a real upstream tool call should be allowed to take. With the default
@@ -110,6 +117,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         server_repo, http_client, handshake_cache,
         interval_seconds=settings.health_poll_interval_seconds,
         webhook_dispatcher=webhook_dispatcher,
+        secret_provider=secret_provider,
     )
     retention_job = AuditRetentionJob(
         audit_repo, settings_repo,
@@ -128,6 +136,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         bridge=bridge,
         tools_cache=tools_cache,
         settings_repo=settings_repo,
+        secret_provider=secret_provider,
     )
     aggregate_pipeline = AggregatePipeline(
         settings=settings, server_repo=server_repo, api_keys=api_keys,
@@ -155,6 +164,12 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
             await webhook_dispatcher.stop()
             await audit.stop()
             await http_client.aclose()
+            # OpenBaoSecretProvider owns its own httpx.AsyncClient (deliberately separate from
+            # the shared http_client — see that class's docstring on why); local/encrypted have
+            # no aclose(), so this is a no-op for them via getattr's default.
+            aclose = getattr(secret_provider, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     app = FastAPI(title="Acropolis", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.middleware("http")(_security_headers_middleware)
@@ -175,12 +190,16 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.retention_job = retention_job
     app.state.webhook_dispatcher = webhook_dispatcher
     app.state.config_source = config_source
+    app.state.secret_provider = secret_provider
+    app.state.pipeline = pipeline
+    app.state.aggregate_pipeline = aggregate_pipeline
 
     oidc_attempts = AttemptStore()
     app.include_router(build_setup_router(settings_repo, rate_limiter, user_repo, http_client, oidc_attempts))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
         rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source, user_repo,
+        secret_provider=secret_provider,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo, config_source))

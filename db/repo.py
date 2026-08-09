@@ -75,6 +75,7 @@ def _row_to_server(row: aiosqlite.Row) -> ServerRecord:
         in_aggregate=bool(row["in_aggregate"]),
         upstream_protocol=row["upstream_protocol"],
         health_status=row["health_status"],
+        health_reason=row["health_reason"] if "health_reason" in row.keys() else None,
         last_seen_at=row["last_seen_at"],
         discover_json=row["discover_json"],
         created_at=row["created_at"],
@@ -227,15 +228,22 @@ class ServerRepo:
 
     async def set_health(
         self, slug: str, health_status: str, upstream_protocol: Optional[str] = None,
-        discover_json: Optional[str] = None,
+        discover_json: Optional[str] = None, health_reason: Optional[str] = None,
     ) -> None:
+        # Enterprise #5: health_reason is NOT COALESCE'd like upstream_protocol/discover_json
+        # above — it must be overwritten with exactly what THIS probe found (None when the
+        # cause wasn't a secret-resolution failure), or a stale reason from a previous failed
+        # probe would keep showing after the server recovers or the cause changes to a plain
+        # network outage.
         current = await self.get(slug)
         async with self._db.gateway_write_lock:
             await self._write.execute(
                 """UPDATE servers SET health_status = ?, upstream_protocol = COALESCE(?, upstream_protocol),
-                   discover_json = COALESCE(?, discover_json), last_seen_at = ?, updated_at = ?
+                   discover_json = COALESCE(?, discover_json), health_reason = ?,
+                   last_seen_at = ?, updated_at = ?
                    WHERE id = ?""",
-                (health_status, upstream_protocol, discover_json, utcnow(), utcnow(), current.id),
+                (health_status, upstream_protocol, discover_json, health_reason,
+                 utcnow(), utcnow(), current.id),
             )
             await self._write.commit()
 

@@ -12,11 +12,19 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+from archon.secrets import is_reference
 from db.models import ServerPolicy
 from db.repo import AdminEventRepo
 
 # Allowlist of fields that may appear in before/after for server changes.
-# upstream_auth_header is deliberately EXCLUDED — it's a live plaintext credential.
+# upstream_auth_header is deliberately EXCLUDED — it's a live plaintext credential (or, as of
+# enterprise #5, potentially a non-secret reference — but this allowlist can't tell which
+# without inspecting the value, and RECORDABLE_SERVER_FIELDS is used generically by
+# filter_server_fields() on dicts that may or may not have already made that distinction. THE
+# VALUE never goes through this allowlist either way. See record_secret_reference_change()
+# below for the enterprise #5-specific event this module adds instead: it records that a
+# reference changed and what it changed TO/FROM only as a boolean shape classification via
+# is_reference(), never the string itself.
 RECORDABLE_SERVER_FIELDS = frozenset({
     "slug", "name", "upstream_url", "enabled", "in_aggregate",
     "upstream_protocol", "health_status",
@@ -143,6 +151,66 @@ async def record_policy_change(
         target_id=server_slug,
         before={"policy": _serialize_policy(current)},
         after={"policy": _serialize_policy(incoming)},
+        client_ip=client_ip,
+    )
+
+
+async def record_secret_reference_change(
+    repo: AdminEventRepo,
+    *,
+    server_slug: str,
+    before_value: Optional[str],
+    after_value: Optional[str],
+    actor: Optional[str] = None,
+    client_ip: Optional[str] = None,
+) -> Optional[int]:
+    """Records that server_slug's upstream_auth_header CHANGED — never the value, in any form,
+    on either side of the change, in any tier (a literal, a vault:// reference, or an enc:v1:
+    ciphertext are all withheld the same way here; ciphertext is not exempted just because it
+    LOOKS unreadable — logging it gratuitously would still be logging derived secret material
+    for no operational benefit).
+
+    Per the plan: "a secret-reference change is a control-plane audit event (server slug + that
+    the reference changed), but the actual secret value must never be audited or logged". The
+    before/after payload here is deliberately just three booleans (was/is something configured,
+    was/is it a reference vs. a literal) plus the slug — enough for an operator reviewing the
+    audit trail to see WHAT KIND of change happened (e.g. "credential externalized to Vault")
+    without any way to recover what the credential actually is or was.
+
+    Returns None (and records nothing) if upstream_auth_header didn't actually change — callers
+    (archon/api.py's create/update handlers) call this unconditionally; the no-op-if-unchanged
+    check lives here so it can't be forgotten at a call site the way a manual `if` could be.
+    """
+    if before_value == after_value:
+        return None
+
+    def _shape(value: Optional[str]) -> dict[str, Any]:
+        return {"configured": value is not None, "is_reference": is_reference(value)}
+
+    before_shape = _shape(before_value)
+    after_shape = _shape(after_value)
+
+    if not before_shape["configured"] and after_shape["configured"]:
+        summary = "credential configured" + (" (reference)" if after_shape["is_reference"] else "")
+    elif before_shape["configured"] and not after_shape["configured"]:
+        summary = "credential cleared"
+    elif before_shape["is_reference"] != after_shape["is_reference"]:
+        summary = (
+            "credential externalized to a reference" if after_shape["is_reference"]
+            else "credential replaced with a literal"
+        )
+    else:
+        summary = "credential value changed"
+
+    return await record(
+        repo,
+        action="server.secret_reference_change",
+        summary=summary,
+        actor=actor,
+        target_type="server",
+        target_id=server_slug,
+        before={"upstream_auth_header": before_shape},
+        after={"upstream_auth_header": after_shape},
         client_ip=client_ip,
     )
 

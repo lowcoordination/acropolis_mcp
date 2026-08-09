@@ -94,10 +94,16 @@ or **Settings → Configuration → Export configuration** in the UI.
 - **API keys.** Stored only as hashes and show-once by design, so exporting them would be
   useless for restoring and a liability to hold. Recreate keys after importing.
 - **`admin_password_hash` and `session_secret`.** Never exported, on either path.
-- **Upstream credentials** (`upstream_auth_header`). Omitted by default; the export names which
-  servers had one so you know the file is incomplete. `--include-credentials` (CLI) or the
-  checkbox in the UI opts in, and stamps a prominent warning into the file itself — at that
-  point the file is a secret, so don't commit it.
+- **Upstream credentials** (`upstream_auth_header`), when stored as a **literal**. Omitted by
+  default; the export names which servers had one so you know the file is incomplete.
+  `--include-credentials` (CLI) or the checkbox in the UI opts in, and stamps a prominent warning
+  into the file itself — at that point the file is a secret, so don't commit it.
+
+  A `vault://` or `enc:v1:` **reference** (enterprise #5 — see [docs/secrets.md](secrets.md)) is
+  the exception: it's not a secret on its own, so it's always included, with no warning, on
+  every export. This is what makes a committed config export practical with real credentials —
+  the same file with the same reference works when imported onto another instance pointed at the
+  same Vault.
 
 Because of the first three, **an export is not a backup.** Use the `sqlite3 .backup` procedure
 above for disaster recovery.
