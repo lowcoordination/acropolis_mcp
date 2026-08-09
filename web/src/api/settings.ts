@@ -3,6 +3,7 @@ import type {
   ConfigImportResponse,
   SettingsResponse,
   SetupStatusResponse,
+  TracingStatusResponse,
   WebhookTestResponse,
 } from './types'
 
@@ -33,6 +34,10 @@ export const configApi = {
 
 export const webhooksApi = {
   test: () => api.post<WebhookTestResponse>('/webhooks/test'),
+}
+
+export const tracingApi = {
+  status: () => api.get<TracingStatusResponse>('/tracing/status'),
 }
 
 export const setupApi = {

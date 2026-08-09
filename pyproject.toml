@@ -28,6 +28,18 @@ dev = [
     # generation Argus needs to BRIDGE to, not the one its test fixtures should emulate as upstream.
     "mcp==1.29.0",
 ]
+# Enterprise #9: OpenTelemetry tracing. Deliberately a SEPARATE optional-dependencies group from
+# `dev`, not folded into it — `dev` is "what CI and contributors need to run the test suite",
+# and the whole point of this extra is that the base install (and, by extension, `dev`) works
+# with these packages absent, proving ACROPOLIS_OTEL_ENABLED=true degrades to a logged no-op
+# rather than a crash when they aren't installed. `pip install acropolis[otel]` (or
+# `pip install -e ".[dev,otel]"` for a contributor who wants both) opts in. See argus/tracing.py
+# and docs/observability.md.
+otel = [
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+]
 
 [project.scripts]
 acropolis = "argus.__main__:cli"

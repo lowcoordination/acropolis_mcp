@@ -29,9 +29,27 @@ HOP_BY_HOP_HEADERS = frozenset(
     }
 )
 
+# Enterprise #9 (OTel tracing): the CLIENT'S OWN inbound traceparent/tracestate are stripped
+# here unconditionally, same denylist mechanism as authorization/cookie above — NOT because
+# they're sensitive, but because strip_hop_by_hop's output previously fed straight into the
+# passthrough forward (argus/pipeline.py's _forward) with no processing at all, so any client
+# could already stamp an arbitrary, ungoverned traceparent onto the upstream request today.
+# That's an incidental passthrough, exactly what the plan (01-otel-tracing.md design decision 3)
+# says this feature must NOT ship as. The correct traceparent is instead re-added deliberately in
+# argus/pipeline.py's _forward, sourced from TracingManager.inject_headers() (i.e. derived from
+# the gateway's own upstream.forward span, correctly parent-chained under whatever inbound
+# traceparent the ROOT span was told to honor) — never a raw copy-through of the client header.
+# See tests/integration/test_otel_propagation.py for both directions of this: tracing disabled
+# -> no traceparent reaches upstream at all; tracing enabled -> the one that reaches upstream is
+# gateway-derived and correctly parent-chained, not the client's verbatim value.
+TRACE_CONTEXT_HEADERS = frozenset({b"traceparent", b"tracestate"})
+
 
 def strip_hop_by_hop(raw_headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
-    return [(k, v) for k, v in raw_headers if k.lower() not in HOP_BY_HOP_HEADERS]
+    return [
+        (k, v) for k, v in raw_headers
+        if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() not in TRACE_CONTEXT_HEADERS
+    ]
 
 
 # F19 fix (review 2026-08-04): the upstream response used to be relayed with headers=dict(

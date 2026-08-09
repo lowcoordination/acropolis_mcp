@@ -133,6 +133,16 @@ export interface WebhookTestResponse {
   error: string | null
 }
 
+export interface TracingStatusResponse {
+  // Enterprise #9: whether ACROPOLIS_OTEL_ENABLED was set at process startup.
+  enabled: boolean
+  // Additionally requires the `otel` optional dependency group to have actually been
+  // importable — can be false even when `enabled` is true (operator flipped the gate on a
+  // base install without the extra). See docs/observability.md.
+  active: boolean
+  sample_ratio: number
+}
+
 export interface ServerHealthSummary {
   slug: string
   health_status: string
