@@ -264,8 +264,12 @@ function ShowKeyModal({ created, onClose }: { created: KeyCreatedResponse; onClo
  * renders nothing for a key with no quota configured, since there's nothing to show progress
  * toward (see docs/quotas.md: null quota = unlimited). */
 function QuotaUsageBar({ apiKey }: { apiKey: KeyResponse }) {
+  const hasQuota = apiKey.quota_calls != null
   const period = apiKey.quota_period ?? 'day'
-  const { data: usage } = useUsage({ api_key_id: apiKey.id, period })
+  // Self-review fix: `enabled: hasQuota` skips the /usage request entirely for an unlimited
+  // key, rather than firing it and only ignoring the result in the early return below — a
+  // wasted round-trip on every unlimited key otherwise, on every Keys page load.
+  const { data: usage } = useUsage({ api_key_id: apiKey.id, period }, hasQuota)
 
   if (apiKey.quota_calls == null) {
     return (

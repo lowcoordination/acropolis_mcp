@@ -6,8 +6,9 @@ spent it." These are complementary, not overlapping: a key can be both rate-limi
 than 5 calls/minute) and quota-limited (no more than 10,000 calls this month), enforced
 independently, one after the other, on the same request.
 
-Configure a quota on the key create/edit form in the UI, or via `POST`/`PATCH
-/api/v1/keys/{id}/quota`.
+Configure a quota on the key create/edit form in the UI, or via the API: `quota_calls`/
+`quota_period` fields on `POST /api/v1/keys` at creation time, or `PATCH /api/v1/keys/{id}/quota`
+to set or clear it on an existing key.
 
 ## Scope: call-count quotas, not cost — read this before you configure one
 

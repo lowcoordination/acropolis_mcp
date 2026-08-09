@@ -19,10 +19,15 @@
 -- "Interactions" section: adding project scoping later should not require ANOTHER migration
 -- against this table, just backfilling and starting to filter/group by it.
 --
--- server_id (not server_slug) is the FK target, matching how server_policies/tool_policies
--- key off server_id rather than the human-facing slug — consistent with the rest of this
--- schema, and immune to a slug being renamed later (ServerRepo has no rename path today, but
--- server_id is still the more correct key to have chosen).
+-- server_id (not server_slug) is the join key, matching how server_policies/tool_policies key
+-- off server_id rather than the human-facing slug — consistent with the rest of this schema,
+-- and immune to a slug being renamed later (ServerRepo has no rename path today, but server_id
+-- is still the more correct key to have chosen). NOT declared as an actual FK REFERENCES
+-- constraint (unlike server_policies.server_id, which does reference servers(id) ON DELETE
+-- CASCADE) — the sentinel value 0 used for "no server" below would violate a real FK, since no
+-- server row with id 0 can ever exist. A row with server_id = <a deleted server's former id> is
+-- left in place rather than cascaded away, which is the correct behavior for a historical usage
+-- record: a server being deleted from the fleet shouldn't retroactively erase what it cost.
 --
 -- api_key_id/server_id/tool are NOT NULL with sentinel values (0 / 0 / '' respectively) for
 -- "no key" (open auth_mode), "no server" (never actually used, reserved), and "no specific
@@ -37,8 +42,11 @@ CREATE TABLE IF NOT EXISTS usage_rollups (
     period_start TEXT NOT NULL,   -- ISO8601 UTC, truncated to the hour, e.g. "2026-08-09T14:00:00+00:00"
     period_kind  TEXT NOT NULL DEFAULT 'hour',
     api_key_id   INTEGER NOT NULL DEFAULT 0,  -- 0 = no key (open auth_mode) — see note above
-    server_id    INTEGER NOT NULL DEFAULT 0,  -- 0 = no server — reserved, not used by tools/call rows
-    tool         TEXT NOT NULL DEFAULT '',    -- '' = no specific tool (non-tools/call traffic)
+    server_id    INTEGER NOT NULL DEFAULT 0,  -- real tools/call rows always carry a real server_id;
+                                               -- 0 only appears if a future caller increments with no
+                                               -- server context at all — not exercised today, kept for
+                                               -- the same "sentinel, not NULL" reason as api_key_id/tool
+    tool         TEXT NOT NULL DEFAULT '',    -- '' = non-tools/call traffic (no specific tool)
     project_id   INTEGER,         -- reserved for enterprise #5 (multi-tenancy) — unused today
     calls        INTEGER NOT NULL DEFAULT 0,
     CHECK (period_kind IN ('hour')),

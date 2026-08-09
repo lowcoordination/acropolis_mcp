@@ -231,6 +231,21 @@ class ToolTestResponse(BaseModel):
     upstream_response: Optional[dict] = None
 
 
+def _validate_quota_pairing(quota_calls: Optional[int], quota_period: Optional[str]) -> None:
+    """Shared by KeyCreateRequest and KeyQuotaUpdateRequest (self-review fix: this validation
+    was duplicated near-verbatim across both models — a single source avoids the two drifting
+    apart the next time one of them changes). A quota_calls with no quota_period (or vice
+    versa) is a half-configured, ambiguous state — reject it at the API boundary rather than
+    let it reach the DB as a row db/models.py's ApiKeyRecord would itself refuse to construct
+    on the way back out."""
+    if (quota_calls is None) != (quota_period is None):
+        raise ValueError("quota_calls and quota_period must be set together, or both omitted")
+    if quota_calls is not None and quota_calls <= 0:
+        raise ValueError("quota_calls must be a positive integer")
+    if quota_period is not None and quota_period not in ("day", "month"):
+        raise ValueError("quota_period must be 'day' or 'month'")
+
+
 class KeyCreateRequest(BaseModel):
     name: str
     server_scopes: Optional[list[str]] = None
@@ -242,15 +257,7 @@ class KeyCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _quota_fields_are_paired(self) -> "KeyCreateRequest":
-        # A quota_calls with no quota_period (or vice versa) is a half-configured, ambiguous
-        # state — reject it at the API boundary rather than let it reach the DB as a row
-        # db/models.py's ApiKeyRecord would itself refuse to construct on the way back out.
-        if (self.quota_calls is None) != (self.quota_period is None):
-            raise ValueError("quota_calls and quota_period must be set together, or both omitted")
-        if self.quota_calls is not None and self.quota_calls <= 0:
-            raise ValueError("quota_calls must be a positive integer")
-        if self.quota_period is not None and self.quota_period not in ("day", "month"):
-            raise ValueError("quota_period must be 'day' or 'month'")
+        _validate_quota_pairing(self.quota_calls, self.quota_period)
         return self
 
 
@@ -285,12 +292,7 @@ class KeyQuotaUpdateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _quota_fields_are_paired(self) -> "KeyQuotaUpdateRequest":
-        if (self.quota_calls is None) != (self.quota_period is None):
-            raise ValueError("quota_calls and quota_period must be set together, or both null")
-        if self.quota_calls is not None and self.quota_calls <= 0:
-            raise ValueError("quota_calls must be a positive integer")
-        if self.quota_period is not None and self.quota_period not in ("day", "month"):
-            raise ValueError("quota_period must be 'day' or 'month'")
+        _validate_quota_pairing(self.quota_calls, self.quota_period)
         return self
 
 

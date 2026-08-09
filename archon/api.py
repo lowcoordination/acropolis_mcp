@@ -1003,18 +1003,15 @@ def build_control_plane_router(
             # key_prefix/server_slug are looked up for display — never the key hash/plaintext,
             # matching the webhook payload's same discipline (see stoa/webhooks.py's
             # fire_quota_threshold docstring).
-            key_prefixes: dict[int, str] = {}
-            server_slugs: dict[int, str] = {}
-            for (k_id, s_id, _tool), _calls in totals.items():
-                if k_id is not None and k_id not in key_prefixes:
-                    rec = await api_keys.get(k_id)
-                    if rec is not None:
-                        key_prefixes[k_id] = rec.key_prefix
-                if s_id is not None and s_id not in server_slugs:
-                    try:
-                        server_slugs[s_id] = (await server_repo.get_by_id(s_id)).slug
-                    except ServerNotFoundError:
-                        pass
+            #
+            # Self-review fix: this used to call api_keys.get(k_id) / server_repo.get_by_id(s_id)
+            # ONCE PER DISTINCT key/server in the result set — an N+1 query pattern (N sequential
+            # DB round-trips for N distinct keys, again for N distinct servers). Both api_keys
+            # and server_repo already expose a single list() call each (the same one GET /keys
+            # and GET /servers use) — two bulk reads regardless of how many distinct keys/servers
+            # appear in `totals`, rather than scaling with the size of the result set.
+            key_prefixes = {k.id: k.key_prefix for k in await api_keys.list()}
+            server_slugs = {s.id: s.slug for s in await server_repo.list()}
 
             buckets = [
                 UsageBucketResponse(

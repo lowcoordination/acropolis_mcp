@@ -27,6 +27,12 @@ CAP_MAX_PER_WINDOW = 20
 
 VALID_EVENTS = ("blocked", "unhealthy", "drift", "quota")
 
+# Bound on WebhookDispatcher._quota_fired's size — see fire_quota_threshold's self-review-fix
+# comment. 10,000 distinct (key_prefix, period_start) entries is generously above what any
+# reasonably-sized deployment's key count x active-period count would produce; this exists to
+# cap worst-case memory, not to be a limit anyone should expect to approach in practice.
+_QUOTA_FIRED_MAX_ENTRIES = 10_000
+
 
 @dataclass
 class _DebounceEntry:
@@ -258,6 +264,22 @@ class WebhookDispatcher:
             if already_fired >= threshold:
                 return
             self._quota_fired[debounce_key] = threshold
+            # Self-review fix: unlike self._debounce (whose entries are popped once their
+            # window's debounced send completes — see _debounced_send), nothing was ever
+            # removing an entry from self._quota_fired. Every distinct (key_prefix,
+            # period_start) combination a quota-configured key ever crosses a threshold in
+            # accumulates one entry, forever, for the life of the process — an unbounded
+            # per-process memory leak on a long-running gateway (one entry per key per day for
+            # daily quotas, indefinitely). There's no natural "period ended" signal to hook a
+            # real eviction on without parsing period lengths this class doesn't otherwise need
+            # to know, so this is a simple bound instead: once the map exceeds a generous cap,
+            # drop the oldest half (insertion order, since dicts preserve it) — old periods are
+            # exactly the ones safe to forget, since their debounce guarantee no longer matters
+            # once the period itself is over.
+            if len(self._quota_fired) > _QUOTA_FIRED_MAX_ENTRIES:
+                stale_keys = list(self._quota_fired.keys())[: len(self._quota_fired) // 2]
+                for stale_key in stale_keys:
+                    self._quota_fired.pop(stale_key, None)
 
         await self._send_if_under_cap(
             config,

@@ -403,6 +403,39 @@ class TestThresholdWebhook:
         # "not yet fired" at the moment they checked.
         assert len(quota_events) == 1
 
+    async def test_quota_fired_map_is_bounded_not_an_unbounded_leak(self, quota_app):
+        """Self-review regression: WebhookDispatcher._quota_fired used to grow by one entry per
+        distinct (key_prefix, period_start) forever, with nothing ever removing an entry —
+        unlike self._debounce, whose entries are popped once their window fires. Proves the
+        eviction added in fire_quota_threshold actually caps the map's size rather than just
+        existing as a comment."""
+        from stoa.webhooks import _QUOTA_FIRED_MAX_ENTRIES
+
+        app, db, admin_client, transport, slug = quota_app
+        dispatcher = app.state.webhook_dispatcher
+
+        # A configured-but-never-dialled webhook_url (fire_quota_threshold returns early when
+        # config is None, before ever touching self._quota_fired — so a REAL config is needed
+        # to exercise the map-growth path) plus a stubbed _send_if_under_cap that's a no-op, to
+        # isolate map growth from needing a live receiver to answer thousands of POSTs.
+        settings_repo = SettingsRepo(db)
+        await settings_repo.set_many({
+            "webhook_url": "https://127.0.0.1:1/hook", "webhook_enabled": "true", "webhook_events": "quota",
+        })
+
+        async def _noop_send(config, payload):
+            return None
+
+        dispatcher._send_if_under_cap = _noop_send
+
+        for i in range(_QUOTA_FIRED_MAX_ENTRIES + 500):
+            await dispatcher.fire_quota_threshold(
+                key_prefix=f"acropolis_key{i}", key_name=f"k{i}",
+                threshold=100, period="day", period_start_iso=f"2026-08-{(i % 28) + 1:02d}T00:00:00+00:00",
+            )
+
+        assert len(dispatcher._quota_fired) <= _QUOTA_FIRED_MAX_ENTRIES
+
 
 # ---------------------------------------------------------------------------
 # Fail-open: the deliberate reversal of secret-resolution's fail-closed default
