@@ -38,6 +38,7 @@ from archon.schemas import (
     DriftStatusResponse,
     KeyCreatedResponse,
     KeyCreateRequest,
+    KeyQuotaUpdateRequest,
     KeyResponse,
     PolicyResponse,
     PolicyUpdateRequest,
@@ -53,6 +54,8 @@ from archon.schemas import (
     ToolTestRequest,
     ToolTestResponse,
     TracingStatusResponse,
+    UsageBucketResponse,
+    UsageResponse,
     UserCreateRequest,
     UserEnabledUpdateRequest,
     UserResponse,
@@ -62,6 +65,7 @@ from archon.schemas import (
 from argus.audit import AuditLogger
 from argus.generation import ClientGeneration
 from argus.pipeline import Pipeline
+from argus.quotas import period_start
 from argus.rate_limiter import RateLimiterRegistry, server_key
 from argus.toolslist import ToolsCache
 from argus.tracing import TracingManager
@@ -73,6 +77,7 @@ from db.repo import (
     ServerNotFoundError,
     ServerRepo,
     SettingsRepo,
+    UsageRepo,
     UserNotFoundError,
     UserRepo,
     UsernameConflictError,
@@ -116,6 +121,7 @@ def _key_to_response(key) -> KeyResponse:
     return KeyResponse(
         id=key.id, name=key.name, key_prefix=key.key_prefix, enabled=key.enabled,
         server_scopes=key.server_scopes, created_at=key.created_at, last_used_at=key.last_used_at,
+        quota_calls=key.quota_calls, quota_period=key.quota_period,
     )
 
 
@@ -140,6 +146,7 @@ def build_control_plane_router(
     user_repo: Optional[UserRepo] = None,
     secret_provider: Optional[SecretProvider] = None,
     tracing: Optional[TracingManager] = None,
+    usage_repo: Optional["UsageRepo"] = None,
 ) -> APIRouter:
     # enterprise #2 (RBAC): the router used to carry ONE blanket
     # dependencies=[Depends(require_admin)] gate — authenticated meant authorized for
@@ -542,9 +549,22 @@ def build_control_plane_router(
         # act entirely outside their control-plane role, which would make the operator/admin
         # boundary trivially bypassable. require_role("admin") above is what actually enforces
         # this; see tests/integration/test_rbac.py's "operator cannot mint a key" case.
-        generated = await api_keys.create(name=body.name, server_scopes=body.server_scopes)
+        generated = await api_keys.create(
+            name=body.name, server_scopes=body.server_scopes,
+            quota_calls=body.quota_calls, quota_period=body.quota_period,
+        )
 
         if admin_event_repo is not None:
+            after = {
+                "name": body.name, "key_prefix": generated.record.key_prefix,
+                "server_scopes": body.server_scopes,
+            }
+            # Enterprise #11: only recorded when actually set, so a plain key-create's
+            # admin-event summary stays exactly as it read before this feature existed — see
+            # tests/integration/test_admin_events.py's key.create shape assertions.
+            if body.quota_calls is not None:
+                after["quota_calls"] = body.quota_calls
+                after["quota_period"] = body.quota_period
             await record(
                 admin_event_repo,
                 action="key.create",
@@ -552,7 +572,7 @@ def build_control_plane_router(
                 actor=principal.actor,
                 target_type="key",
                 target_id=str(generated.record.id),
-                after={"name": body.name, "key_prefix": generated.record.key_prefix, "server_scopes": body.server_scopes},
+                after=after,
                 client_ip=request.client.host if request.client else None,
             )
 
@@ -589,6 +609,41 @@ def build_control_plane_router(
                 target_id=str(key_id),
                 before={"enabled": key_before.enabled},
                 after={"enabled": enabled},
+                client_ip=request.client.host if request.client else None,
+            )
+
+        return _key_to_response(key_after)
+
+    @router.patch("/keys/{key_id}/quota", response_model=KeyResponse, dependencies=[Depends(require_role("admin"))])
+    async def patch_key_quota(
+        key_id: int, body: KeyQuotaUpdateRequest, request: Request,
+        principal: Principal = Depends(require_role("admin")),
+    ):
+        """Enterprise #11: sets or clears a key's quota. A separate route from PATCH /keys/{id}
+        (see KeyQuotaUpdateRequest's docstring) — admin-only, same as every other key-mutating
+        route (02-rbac.md design decision 3: a key is a data-plane credential, so changing what
+        it can do is as sensitive as minting one)."""
+        key_before = await api_keys.get(key_id)
+        if key_before is None:
+            raise HTTPException(status_code=404, detail="key not found")
+
+        await api_keys.set_quota(key_id, body.quota_calls, body.quota_period)
+        key_after = await api_keys.get(key_id)
+
+        if admin_event_repo is not None and key_after is not None:
+            await record(
+                admin_event_repo,
+                action="key.quota_update",
+                summary=(
+                    f"set quota on API key '{key_after.name}': {body.quota_calls}/{body.quota_period}"
+                    if body.quota_calls is not None
+                    else f"cleared quota on API key '{key_after.name}'"
+                ),
+                actor=principal.actor,
+                target_type="key",
+                target_id=str(key_id),
+                before={"quota_calls": key_before.quota_calls, "quota_period": key_before.quota_period},
+                after={"quota_calls": body.quota_calls, "quota_period": body.quota_period},
                 client_ip=request.client.host if request.client else None,
             )
 
@@ -894,6 +949,96 @@ def build_control_plane_router(
                         audit_logger.unsubscribe(q)
 
                 return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    if usage_repo is not None:
+        @router.get("/usage", response_model=UsageResponse, dependencies=[Depends(require_role("viewer"))])
+        async def get_usage(
+            api_key_id: Optional[int] = None, server_slug: Optional[str] = None,
+            tool: Optional[str] = None, period: str = "day",
+            principal: Principal = Depends(require_role("viewer")),
+        ):
+            """Enterprise #11. viewer+ (read-only, consistent with how /audit is already scoped
+            — a viewer can already see per-key traffic there, including numeric api_key_id and
+            tool on every row; this route's CALL-COUNT data is the same order of visibility.
+
+            SECURITY (self-review finding, fixed here — see docs/quotas.md's "who can see what"
+            section for the full writeup): `key_prefix` is a piece of key metadata `/audit`
+            does NOT expose to a viewer (that response carries only the bare numeric
+            api_key_id — see AuditEventResponse) and GET /keys, which DOES expose it, is
+            admin-only. A first pass at this route populated key_prefix for every caller,
+            which would have handed a viewer something they could not get from either existing
+            surface — a real, new capability, not a re-exposure of something already visible.
+            Fixed by gating key_prefix on admin role specifically; a viewer/operator still gets
+            the numeric api_key_id and the call count (exactly what /audit already shows them),
+            just not the human-identifiable prefix.
+
+            `period` selects how far back to sum: "day" (since UTC midnight today), "month"
+            (since the 1st of the current UTC month), or "all" (every stored bucket — hourly
+            rollups are never pruned, see 0010_usage_rollups.sql, so "all" is bounded only by
+            how long this Acropolis instance has been running). This is a QUERY window,
+            independent of any key's configured quota_period — a key with no quota at all can
+            still be queried here.
+            """
+            if period not in ("day", "month", "all"):
+                raise HTTPException(status_code=400, detail="period must be 'day', 'month', or 'all'")
+
+            since_iso: Optional[str] = None
+            if period in ("day", "month"):
+                since_iso = period_start(period).isoformat()
+
+            server_id: Optional[int] = None
+            if server_slug is not None:
+                try:
+                    server_id = (await server_repo.get(server_slug)).id
+                except ServerNotFoundError:
+                    return UsageResponse(period=period, since=since_iso, buckets=[])
+
+            raw = await usage_repo.query(
+                api_key_id=api_key_id, server_id=server_id, tool=tool, since_iso=since_iso,
+            )
+
+            # Sum the raw hourly buckets down to one row per (key, server, tool) — see
+            # UsageRepo.query's docstring on why summing here beats N bespoke GROUP BY queries.
+            # Sentinel translation (0 -> None for api_key_id/server_id, '' -> None for tool)
+            # happens here too, so the API never leaks the storage-layer sentinel outward.
+            totals: dict[tuple[Optional[int], Optional[int], Optional[str]], int] = {}
+            for row in raw:
+                key = (
+                    row["api_key_id"] or None,
+                    row["server_id"] or None,
+                    row["tool"] or None,
+                )
+                totals[key] = totals.get(key, 0) + row["calls"]
+
+            # key_prefix/server_slug are looked up for display — never the key hash/plaintext,
+            # matching the webhook payload's same discipline (see stoa/webhooks.py's
+            # fire_quota_threshold docstring).
+            #
+            # Self-review fix: this used to call api_keys.get(k_id) / server_repo.get_by_id(s_id)
+            # ONCE PER DISTINCT key/server in the result set — an N+1 query pattern (N sequential
+            # DB round-trips for N distinct keys, again for N distinct servers). Both api_keys
+            # and server_repo already expose a single list() call each (the same one GET /keys
+            # and GET /servers use) — two bulk reads regardless of how many distinct keys/servers
+            # appear in `totals`, rather than scaling with the size of the result set.
+            #
+            # Security fix (see this route's docstring): key_prefix is admin-only. server_slug
+            # stays available to every role — servers are already fully visible to a viewer via
+            # GET /servers, so there is no analogous leak on that side.
+            key_prefixes = (
+                {k.id: k.key_prefix for k in await api_keys.list()}
+                if principal.role == "admin" else {}
+            )
+            server_slugs = {s.id: s.slug for s in await server_repo.list()}
+
+            buckets = [
+                UsageBucketResponse(
+                    api_key_id=k_id, key_prefix=key_prefixes.get(k_id) if k_id is not None else None,
+                    server_id=s_id, server_slug=server_slugs.get(s_id) if s_id is not None else None,
+                    tool=tool_name, calls=calls,
+                )
+                for (k_id, s_id, tool_name), calls in sorted(totals.items(), key=lambda kv: -kv[1])
+            ]
+            return UsageResponse(period=period, since=since_iso, buckets=buckets)
 
     if admin_event_repo is not None:
         @router.get("/admin-events", response_model=list[AdminEventResponse], dependencies=[Depends(require_role("viewer"))])

@@ -25,7 +25,13 @@ DEBOUNCE_WINDOW_SECONDS = 60.0
 CAP_WINDOW_SECONDS = 3600.0
 CAP_MAX_PER_WINDOW = 20
 
-VALID_EVENTS = ("blocked", "unhealthy", "drift")
+VALID_EVENTS = ("blocked", "unhealthy", "drift", "quota")
+
+# Bound on WebhookDispatcher._quota_fired's size — see fire_quota_threshold's self-review-fix
+# comment. 10,000 distinct (key_prefix, period_start) entries is generously above what any
+# reasonably-sized deployment's key count x active-period count would produce; this exists to
+# cap worst-case memory, not to be a limit anyone should expect to approach in practice.
+_QUOTA_FIRED_MAX_ENTRIES = 10_000
 
 
 @dataclass
@@ -76,6 +82,22 @@ class WebhookDispatcher:
         self._task: Optional[asyncio.Task] = None
         self._debounce: dict[tuple[str, str], _DebounceEntry] = {}
         self._cap = _CapState()
+        # Enterprise #11: (key_prefix, period_start_iso) -> highest threshold already fired
+        # this period. Per-PERIOD debounce, not the time-windowed DEBOUNCE_WINDOW_SECONDS
+        # pattern the rest of this class uses for BLOCKED/unhealthy/drift — a quota alert's
+        # correct debounce boundary is "once per threshold per billing period," which could be
+        # hours or a month wide, not a fixed 60s window. period_start_iso is part of the key so
+        # a NEW period (the caller computes a new start via argus.quotas.period_start) starts
+        # with a clean slate automatically, with no separate reset job needed.
+        self._quota_fired: dict[tuple[str, str], int] = {}
+        # Enterprise #11 self-review fix: a burst of concurrent requests can all read
+        # self._quota_fired BEFORE any of them writes it back — the classic check-then-act race
+        # (see tests/integration/test_quotas.py::test_concurrent_burst_crossing_threshold_
+        # fires_webhook_exactly_once for the regression test). One lock, keyed by
+        # (key_prefix, period_start_iso), makes "check what's fired, then record what just
+        # fired" atomic across concurrent callers instead of two separate awaits with a gap
+        # between them.
+        self._quota_lock = asyncio.Lock()
 
     async def fire(self, event_type: str, payload: dict) -> None:
         """Fire a webhook event of the given type. Generic entry point for non-audit events
@@ -206,6 +228,69 @@ class WebhookDispatcher:
                 "event": "unhealthy",
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "server_slug": server_slug,
+                "count": 1,
+            },
+        )
+
+    async def fire_quota_threshold(
+        self, *, key_prefix: str, key_name: str, threshold: int, period: str, period_start_iso: str,
+    ) -> None:
+        """Enterprise #11: fires the `quota` webhook event when a call crosses an
+        80%/100%-of-quota threshold. Called from argus/pipeline.py's _check_quota /
+        _maybe_fire_quota_webhook, which already determined THAT a threshold was newly crossed
+        by the call currently being evaluated — this method's only remaining job is the
+        once-per-threshold-per-period debounce and the actual send.
+
+        PAYLOAD SECRECY (non-negotiable, matching the DLP/secrets discipline elsewhere in this
+        codebase): only `key_prefix` (already a public, truncated, non-secret identifier shown
+        in the UI — see ApiKeyRecord/ApiKeyService, which only ever store a SHA-256 hash of the
+        real key) and `key_name` (operator-assigned label, not secret) leave this method. The
+        key's plaintext is never available past creation time (show-once by design) and its
+        hash is never put on any outbound surface, webhook payloads included — same rule
+        test_webhooks.py already enforces for the `blocked` event's exclusion of args_summary.
+        """
+        config = await self._load_config()
+        if config is None or "quota" not in config["events"]:
+            return
+
+        debounce_key = (key_prefix, period_start_iso)
+        # Self-review fix: the check (has this threshold already fired this period?) and the
+        # record (mark it fired) must be atomic across concurrent callers, or a burst of
+        # simultaneous requests all crossing 80% at once can all pass the check before any of
+        # them records it — firing the webhook N times instead of once. One lock held across
+        # both halves closes that window; see test_quotas.py's concurrent-burst regression test.
+        async with self._quota_lock:
+            already_fired = self._quota_fired.get(debounce_key, 0)
+            if already_fired >= threshold:
+                return
+            self._quota_fired[debounce_key] = threshold
+            # Self-review fix: unlike self._debounce (whose entries are popped once their
+            # window's debounced send completes — see _debounced_send), nothing was ever
+            # removing an entry from self._quota_fired. Every distinct (key_prefix,
+            # period_start) combination a quota-configured key ever crosses a threshold in
+            # accumulates one entry, forever, for the life of the process — an unbounded
+            # per-process memory leak on a long-running gateway (one entry per key per day for
+            # daily quotas, indefinitely). There's no natural "period ended" signal to hook a
+            # real eviction on without parsing period lengths this class doesn't otherwise need
+            # to know, so this is a simple bound instead: once the map exceeds a generous cap,
+            # drop the oldest half (insertion order, since dicts preserve it) — old periods are
+            # exactly the ones safe to forget, since their debounce guarantee no longer matters
+            # once the period itself is over.
+            if len(self._quota_fired) > _QUOTA_FIRED_MAX_ENTRIES:
+                stale_keys = list(self._quota_fired.keys())[: len(self._quota_fired) // 2]
+                for stale_key in stale_keys:
+                    self._quota_fired.pop(stale_key, None)
+
+        await self._send_if_under_cap(
+            config,
+            {
+                "event": "quota",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "server_slug": None,
+                "key_prefix": key_prefix,
+                "key_name": key_name,
+                "threshold_percent": threshold,
+                "period": period,
                 "count": 1,
             },
         )

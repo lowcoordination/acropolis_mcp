@@ -7,6 +7,7 @@ import { Dashboard } from './pages/Dashboard'
 import { Servers } from './pages/Servers'
 import { ServerDetail } from './pages/ServerDetail'
 import { Keys } from './pages/Keys'
+import { Usage } from './pages/Usage'
 import { Audit } from './pages/Audit'
 import { Settings } from './pages/Settings'
 import { Users } from './pages/Users'
@@ -40,6 +41,7 @@ function App() {
         <Route path="servers" element={<Servers />} />
         <Route path="servers/:slug" element={<ServerDetail />} />
         <Route path="keys" element={<Keys />} />
+        <Route path="usage" element={<Usage />} />
         <Route path="audit" element={<Audit />} />
         <Route path="settings" element={<Settings />} />
         {/* No client-side role gate on this route itself — Users renders an empty/error state

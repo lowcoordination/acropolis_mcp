@@ -32,12 +32,16 @@ class ApiKeyService:
     def __init__(self, repo: ApiKeyRepo):
         self._repo = repo
 
-    async def create(self, name: str, server_scopes: Optional[list[str]] = None) -> GeneratedKey:
+    async def create(
+        self, name: str, server_scopes: Optional[list[str]] = None,
+        quota_calls: Optional[int] = None, quota_period: Optional[str] = None,
+    ) -> GeneratedKey:
         plaintext = _generate_plaintext()
         key_hash = _hash_key(plaintext)
         display_prefix = plaintext[:DISPLAY_PREFIX_LEN]
         record = await self._repo.create(
-            name=name, key_hash=key_hash, key_prefix=display_prefix, server_scopes=server_scopes
+            name=name, key_hash=key_hash, key_prefix=display_prefix, server_scopes=server_scopes,
+            quota_calls=quota_calls, quota_period=quota_period,
         )
         return GeneratedKey(record=record, plaintext=plaintext)
 
@@ -79,6 +83,9 @@ class ApiKeyService:
 
     async def enable(self, key_id: int) -> None:
         await self._repo.set_enabled(key_id, True)
+
+    async def set_quota(self, key_id: int, quota_calls: Optional[int], quota_period: Optional[str]) -> None:
+        await self._repo.set_quota(key_id, quota_calls, quota_period)
 
     async def delete(self, key_id: int) -> None:
         await self._repo.delete(key_id)
