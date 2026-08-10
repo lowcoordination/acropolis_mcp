@@ -25,7 +25,7 @@ DEBOUNCE_WINDOW_SECONDS = 60.0
 CAP_WINDOW_SECONDS = 3600.0
 CAP_MAX_PER_WINDOW = 20
 
-VALID_EVENTS = ("blocked", "unhealthy", "drift", "quota")
+VALID_EVENTS = ("blocked", "unhealthy", "drift", "quota", "approval_pending")
 
 # Bound on WebhookDispatcher._quota_fired's size — see fire_quota_threshold's self-review-fix
 # comment. 10,000 distinct (key_prefix, period_start) entries is generously above what any
@@ -228,6 +228,36 @@ class WebhookDispatcher:
                 "event": "unhealthy",
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "server_slug": server_slug,
+                "count": 1,
+            },
+        )
+
+    async def notify_approval_pending(
+        self, *, proposal_id: int, target_type: str, target_id: str, proposer: str,
+    ) -> None:
+        """Enterprise #9: fires the `approval_pending` webhook event when a proposal is created
+        (called from archon/approvals.py). Edge semantics like notify_unhealthy — a proposal
+        creation happens at most once per proposal by construction, so there is nothing to
+        debounce (unlike BLOCKED/quota, which fire per matching request and need the window).
+
+        PAYLOAD SECRECY (non-negotiable, matching the DLP/secrets discipline elsewhere): the
+        payload carries the proposal id, its target, and the proposer's actor label — NOTHING
+        else. No diff contents, no policy payload, no YAML, no matched values (same reason
+        `blocked` events exclude args_summary and the DLP detector name is the only DLP field
+        that ever leaves). The id is the receiver's handle for pulling detail over the
+        authenticated API if it wants it."""
+        config = await self._load_config()
+        if config is None or "approval_pending" not in config["events"]:
+            return
+        await self._send_if_under_cap(
+            config,
+            {
+                "event": "approval_pending",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "proposal_id": proposal_id,
+                "target_type": target_type,
+                "target_id": target_id,
+                "proposer": proposer,
                 "count": 1,
             },
         )

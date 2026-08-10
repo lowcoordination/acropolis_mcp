@@ -111,3 +111,5 @@ of one per server.
 - [Webhook alerts](webhook-alerts.md) — get notified when a tool call is blocked or a server
   goes unhealthy, instead of watching the Audit page. Read this one before enabling it — it's
   the one feature in Acropolis that makes outbound requests to a URL you supply.
+- [Approval workflows](approvals.md) — four-eyes change control for policy/config changes.
+  Off by default; read the GitOps-vs-in-app decision table before enabling it.

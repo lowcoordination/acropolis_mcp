@@ -35,6 +35,8 @@ RECORDABLE_SERVER_FIELDS = frozenset({
 RECORDABLE_SETTINGS_KEYS = frozenset({
     "auth_mode", "aggregate_enabled", "default_ttl_ms", "audit_retention_days",
     "webhook_url", "webhook_enabled", "webhook_events",
+    # Enterprise #9: approval workflows — non-secret configuration like any other setting here.
+    "approvals_enabled", "approvals_ttl_days",
 })
 
 

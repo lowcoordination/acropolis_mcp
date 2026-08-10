@@ -16,6 +16,9 @@ export interface SettingsUpdateRequest {
   webhook_enabled?: boolean
   webhook_events?: string[]
   webhook_allow_private?: boolean
+  // Enterprise #9: approval workflows.
+  approvals_enabled?: boolean
+  approvals_ttl_days?: number
 }
 
 export const settingsApi = {

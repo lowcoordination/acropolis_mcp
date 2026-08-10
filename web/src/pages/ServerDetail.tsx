@@ -279,6 +279,7 @@ export function ServerDetail() {
   const [expandedTool, setExpandedTool] = useState<string | null>(null)
   const [testingTool, setTestingTool] = useState<string | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [saveNotice, setSaveNotice] = useState<string | null>(null)
   const [selectedPresetId, setSelectedPresetId] = useState('')
 
   useEffect(() => {
@@ -286,9 +287,28 @@ export function ServerDetail() {
   }, [policy])
 
   const savePolicy = useMutation({
-    mutationFn: (body: PolicyResponse) => serversApi.setPolicy(slug!, body),
-    onSuccess: () => {
+    // Enterprise #9: with approvals enabled, the server returns 202 + {proposal_id} instead of
+    // the applied policy — the response is a ProposalPendingResponse, not a PolicyResponse. The
+    // UI must not pretend the save happened; it tells the operator it was queued.
+    mutationFn: async (body: PolicyResponse) => {
+      const resp = await serversApi.setPolicy(slug!, body)
+      if ('proposal_id' in resp) {
+        return { queued: true, proposalId: (resp as unknown as { proposal_id: number }).proposal_id }
+      }
+      return { queued: false, proposalId: null }
+    },
+    onSuccess: (result) => {
       setSaveError(null)
+      if (result.queued) {
+        // Nothing changed server-side — leave the draft as-is (so the operator sees exactly
+        // what's pending) and point at the Approvals page.
+        setSaveNotice(
+          `Change queued for approval (proposal #${result.proposalId}). It will apply once a ` +
+            'second admin approves it — see Approvals.',
+        )
+        return
+      }
+      setSaveNotice(null)
       queryClient.invalidateQueries({ queryKey: ['servers', slug, 'policy'] })
       queryClient.invalidateQueries({ queryKey: ['servers', slug, 'tools'] })
     },
@@ -296,6 +316,7 @@ export function ServerDetail() {
       // Deliberately not auto-redirected to /login even on a 401 (see api/client.ts) — this
       // draft may be the only copy of unsaved edits, so surface the failure here instead of
       // navigating away and silently discarding it.
+      setSaveNotice(null)
       setSaveError(
         err instanceof ApiError && err.status === 401
           ? 'Your session expired — log in again, then Save policy to retry.'
@@ -463,6 +484,11 @@ export function ServerDetail() {
                 {saveError}
               </p>
             )}
+            {saveNotice && (
+              <p className="text-sm" style={{ color: 'var(--accent)' }}>
+                {saveNotice}
+              </p>
+            )}
             <div className="flex gap-2">
               <button
                 type="button"
@@ -496,6 +522,11 @@ export function ServerDetail() {
             {saveError && (
               <p className="text-sm" style={{ color: 'var(--danger)' }}>
                 {saveError}
+              </p>
+            )}
+            {saveNotice && (
+              <p className="text-sm" style={{ color: 'var(--accent)' }}>
+                {saveNotice}
               </p>
             )}
             <div className="flex gap-2">

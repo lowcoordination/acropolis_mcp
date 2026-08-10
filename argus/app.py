@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from archon.api import build_control_plane_router
+from archon.approvals import ApprovalService
 from archon.auth.apikeys import ApiKeyService
 from archon.oidc import AttemptStore
 from archon.secrets import build_secret_provider
@@ -32,6 +33,7 @@ from db.repo import (
     AuditRepo,
     ProjectMemberRepo,
     ProjectRepo,
+    ProposalRepo,
     ServerRepo,
     SettingsRepo,
     UsageRepo,
@@ -39,6 +41,7 @@ from db.repo import (
 )
 from stoa.gitops import ConfigSource
 from stoa.health import HealthPoller
+from stoa.proposals import ProposalExpiryJob
 from stoa.retention import AuditRetentionJob
 from stoa.webhooks import WebhookDispatcher
 
@@ -95,6 +98,10 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     # instance has at least the backfilled 'default' project).
     project_repo = ProjectRepo(db)
     project_member_repo = ProjectMemberRepo(db)
+    # Enterprise #9: ProposalRepo is always constructed and always wired into the router, the
+    # same "no disabled build" shape as usage_repo — the feature's off-by-default guarantee
+    # comes from the DB-backed approvals_enabled setting, not from omitting the repo.
+    proposal_repo = ProposalRepo(db)
     # Enterprise #11: usage_repo is always constructed (unlike secret_provider/tracing, there's
     # no "disabled" build for this one — quotas/usage query availability doesn't depend on an
     # env var) and always wired into Pipeline. The feature's own off-by-default guarantee comes
@@ -151,6 +158,20 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         audit_repo, settings_repo,
         check_interval_seconds=settings.audit_retention_check_interval_seconds,
     )
+    # Enterprise #9: approval-proposal TTL sweep — always constructed and always started (same
+    # always-on shape as ConfigSource): when approvals are disabled the proposals table is
+    # empty and run_once() is a cheap no-op, so no gating flag is needed.
+    proposal_expiry_job = ProposalExpiryJob(
+        ApprovalService(
+            proposal_repo=proposal_repo,
+            server_repo=server_repo,
+            settings_repo=settings_repo,
+            admin_event_repo=AdminEventRepo(db),
+            project_repo=project_repo,
+        ),
+        settings_repo,
+        check_interval_seconds=settings.audit_retention_check_interval_seconds,
+    )
     config_source = ConfigSource(server_repo, settings_repo, project_repo=project_repo)
     config_source.set_webhook_dispatcher(webhook_dispatcher)
 
@@ -190,6 +211,9 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
             health_poller.start()
         if settings.audit_retention_enabled:
             retention_job.start()
+        # Enterprise #9: the proposal TTL sweep is unconditional — see its construction comment
+        # for why (empty-table no-op when approvals are disabled).
+        proposal_expiry_job.start()
         # GitOps polling is opt-in via gitops_enabled setting
         await config_source.start()
         try:
@@ -197,6 +221,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         finally:
             await config_source.stop()
             await retention_job.stop()
+            await proposal_expiry_job.stop()
             await health_poller.stop()
             # Stop the dispatcher before audit — it unsubscribe()s from the SAME AuditLogger it
             # subscribed to in start(), and that logger must still be alive to accept the call.
@@ -240,6 +265,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.state.usage_repo = usage_repo
     app.state.project_repo = project_repo
     app.state.project_member_repo = project_member_repo
+    app.state.proposal_repo = proposal_repo
+    app.state.proposal_expiry_job = proposal_expiry_job
 
     oidc_attempts = AttemptStore()
     app.include_router(build_setup_router(settings_repo, rate_limiter, user_repo, http_client, oidc_attempts))
@@ -248,6 +275,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source, user_repo,
         secret_provider=secret_provider, tracing=tracing, usage_repo=usage_repo,
         project_repo=project_repo, project_member_repo=project_member_repo,
+        proposal_repo=proposal_repo,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo, config_source))

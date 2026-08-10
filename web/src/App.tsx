@@ -10,6 +10,7 @@ import { ServerDetail } from './pages/ServerDetail'
 import { Keys } from './pages/Keys'
 import { Usage } from './pages/Usage'
 import { Audit } from './pages/Audit'
+import { Proposals } from './pages/Proposals'
 import { Settings } from './pages/Settings'
 import { Users } from './pages/Users'
 import { Projects } from './pages/Projects'
@@ -54,6 +55,7 @@ function App() {
         <Route path="keys" element={<Keys />} />
         <Route path="usage" element={<Usage />} />
         <Route path="audit" element={<Audit />} />
+        <Route path="approvals" element={<Proposals />} />
         <Route path="settings" element={<Settings />} />
         {/* No client-side role gate on this route itself — Users renders an empty/error state
             for a non-admin (GET /users 403s), and every mutation in it 403s server-side

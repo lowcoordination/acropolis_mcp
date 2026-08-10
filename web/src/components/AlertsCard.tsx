@@ -5,6 +5,8 @@ import { ApiError } from '../api/client'
 const EVENT_OPTIONS: { key: string; label: string }[] = [
   { key: 'blocked', label: 'A tool call is blocked' },
   { key: 'unhealthy', label: 'A server goes unhealthy' },
+  // Enterprise #9: a policy/config change is queued awaiting a second admin's approval.
+  { key: 'approval_pending', label: 'A change is queued for approval' },
 ]
 
 export function AlertsCard() {

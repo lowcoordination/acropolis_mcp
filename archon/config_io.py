@@ -27,7 +27,10 @@ EXPORT_VERSION = 1
 # `session_secret` and `admin_password_hash`, and dumping the table minus a hardcoded blocklist
 # would silently start exporting any FUTURE secret someone adds. Enumerating what may leave is
 # the only shape that stays safe as the schema grows.
-EXPORTABLE_SETTINGS = ("auth_mode", "aggregate_enabled", "default_ttl_ms", "audit_retention_days")
+EXPORTABLE_SETTINGS = (
+    "auth_mode", "aggregate_enabled", "default_ttl_ms", "audit_retention_days",
+    "approvals_enabled", "approvals_ttl_days",
+)
 
 _NO_API_KEYS_NOTE = (
     "API keys are deliberately NOT exported: they are stored only as hashes (show-once by "

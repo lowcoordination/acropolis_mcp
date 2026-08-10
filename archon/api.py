@@ -6,11 +6,11 @@ import io
 import json
 import secrets
 import uuid
-from typing import Optional
+from typing import Optional, Union
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from archon.admin_auth import Principal, require_admin
 from archon.admin_audit import (
@@ -20,6 +20,15 @@ from archon.admin_audit import (
     record_config_import,
     record_policy_change,
     record_secret_reference_change,
+)
+from archon.approvals import (
+    SETTING_ENABLED as APPROVALS_SETTING_ENABLED,
+    SETTING_TTL_DAYS as APPROVALS_SETTING_TTL_DAYS,
+    ApprovalService,
+    ProposalConflictError,
+    ProposalError,
+    ProposalResolvedError,
+    ProposalStaleError,
 )
 from archon.auth.apikeys import ApiKeyService
 from archon.config_io import export_config, plan_import
@@ -48,6 +57,11 @@ from archon.schemas import (
     KeyResponse,
     PolicyResponse,
     PolicyUpdateRequest,
+    ProposalApproveRequest,
+    ProposalDetailResponse,
+    ProposalPendingResponse,
+    ProposalRejectRequest,
+    ProposalResponse,
     ProjectCreateRequest,
     ProjectMemberResponse,
     ProjectMemberUpsertRequest,
@@ -88,6 +102,8 @@ from db.repo import (
     ProjectNotFoundError,
     ProjectRepo,
     ProjectSlugConflictError,
+    ProposalNotFoundError,
+    ProposalRepo,
     ServerNotFoundError,
     ServerRepo,
     SettingsRepo,
@@ -111,6 +127,11 @@ _SETTINGS_DEFAULTS = {
     "gitops_enabled": "false",
     "gitops_poll_seconds": "300",
     "gitops_allow_private": "false",
+    # Enterprise #9: approval workflows — OFF by default. Disabled = byte-identical to today;
+    # the proposals table stays empty and every write path below behaves exactly as it did
+    # before this feature existed.
+    "approvals_enabled": "false",
+    "approvals_ttl_days": "7",
 }
 
 
@@ -186,6 +207,7 @@ def build_control_plane_router(
     usage_repo: Optional["UsageRepo"] = None,
     project_repo: Optional[ProjectRepo] = None,
     project_member_repo: Optional[ProjectMemberRepo] = None,
+    proposal_repo: Optional[ProposalRepo] = None,
 ) -> APIRouter:
     # enterprise #2 (RBAC): the router used to carry ONE blanket
     # dependencies=[Depends(require_admin)] gate — authenticated meant authorized for
@@ -205,6 +227,23 @@ def build_control_plane_router(
     # shadow it for the rest of the closure, breaking any call to the stdlib module made
     # anywhere inside build_control_plane_router after this point.
     secret_backend = secret_provider or LocalSecretProvider()
+
+    # Enterprise #9: approval workflows. Built whenever a ProposalRepo is wired (the real app
+    # always wires one; tests that don't care about approvals leave it None and get byte-
+    # identical behaviour, matching how project_repo/usage_repo were made optional). The
+    # feature's own off/on switch is the DB-backed approvals_enabled setting, read live by
+    # ApprovalService.enabled() on every write — not construction here.
+    approvals = None
+    if proposal_repo is not None and settings_repo is not None:
+        approvals = ApprovalService(
+            proposal_repo=proposal_repo,
+            server_repo=server_repo,
+            settings_repo=settings_repo,
+            admin_event_repo=admin_event_repo,
+            project_repo=project_repo,
+            tools_cache=tools_cache,
+            webhook_dispatcher=webhook_dispatcher,
+        )
 
     # F21 fix (review 2026-08-04): /api/v1/health used to live HERE, behind require_admin —
     # but both the Dockerfile HEALTHCHECK and the k8s liveness/readiness probes target it
@@ -589,7 +628,7 @@ def build_control_plane_router(
         policy = await server_repo.get_policy(server.id)
         return PolicyResponse(**policy.model_dump())
 
-    @router.put("/servers/{slug}/policy", response_model=PolicyResponse)
+    @router.put("/servers/{slug}/policy", response_model=Union[PolicyResponse, ProposalPendingResponse])
     async def set_policy(
         slug: str, body: PolicyUpdateRequest, request: Request,
         principal: Principal = Depends(
@@ -600,6 +639,28 @@ def build_control_plane_router(
             server = await server_repo.get(slug)
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
+
+        # Enterprise #9: when approval workflows are enabled, a policy write is QUEUED, not
+        # applied — PUT returns 202 + the proposal id and nothing about the server changes
+        # (policy unchanged on re-read, tools cache untouched, no policy.update event). The
+        # four-eyes gate applies to EVERYONE, including admins ("four-eyes that admins can
+        # bypass is theater" — plan design decision 4); the approver gate is
+        # require_role("admin") on POST /proposals/{id}/approve.
+        if approvals is not None and await approvals.enabled():
+            proposal = await approvals.propose_policy_change(
+                server_slug=slug,
+                requested=body.model_dump(),
+                proposer=principal,
+                client_ip=request.client.host if request.client else None,
+            )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "proposal_id": proposal.id,
+                    "state": proposal.state,
+                    "message": "change queued for approval",
+                },
+            )
 
         # Fetch before state for audit diff
         before_policy = await server_repo.get_policy(server.id)
@@ -820,6 +881,8 @@ def build_control_plane_router(
                 webhook_allow_private=values.get("webhook_allow_private") == "true",
                 has_webhook_secret=bool(values.get("webhook_secret")),
                 secret_provider=provider_tier_name(secret_backend),
+                approvals_enabled=values["approvals_enabled"] == "true",
+                approvals_ttl_days=int(values["approvals_ttl_days"]),
             )
 
         @router.put("/settings", response_model=SettingsResponse)
@@ -863,6 +926,20 @@ def build_control_plane_router(
                         detail=f"webhook_events contains unsupported value(s): {bad}",
                     )
                 updates["webhook_events"] = ",".join(body.webhook_events)
+            # Enterprise #9: approvals on/off + TTL. TTL must be a positive integer (same
+            # fail-fast validation the retention window gets); <= 0 at expiry time means "keep
+            # forever" — the >0 check here just stops a mistyped 0/-1 from being silently
+            # accepted as a "keep forever" someone didn't mean to set.
+            if body.approvals_enabled is not None:
+                updates[APPROVALS_SETTING_ENABLED] = "true" if body.approvals_enabled else "false"
+            if body.approvals_ttl_days is not None:
+                if body.approvals_ttl_days <= 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="approvals_ttl_days must be a positive integer (0 means keep "
+                               "proposals forever, set it explicitly via the settings table)",
+                    )
+                updates[APPROVALS_SETTING_TTL_DAYS] = str(body.approvals_ttl_days)
             await settings_repo.set_many(updates)
 
             # Fetch after state for audit diff
@@ -917,7 +994,7 @@ def build_control_plane_router(
                 content=result.to_yaml(), media_type="application/x-yaml", headers=headers
             )
 
-        @router.post("/config/import", response_model=ConfigImportResponse)
+        @router.post("/config/import", response_model=Union[ConfigImportResponse, ProposalPendingResponse])
         async def import_configuration(
             body: ConfigImportRequest, request: Request,
             principal: Principal = Depends(require_role("admin")),
@@ -928,6 +1005,25 @@ def build_control_plane_router(
             # Enterprise #4: stays global-admin-only, UNCHANGED gate — a project admin does not
             # get config-import authority merely by being a project admin (03-multi-tenancy.md
             # design decision 8). Only the YAML shape changes (project_slug per server).
+            # Enterprise #9: config import is a policy-shaped mutation by blast radius (the
+            # same reasoning that made it admin-only) — with approvals on, an apply=true import
+            # is QUEUED as a proposal and returns 202 instead of applying; the proposal's
+            # approve path recomputes the plan against current state (dry-run stays as-is: a
+            # preview changes nothing).
+            if body.apply and approvals is not None and await approvals.enabled():
+                proposal = await approvals.propose_config_import(
+                    yaml_text=body.yaml, proposer=principal,
+                    client_ip=request.client.host if request.client else None,
+                )
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "proposal_id": proposal.id,
+                        "state": proposal.state,
+                        "message": "change queued for approval",
+                    },
+                )
+
             plan = await plan_import(
                 server_repo, settings_repo, body.yaml, apply=body.apply, project_repo=project_repo,
             )
@@ -958,6 +1054,104 @@ def build_control_plane_router(
                 warnings=plan.warnings,
                 errors=plan.errors,
             )
+
+    if approvals is not None:
+        # Enterprise #9: the approval-workflow surface. Everything here is global-admin-gated
+        # (require_role("admin"), same gate as config import): proposals carry the full policy
+        # intent / import YAML, which can include plaintext upstream credentials when an
+        # operator imports a file exported with include_credentials=true — a viewer or
+        # poweruser must never be able to list those. The four-eyes *proposer* gate stays where
+        # it always was (the write routes above queue proposals from anyone who could have made
+        # the write directly); the *approver* gate is here.
+
+        def _proposal_to_response(proposal) -> ProposalResponse:
+            return ProposalResponse(
+                id=proposal.id,
+                target_type=proposal.target_type,
+                target_id=proposal.target_id,
+                proposer=proposal.proposer,
+                state=proposal.state,
+                created_at=proposal.created_at,
+                resolved_at=proposal.resolved_at,
+                resolver=proposal.resolver,
+                resolution_reason=proposal.resolution_reason,
+            )
+
+        @router.get(
+            "/proposals", response_model=list[ProposalResponse],
+            dependencies=[Depends(require_role("admin"))],
+        )
+        async def list_proposals(state: Optional[str] = None):
+            if state is not None and state not in ("pending", "approved", "rejected", "expired"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid state {state!r}; must be one of: pending, approved, "
+                           "rejected, expired",
+                )
+            return [_proposal_to_response(p) for p in await proposal_repo.list(state=state)]
+
+        @router.get(
+            "/proposals/{proposal_id}", response_model=ProposalDetailResponse,
+            dependencies=[Depends(require_role("admin"))],
+        )
+        async def get_proposal(proposal_id: int):
+            try:
+                proposal = await proposal_repo.get(proposal_id)
+            except ProposalNotFoundError:
+                raise HTTPException(status_code=404, detail="proposal not found")
+            preview, stale = await approvals.preview(proposal)
+            base = _proposal_to_response(proposal).model_dump()
+            return ProposalDetailResponse(**base, preview=preview, stale=stale)
+
+        @router.post(
+            "/proposals/{proposal_id}/approve", response_model=ProposalResponse,
+        )
+        async def approve_proposal(
+            proposal_id: int, body: ProposalApproveRequest, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
+            try:
+                resolved = await approvals.approve(
+                    proposal_id=proposal_id, principal=principal,
+                    reason=body.reason,
+                    client_ip=request.client.host if request.client else None,
+                )
+            except ProposalNotFoundError:
+                raise HTTPException(status_code=404, detail="proposal not found")
+            except ProposalStaleError as e:
+                # 409 Conflict: the target changed since the proposal was created — the change
+                # must be re-proposed/re-reviewed, never blindly applied (the TOCTOU guard).
+                raise HTTPException(status_code=409, detail=str(e))
+            except ProposalResolvedError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            except ProposalConflictError as e:
+                # 403 with a DISTINCT message from a plain role failure, per the plan's
+                # verification item 2 ("self-approval rejected (403, distinct message)").
+                raise HTTPException(status_code=403, detail=str(e))
+            except ProposalError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            return _proposal_to_response(resolved)
+
+        @router.post(
+            "/proposals/{proposal_id}/reject", response_model=ProposalResponse,
+        )
+        async def reject_proposal(
+            proposal_id: int, body: ProposalRejectRequest, request: Request,
+            principal: Principal = Depends(require_role("admin")),
+        ):
+            try:
+                resolved = await approvals.reject(
+                    proposal_id=proposal_id, principal=principal,
+                    reason=body.reason,
+                    client_ip=request.client.host if request.client else None,
+                )
+            except ProposalNotFoundError:
+                raise HTTPException(status_code=404, detail="proposal not found")
+            except ProposalResolvedError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            except ProposalError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            return _proposal_to_response(resolved)
 
     if webhook_dispatcher is not None:
         @router.post(

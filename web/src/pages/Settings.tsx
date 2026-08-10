@@ -13,12 +13,16 @@ export function Settings() {
   const [authMode, setAuthMode] = useState<'open' | 'keyed'>('keyed')
   const [aggregateEnabled, setAggregateEnabled] = useState(true)
   const [retentionDays, setRetentionDays] = useState(30)
+  const [approvalsEnabled, setApprovalsEnabled] = useState(false)
+  const [approvalsTtlDays, setApprovalsTtlDays] = useState(7)
 
   useEffect(() => {
     if (settings) {
       setAuthMode(settings.auth_mode)
       setAggregateEnabled(settings.aggregate_enabled)
       setRetentionDays(settings.audit_retention_days)
+      setApprovalsEnabled(settings.approvals_enabled)
+      setApprovalsTtlDays(settings.approvals_ttl_days)
     }
   }, [settings])
 
@@ -61,13 +65,17 @@ export function Settings() {
   const isDirty =
     authMode !== settings.auth_mode ||
     aggregateEnabled !== settings.aggregate_enabled ||
-    retentionDays !== settings.audit_retention_days
+    retentionDays !== settings.audit_retention_days ||
+    approvalsEnabled !== settings.approvals_enabled ||
+    approvalsTtlDays !== settings.approvals_ttl_days
 
   function handleSave() {
     update.mutate({
       auth_mode: authMode,
       aggregate_enabled: aggregateEnabled,
       audit_retention_days: retentionDays,
+      approvals_enabled: approvalsEnabled,
+      approvals_ttl_days: approvalsTtlDays,
     })
   }
 
@@ -128,6 +136,37 @@ export function Settings() {
             onChange={(e) => setRetentionDays(Number(e.target.value))}
           />
         </div>
+
+        <div className="border-t pt-4" style={{ borderColor: 'var(--border)' }}>
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={approvalsEnabled}
+              onChange={(e) => setApprovalsEnabled(e.target.checked)}
+            />
+            Require approval for policy and config changes
+          </label>
+          <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+            Four-eyes change control: writes are queued as proposals until a second admin approves.
+            Off by default — GitOps deployments should keep it off and use pull-request review.
+          </p>
+        </div>
+
+        {approvalsEnabled && (
+          <div>
+            <label className="block text-sm font-medium mb-1" htmlFor="approvals-ttl">
+              Proposal TTL (days)
+            </label>
+            <input
+              id="approvals-ttl"
+              type="number"
+              min={1}
+              className="rounded-md px-3 py-2 text-sm w-32"
+              value={approvalsTtlDays}
+              onChange={(e) => setApprovalsTtlDays(Number(e.target.value))}
+            />
+          </div>
+        )}
 
         {isDirty && (
           <button

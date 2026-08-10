@@ -153,6 +153,9 @@ export interface SettingsResponse {
   // shape of value the server form should expect: a literal under 'local'/'encrypted', a
   // vault://... reference under 'openbao').
   secret_provider: 'local' | 'encrypted' | 'openbao' | string
+  // Enterprise #9: approval workflows — off by default.
+  approvals_enabled: boolean
+  approvals_ttl_days: number
 }
 
 export interface WebhookTestResponse {
@@ -345,4 +348,35 @@ export interface ProjectMemberResponse {
 export interface ProjectMemberUpsertRequest {
   user_id: number
   role: ProjectRole
+}
+
+// Enterprise #9 (issue #10): approval workflows. A proposal is a queued policy-shaped change
+// awaiting a SECOND admin's approval. The list/detail views only ever carry identity + state;
+// the detail view additionally carries the RECOMPUTED preview (archon/approvals.py's
+// preview()) so an approver never sees a stored stale diff.
+export type ProposalTargetType = 'server_policy' | 'config_import'
+export type ProposalState = 'pending' | 'approved' | 'rejected' | 'expired'
+
+export interface ProposalResponse {
+  id: number
+  target_type: ProposalTargetType
+  target_id: string
+  proposer: string
+  state: ProposalState
+  created_at: string
+  resolved_at: string | null
+  resolver: string | null
+  resolution_reason: string | null
+}
+
+export interface ProposalDetailResponse extends ProposalResponse {
+  preview: string[]
+  stale: boolean
+}
+
+// The body a queued write returns (202) instead of its normal 200 shape when approvals are on.
+export interface ProposalPendingResponse {
+  proposal_id: number
+  state: ProposalState
+  message: string
 }

@@ -35,26 +35,31 @@ def _run_server() -> None:
     settings = Settings()
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
 
-    # §26 (review 2026-08-04): this builds the app (including db.connect(), which constructs
-    # asyncio.Lock/Queue instances) inside a THROWAWAY asyncio.run() loop, then hands the
-    # resulting app to uvicorn.run(), which creates a SEPARATE, second event loop to actually
-    # serve requests — a real cross-loop hazard in principle. Considered fixing via uvicorn's
-    # `factory=True`, but confirmed by reading uvicorn's Config.load() (self.loaded_app =
-    # self.loaded_app(), a plain synchronous call) that it does NOT support an async factory —
-    # it would call this and get back an unawaited coroutine object instead of an app, a worse
-    # bug than the one being fixed. Left as-is: Python 3.10+'s asyncio.Lock/Queue defer loop
-    # binding to first real use rather than construction, and nothing in the first loop here
-    # ever uses one of these primitives, so the cross-loop construction is currently safe in
-    # practice, just not guaranteed by the primitives' public contract. A real fix needs
-    # uvicorn's `Server` class driven directly inside one loop rather than `uvicorn.run()`,
-    # which is a bigger change than this cleanup pass warrants.
-    async def _make_app():
+    # §26 (review 2026-08-04) + 2026-08-10 follow-up: the original implementation built the app
+    # (including db.connect(), which constructs asyncio.Lock/Queue and — post-cutover, the
+    # asyncpg pools) inside a THROWAWAY asyncio.run() loop, then handed the app to
+    # uvicorn.run(), which creates a SEPARATE, second event loop to actually serve requests. The
+    # 2026-08-04 review accepted this as "safe in practice, not guaranteed by the primitives'
+    # public contract" — Python 3.12's asyncio deferred loop binding enough that the pools never
+    # noticed. Python 3.14's stricter asyncio makes it a hard failure: the pools' first
+    # connection attempt on uvicorn's loop raises RuntimeError('Event loop is closed') and the
+    # gateway never comes up. The review's own prescription for the real fix is used here:
+    # drive uvicorn's `Server` class directly inside ONE loop that also owns the db + app, so
+    # the pools' loop is the serving loop by construction. Server.serve() runs the lifespan
+    # (start/stop of the background jobs) and blocks until shutdown; db.close() then runs on
+    # the same loop that owns its pools.
+    async def _run() -> None:
         db = _make_db(settings)
         await db.connect()
-        return create_app(settings, db)
+        try:
+            app = create_app(settings, db)
+            config = uvicorn.Config(app, host=settings.host, port=settings.port)
+            server = uvicorn.Server(config)
+            await server.serve()
+        finally:
+            await db.close()
 
-    app = asyncio.run(_make_app())
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    asyncio.run(_run())
 
 
 async def _run_import(path: str, dry_run: bool) -> None:
