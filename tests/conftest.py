@@ -44,7 +44,7 @@ import pytest
 import db.database as db_database
 
 
-def _run_sync(coro_factory):
+def _run_sync(coro_factory, timeout: float = 120.0):
     """Run an async helper from SYNCHRONOUS fixture code.
 
     pytest-asyncio runs in `asyncio_mode = "auto"` (see pyproject.toml), so by the time a fixture
@@ -54,9 +54,14 @@ def _run_sync(coro_factory):
     does anything, and must not join the test's loop (a connection opened on it would outlive the
     fixture). Running each on its own thread with its own fresh loop keeps them completely
     independent of whatever loop the test is using.
+
+    The explicit timeout matters: `ThreadPoolExecutor.__exit__` joins its worker, so a helper that
+    blocks forever (e.g. a DROP DATABASE waiting behind a connection that hasn't finished closing)
+    would hang the whole suite in fixture teardown with no traceback pointing at the cause. Better
+    to raise and let the caller decide — cleanup callers swallow it, provisioning callers don't.
     """
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(coro_factory())).result()
+        return pool.submit(lambda: asyncio.run(coro_factory())).result(timeout=timeout)
 
 _CONTAINER_NAME = "acropolis-pytest-pg"
 _PG_IMAGE = "postgres:17-alpine"
@@ -130,7 +135,10 @@ def postgres_admin_dsn():
     external = os.environ.get("ACROPOLIS_TEST_DATABASE_URL")
     if external:
         _wait_ready(external)
-        yield external
+        try:
+            yield external
+        finally:
+            _drop_leftover_databases(external)
         return
 
     if not _docker_available():
@@ -145,6 +153,7 @@ def postgres_admin_dsn():
         _wait_ready(dsn)
         yield dsn
     finally:
+        _drop_leftover_databases(dsn)
         subprocess.run(["docker", "rm", "-f", _CONTAINER_NAME], capture_output=True)
 
 
@@ -166,21 +175,55 @@ def _create_database(admin_dsn: str) -> str:
 
 
 def _drop_database(admin_dsn: str, dsn: str) -> None:
+    """Drop one test database, best-effort and time-bounded.
+
+    `WITH (FORCE)` terminates any connection the test left open, so a pool that wasn't explicitly
+    closed can't wedge the drop. Even so this is wrapped in a short timeout and a bare except:
+    per-test cleanup must NEVER be able to fail or hang a test that already passed. Anything that
+    survives lands in _LEAKED and gets one more attempt at session end (see
+    _drop_leftover_databases), and failing even that only leaves a stray database in a
+    throwaway test server.
+
+    Why this is defensive rather than paranoid: a test's app pools are closed by the test's own
+    fixture teardown, which runs on the test's event loop, while this runs on a different thread
+    with its own loop. Those two are not ordered with respect to each other, so this call can
+    legitimately arrive while connections are still going away.
+    """
     name = dsn.rpartition("/")[2]
 
     async def _go() -> None:
-        conn = await asyncpg.connect(_admin_dsn(admin_dsn))
+        conn = await asyncpg.connect(_admin_dsn(admin_dsn), timeout=10)
         try:
-            # FORCE terminates any connection a test left open (a pool that wasn't closed),
-            # so a leaked connection can't wedge the drop and leak databases across a run.
             await conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         finally:
             await conn.close()
 
     try:
-        _run_sync(_go)
-    except Exception:  # noqa: BLE001 — cleanup must never fail a passing test
-        pass
+        _run_sync(_go, timeout=20.0)
+    except Exception:  # noqa: BLE001 — cleanup must never fail or hang a passing test
+        _LEAKED.append(dsn)
+
+
+# Databases whose per-test drop didn't succeed in time; retried once at session end.
+_LEAKED: list[str] = []
+
+
+def _drop_leftover_databases(admin_dsn: str) -> None:
+    for dsn in list(_LEAKED):
+        name = dsn.rpartition("/")[2]
+
+        async def _go(n=name) -> None:
+            conn = await asyncpg.connect(_admin_dsn(admin_dsn), timeout=10)
+            try:
+                await conn.execute(f'DROP DATABASE IF EXISTS "{n}" WITH (FORCE)')
+            finally:
+                await conn.close()
+
+        try:
+            _run_sync(_go, timeout=20.0)
+        except Exception:  # noqa: BLE001
+            pass
+    _LEAKED.clear()
 
 
 @pytest.fixture(autouse=True)

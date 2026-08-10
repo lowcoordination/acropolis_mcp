@@ -267,11 +267,10 @@ async def test_unknown_role_denied_everywhere(rbac_app, role_clients):
     # binary doesn't fully understand, or any other path that could produce a bad row.
     user_repo: UserRepo = app.state.user_repo
     user = await user_repo.get_by_username("garbage-role-user")
-    async with app.state.db.gateway_write_lock:
-        await app.state.db.gateway.execute(
-            "UPDATE users SET role = 'super-admin-mode' WHERE id = ?", (user.id,)
-        )
-        await app.state.db.gateway.commit()
+    # Postgres cutover: gateway_write_lock is gone (see db/repo.py's conversion-audit header) —
+    # this hand-edit now goes through the writer pool directly.
+    async with app.state.db.writer.acquire() as conn:
+        await conn.execute("UPDATE users SET role = 'super-admin-mode' WHERE id = $1", user.id)
 
     from archon.sessions import DEFAULT_SESSION_VERSION, SESSION_COOKIE_NAME, create_session_token
 

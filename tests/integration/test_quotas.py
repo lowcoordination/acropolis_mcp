@@ -202,8 +202,15 @@ class TestRollupsMatchAuditRows:
         assert total == len(audit_rows) == 5
 
     async def test_rollups_survive_audit_db_retention_pruning(self, quota_app):
-        """The entire point of putting usage_rollups in gateway.db instead of audit.db: prune
-        audit.db via the real retention job and assert the rollup total is UNTOUCHED."""
+        """The entire point of keeping usage_rollups in a SEPARATE TABLE from audit_events:
+        prune the traffic log via the real retention job and assert the rollup total is
+        UNTOUCHED.
+
+        Postgres cutover: pre-cutover this was phrased as "gateway.db instead of audit.db" and
+        reached into `db.audit`, a dedicated connection to a second SQLite file. Both are now
+        tables in one database, so the guarantee under test is unchanged but its mechanism is
+        table identity rather than file identity — AuditRetentionJob only ever DELETEs from
+        audit_events."""
         app, db, admin_client, transport, slug = quota_app
         created = await _mint_key(admin_client, "survivor", quota_calls=1000, quota_period="month")
         key = created["plaintext"]
@@ -219,11 +226,11 @@ class TestRollupsMatchAuditRows:
         assert before_prune == 4
 
         # Force every audit row to look 100 days old, then run the real retention job with a
-        # 30-day window — this actually deletes rows from audit.db (not a mock), same pattern
+        # 30-day window — this actually deletes audit_events rows (not a mock), same pattern
         # test_retention.py itself uses.
         old_ts = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
-        await db.audit.execute("UPDATE audit_events SET ts = ?", (old_ts,))
-        await db.audit.commit()
+        async with db.writer.acquire() as conn:
+            await conn.execute("UPDATE audit_events SET ts = $1", old_ts)
 
         settings_repo = SettingsRepo(db)
         await settings_repo.set("audit_retention_days", "30")
@@ -374,9 +381,10 @@ class TestThresholdWebhook:
         record = await api_key_repo.get_by_id(created["id"])
         # Reach into the raw hash the way the real DB stores it, to prove it never appears
         # either — not just the plaintext.
-        cur = await db.gateway_read.execute("SELECT key_hash FROM api_keys WHERE id = ?", (created["id"],))
-        row = await cur.fetchone()
-        key_hash = row["key_hash"] if row else None
+        async with db.reader.acquire() as conn:
+            key_hash = await conn.fetchval(
+                "SELECT key_hash FROM api_keys WHERE id = $1", created["id"]
+            )
 
         assert len(receiver.requests) >= 1
         for req in receiver.requests:

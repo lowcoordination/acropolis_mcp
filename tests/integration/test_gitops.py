@@ -42,9 +42,31 @@ async def _setup_admin(client):
     return resp.cookies.get("acropolis_session")
 
 
+def _cli_env(pg_dsn: str) -> dict:
+    """Environment for the `argus` CLI subprocesses below.
+
+    Postgres cutover (enterprise #7): these used to pass `ARGUS_DATA_DIR` and let the CLI open a
+    SQLite file under it. Postgres is now a hard requirement with no fallback, so the CLI needs a
+    real connection URL or it exits non-zero by design (DatabaseNotConfiguredError). Each test
+    gets its own empty database via the `pg_dsn` fixture, preserving the per-test isolation the
+    old per-tmp_path data directory provided.
+
+    (Note the old variable name was already stale — Settings uses the ACROPOLIS_ prefix, so
+    ARGUS_DATA_DIR had no effect and these subprocesses were silently sharing ./data. Worth
+    recording, since it means these tests are now MORE isolated than they were before.)
+
+    PATH is kept minimal, as before, but must include the venv's bin so `python -m argus`
+    resolves its dependencies.
+    """
+    return {
+        "ACROPOLIS_DATABASE_URL": pg_dsn,
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    }
+
+
 # CLI tests use subprocess to test the actual exit codes
 
-def test_cli_check_exit_code_0_when_in_sync(tmp_path):
+def test_cli_check_exit_code_0_when_in_sync(tmp_path, pg_dsn):
     """check exits 0 when live config matches the file."""
     # Create a minimal valid config (empty settings = use defaults)
     config_file = tmp_path / "config.yaml"
@@ -58,7 +80,7 @@ servers: []
     result = subprocess.run(
         [sys.executable, "-m", "argus", "check", str(config_file)],
         cwd=PROJECT_ROOT,
-        env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
+        env=_cli_env(pg_dsn),
         capture_output=True,
         text=True,
     )
@@ -66,14 +88,14 @@ servers: []
     assert result.returncode == 0, f"expected 0 (in sync), got {result.returncode}: {result.stderr}"
 
 
-def test_cli_check_exit_code_1_when_drift(tmp_path):
+def test_cli_check_exit_code_1_when_drift(tmp_path, pg_dsn):
     """check exits 1 when live config differs from the file."""
     # First, export the current config
     data_dir = tmp_path / "data"
     export_result = subprocess.run(
         [sys.executable, "-m", "argus", "export", "--stable"],
         cwd=PROJECT_ROOT,
-        env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
+        env=_cli_env(pg_dsn),
         capture_output=True,
         text=True,
     )
@@ -91,7 +113,7 @@ servers: []
     result = subprocess.run(
         [sys.executable, "-m", "argus", "check", str(config_file)],
         cwd=PROJECT_ROOT,
-        env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
+        env=_cli_env(pg_dsn),
         capture_output=True,
         text=True,
     )
@@ -99,7 +121,7 @@ servers: []
     assert "drift" in result.stderr.lower() or "auth_mode" in result.stderr
 
 
-def test_cli_check_exit_code_2_when_invalid_file(tmp_path):
+def test_cli_check_exit_code_2_when_invalid_file(tmp_path, pg_dsn):
     """check exits 2 when the file is malformed."""
     config_file = tmp_path / "config.yaml"
     config_file.write_text("not valid yaml: [{")
@@ -108,7 +130,7 @@ def test_cli_check_exit_code_2_when_invalid_file(tmp_path):
     result = subprocess.run(
         [sys.executable, "-m", "argus", "check", str(config_file)],
         cwd=PROJECT_ROOT,
-        env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
+        env=_cli_env(pg_dsn),
         capture_output=True,
         text=True,
     )
@@ -116,7 +138,7 @@ def test_cli_check_exit_code_2_when_invalid_file(tmp_path):
     assert "error" in result.stderr.lower()
 
 
-def test_cli_export_stable_produces_identical_output(tmp_path):
+def test_cli_export_stable_produces_identical_output(tmp_path, pg_dsn):
     """--stable export omits exported_at, producing byte-identical output for unchanged config."""
     data_dir = tmp_path / "data"
 
@@ -124,14 +146,14 @@ def test_cli_export_stable_produces_identical_output(tmp_path):
     result1 = subprocess.run(
         [sys.executable, "-m", "argus", "export", "--stable"],
         cwd=PROJECT_ROOT,
-        env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
+        env=_cli_env(pg_dsn),
         capture_output=True,
         text=True,
     )
     result2 = subprocess.run(
         [sys.executable, "-m", "argus", "export", "--stable"],
         cwd=PROJECT_ROOT,
-        env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
+        env=_cli_env(pg_dsn),
         capture_output=True,
         text=True,
     )
@@ -142,14 +164,14 @@ def test_cli_export_stable_produces_identical_output(tmp_path):
     assert "exported_at" not in result1.stdout, "--stable should omit exported_at"
 
 
-def test_cli_export_without_stable_includes_exported_at(tmp_path):
+def test_cli_export_without_stable_includes_exported_at(tmp_path, pg_dsn):
     """Default export includes exported_at timestamp."""
     data_dir = tmp_path / "data"
 
     result = subprocess.run(
         [sys.executable, "-m", "argus", "export"],
         cwd=PROJECT_ROOT,
-        env={"ARGUS_DATA_DIR": str(data_dir), "PATH": "/usr/bin:/bin"},
+        env=_cli_env(pg_dsn),
         capture_output=True,
         text=True,
     )

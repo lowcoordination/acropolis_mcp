@@ -396,58 +396,63 @@ class TestF14AggregateToolsListConcurrent:
 
 class TestF25SchemaVersionGuard:
     """Confirms Database.connect() refuses to start (rather than silently limping along) when
-    the on-disk gateway.db has a migration version applied that this binary's own migration
-    list doesn't know about — the rollback-after-upgrade scenario the review flagged."""
+    the database has a migration version applied that this binary's own migration list doesn't
+    know about — the rollback-after-upgrade scenario the review flagged."""
 
-    async def test_connect_raises_when_db_has_a_newer_migration_than_binary_knows(self, tmp_path):
-        db = Database(tmp_path)
+    async def test_connect_raises_when_db_has_a_newer_migration_than_binary_knows(self, pg_dsn):
+        db = Database(pg_dsn)
         await db.connect()
         # Simulate "a newer binary already ran here": stamp a migration version this binary's
-        # _GATEWAY_MIGRATIONS list has never heard of, then reconnect fresh.
-        await db.gateway.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-            (9999, "2026-01-01T00:00:00+00:00"),
-        )
-        await db.gateway.commit()
+        # MIGRATIONS list has never heard of, then reconnect fresh.
+        async with db.writer.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2)",
+                9999, "2026-01-01T00:00:00+00:00",
+            )
         await db.close()
 
-        fresh = Database(tmp_path)
+        fresh = Database(pg_dsn)
         with pytest.raises(SchemaTooNewError, match="9999"):
             await fresh.connect()
+        await fresh.close()
 
-    async def test_connect_succeeds_when_db_is_at_or_behind_known_migrations(self, tmp_path):
-        """Regression guard: a totally fresh data dir, or one already fully migrated by THIS
+    async def test_connect_succeeds_when_db_is_at_or_behind_known_migrations(self, pg_dsn):
+        """Regression guard: a totally fresh database, or one already fully migrated by THIS
         binary, must still start normally — the guard should only fire on genuinely unknown
         (higher) versions, never on the normal case."""
-        db = Database(tmp_path)
+        db = Database(pg_dsn)
         await db.connect()
         await db.close()
 
         # Reconnecting against the same, fully-migrated-by-us database must not raise.
-        again = Database(tmp_path)
+        again = Database(pg_dsn)
         await again.connect()
         await again.close()
 
-    async def test_audit_db_applies_0004_and_still_guards_on_unknown_version(self, tmp_path):
-        """audit.db has its own independent migration list (_AUDIT_MIGRATIONS) and its own
-        schema_migrations table — this is the audit.db analogue of the two tests above, added
-        when 0004_audit_api_key_index.sql was appended for Item B's api_key_id filter."""
-        db = Database(tmp_path)
+    async def test_audit_migrations_apply_in_the_unified_sequence(self, pg_dsn):
+        """Pre-cutover this test existed because audit.db had its OWN migration list and its own
+        schema_migrations table, so the version guard needed proving twice. Post-cutover there is
+        one database, one migration sequence, and one schema_migrations table — so the guard is
+        already covered above and the remaining thing worth asserting is that the audit-side
+        migrations (which used to live in that separate series) actually applied to the shared
+        database: idx_audit_api_key comes from 0003_audit_api_key_index.sql, and the origin
+        column from 0004_audit_origin.sql."""
+        db = Database(pg_dsn)
         await db.connect()
-        cur = await db.audit.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_audit_api_key'"
-        )
-        assert await cur.fetchone() is not None
-        await db.audit.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-            (9999, "2026-01-01T00:00:00+00:00"),
-        )
-        await db.audit.commit()
-        await db.close()
+        try:
+            async with db.reader.acquire() as conn:
+                index_exists = await conn.fetchval(
+                    "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_audit_api_key'"
+                )
+                assert index_exists, "0003_audit_api_key_index.sql did not apply"
 
-        fresh = Database(tmp_path)
-        with pytest.raises(SchemaTooNewError, match="9999"):
-            await fresh.connect()
+                origin_exists = await conn.fetchval(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'audit_events' AND column_name = 'origin'"
+                )
+                assert origin_exists, "0004_audit_origin.sql did not apply"
+        finally:
+            await db.close()
 
 
 # ---------------------------------------------------------------------------
