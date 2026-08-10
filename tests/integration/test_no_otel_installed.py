@@ -15,9 +15,20 @@ Session-scoped venv build (~5-10s, one-time per test run) — this is a "measure
 test in spirit (see tests/bench/bench_dlp.py's similar "not a fast unit test" framing), so it's
 acceptable for it to be slower than the rest of the suite; it is still a real, always-run pytest
 test, not a separately-invoked script, so CI catches a regression here automatically.
+
+INCIDENT (review 2026-08-10): a `pip install` inside a fresh venv is a real PyPI round-trip,
+which is fast and cache-warm locally but not on a CI runner rebuilding from scratch mid-suite.
+Under degraded runner network conditions, `subprocess.run(timeout=...)`'s own timeout didn't
+fire cleanly here — a build-backend grandchild pip spawns can outlive the direct child's kill
+and keep the output pipe open, so `subprocess.run` blocks in `communicate()` past the stated
+deadline. See `_run_with_hard_timeout` below (process-group kill via `start_new_session=True`
++ `os.killpg`) for the fix, and `.github/workflows/ci.yml`'s `Run pytest` step timeout for the
+outer backstop in case a future failure mode isn't one this specific fix covers.
 """
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -27,6 +38,45 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _run_with_hard_timeout(args: list[str], *, timeout: float, **kwargs) -> subprocess.CompletedProcess:
+    """subprocess.run(..., timeout=...) wrapper that actually enforces the deadline (incident,
+    review 2026-08-10 — see CI's own `Run pytest` step timeout comment in
+    .github/workflows/ci.yml for the failure this fixes).
+
+    Plain `subprocess.run(timeout=N)` only kills the DIRECT child on timeout. `pip install`
+    routinely spawns grandchildren (a build backend subprocess for a wheel/sdist build, a
+    resolver worker) that are NOT in that kill's blast radius — if one of those is still alive
+    and holding the child's stdout/stderr pipe open (e.g. blocked on its own I/O under degraded
+    runner network conditions), `Popen.kill()` on the direct child returns immediately but the
+    subsequent `communicate()`/`wait()` used internally by `subprocess.run` can still block
+    forever reading from that pipe. This is exactly what happened in CI: the 180s timeout never
+    fired, and with no job-level timeout either, the run sat for 12+ minutes with zero output
+    before being manually cancelled.
+
+    Fix: `start_new_session=True` puts the child in its own process GROUP, and on timeout we
+    kill the whole group (`os.killpg`) rather than just the one process `subprocess.run` would
+    reach — every descendant dies together, so nothing is left holding the pipe open.
+
+    Takes the same `capture_output=True, text=True` call shape as subprocess.run for a
+    drop-in swap at each call site, but Popen itself doesn't accept `capture_output` (it's a
+    subprocess.run-only convenience that expands to stdout=PIPE, stderr=PIPE) — translated here
+    so callers don't need to know that."""
+    if kwargs.pop("capture_output", False):
+        kwargs.setdefault("stdout", subprocess.PIPE)
+        kwargs.setdefault("stderr", subprocess.PIPE)
+    proc = subprocess.Popen(args, start_new_session=True, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already exited between the timeout firing and us getting here
+        stdout, stderr = proc.communicate()  # drain what's left; process group is dead now
+        raise subprocess.TimeoutExpired(args, timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
 
 
 @pytest.fixture(scope="session")
@@ -39,7 +89,7 @@ def no_otel_venv(tmp_path_factory):
     venv.EnvBuilder(with_pip=True, symlinks=True).create(venv_dir)
     python = venv_dir / "bin" / "python"
 
-    result = subprocess.run(
+    result = _run_with_hard_timeout(
         [str(python), "-m", "pip", "install", "-q", "-e", f"{REPO_ROOT}[dev]"],
         capture_output=True, text=True, timeout=180,
     )
@@ -50,12 +100,10 @@ def no_otel_venv(tmp_path_factory):
 
 
 def _run_script(python: Path, script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    import os
-
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
-    return subprocess.run(
+    return _run_with_hard_timeout(
         [str(python), "-c", textwrap.dedent(script)],
         capture_output=True, text=True, timeout=60, env=full_env, cwd=str(REPO_ROOT),
     )
