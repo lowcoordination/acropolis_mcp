@@ -197,12 +197,12 @@ async def test_audit_export_csv_defuses_formula_injection(tmp_path: Path):
     await db.connect()
     app = create_app(settings, db)
     audit_repo = AuditRepo(db)
-    await audit_repo._conn.execute(
-        "INSERT INTO audit_events (ts, server_slug, decision, reason, args_summary) "
-        "VALUES (?, 'x', 'BLOCKED', ?, ?)",
-        ("2026-01-01T00:00:00Z", "=cmd(calc)", "@SUM(1,1)"),
-    )
-    await audit_repo._conn.commit()
+    # Postgres cutover: seeds go through the repo's public insert_many() rather than a private
+    # connection (repos acquire from a pool per call now and hold none).
+    await audit_repo.insert_many([{
+        "ts": "2026-01-01T00:00:00Z", "server_slug": "x", "decision": "BLOCKED",
+        "reason": "=cmd(calc)", "args_summary": "@SUM(1,1)",
+    }])
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):

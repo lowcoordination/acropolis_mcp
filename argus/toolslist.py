@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import aiosqlite
+import asyncpg
 
 from argus.bridge import BridgeError, ProtocolBridge
 from argus.policy import tool_is_visible
@@ -24,23 +24,19 @@ class ToolsCache:
         self._db = db
         self._bridge = bridge
 
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
+    def _read(self):
+        assert self._db.reader is not None, "Database.connect() not awaited"
+        return self._db.reader.acquire()
 
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
+    def _write(self):
+        assert self._db.writer is not None, "Database.connect() not awaited"
+        return self._db.writer.acquire()
 
-    async def _cached_rows(self, server_id: int) -> list[aiosqlite.Row]:
-        cur = await self._read.execute(
-            "SELECT * FROM tools_cache WHERE server_id = ? ORDER BY tool_name", (server_id,)
-        )
-        return list(await cur.fetchall())
+    async def _cached_rows(self, server_id: int) -> list[asyncpg.Record]:
+        async with self._read() as conn:
+            return list(await conn.fetch(
+                "SELECT * FROM tools_cache WHERE server_id = $1 ORDER BY tool_name", server_id
+            ))
 
     def _is_fresh(self, fetched_at: str, ttl_ms: Optional[int]) -> bool:
         ttl = ttl_ms if ttl_ms is not None else DEFAULT_TTL_MS
@@ -88,43 +84,52 @@ class ToolsCache:
     async def _store(
         self, server_id: int, tools: list[dict], ttl_ms: Optional[int], cache_scope: Optional[str]
     ) -> None:
-        # F7: DELETE-then-N-INSERT, same shape as ServerRepo.set_policy — serialize through the
-        # write lock + explicit transaction so a concurrent reader (a different connection) never
-        # observes the gap. The INSERT-OR-REPLACE + malformed-tool-name hardening this method
-        # still needs is tracked as Plan 3 scope (03-reliability-and-ops.md §26); this only
-        # closes the same-shape isolation gap F7 targets.
-        async with self._db.gateway_write_lock:
-            await self._write.execute("BEGIN IMMEDIATE")
-            try:
-                await self._write.execute("DELETE FROM tools_cache WHERE server_id = ?", (server_id,))
+        # [TRANSACTION] replaces gateway_write_lock (Postgres cutover, enterprise #7).
+        #
+        # DELETE-then-N-INSERT, the same shape as ServerRepo.set_policy: a reader catching the
+        # gap would see this server as having NO tools at all. Under SQLite that required the
+        # write lock plus a dedicated writer connection plus WAL; a plain transaction gives it
+        # here, and gives it across processes rather than only within one.
+        #
+        # ON CONFLICT DO UPDATE additionally makes the insert half idempotent, so an upstream
+        # advertising the same tool name twice in one tools/list response no longer aborts the
+        # whole refresh on a primary-key violation — previously that would roll the transaction
+        # back and leave the cache empty. (The broader malformed-tool-name hardening is still
+        # tracked as Plan 3 scope, 03-reliability-and-ops.md §26.)
+        async with self._write() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM tools_cache WHERE server_id = $1", server_id)
                 now = utcnow()
-                for tool in tools:
-                    await self._write.execute(
-                        """INSERT INTO tools_cache (server_id, tool_name, definition_json, ttl_ms, cache_scope, fetched_at)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (server_id, tool["name"], json.dumps(tool), ttl_ms, cache_scope, now),
+                if tools:
+                    await conn.executemany(
+                        """INSERT INTO tools_cache
+                           (server_id, tool_name, definition_json, ttl_ms, cache_scope, fetched_at)
+                           VALUES ($1, $2, $3, $4, $5, $6)
+                           ON CONFLICT (server_id, tool_name) DO UPDATE SET
+                               definition_json = excluded.definition_json,
+                               ttl_ms = excluded.ttl_ms,
+                               cache_scope = excluded.cache_scope,
+                               fetched_at = excluded.fetched_at""",
+                        [
+                            (server_id, tool["name"], json.dumps(tool), ttl_ms, cache_scope, now)
+                            for tool in tools
+                        ],
                     )
-                await self._write.commit()
-            except BaseException:
-                await self._write.rollback()
-                raise
 
     async def invalidate(self, server_id: int) -> None:
         """Called on policy write — a stale filtered list would otherwise show a tool that
         was just denied, or hide one that was just allowed."""
-        async with self._db.gateway_write_lock:
-            await self._write.execute("DELETE FROM tools_cache WHERE server_id = ?", (server_id,))
-            await self._write.commit()
+        # [SINGLE-STATEMENT] replaces gateway_write_lock.
+        async with self._write() as conn:
+            await conn.execute("DELETE FROM tools_cache WHERE server_id = $1", server_id)
 
     async def fetched_at(self, server_id: int) -> Optional[str]:
         """Roadmap #6: the most recent fetched_at across this server's cached tools, so the UI
         can show "updated <relative time>" — or None if nothing has been fetched yet."""
-        cur = await self._read.execute(
-            "SELECT MAX(fetched_at) AS fetched_at FROM tools_cache WHERE server_id = ?",
-            (server_id,),
-        )
-        row = await cur.fetchone()
-        return row["fetched_at"] if row else None
+        async with self._read() as conn:
+            return await conn.fetchval(
+                "SELECT MAX(fetched_at) FROM tools_cache WHERE server_id = $1", server_id
+            )
 
     async def get_filtered_tools(
         self, server_id: int, upstream_url: str, policy: ServerPolicy,

@@ -91,7 +91,7 @@ async def two_projects(mt_app):
 # 1. Migration backfill
 # ---------------------------------------------------------------------------------------------
 
-async def test_migration_backfills_default_project_and_admin_memberships(tmp_path: Path):
+async def test_migration_backfills_default_project_and_admin_memberships(pg_dsn):
     """Populated-DB migration proof, the real thing: build a PRE-migration gateway.db by hand
     (seed `users` rows the way 0007_users.sql would have left them, from BEFORE 0011_projects.sql
     ever ran), then apply migrations via Database.connect() and confirm every one of those
@@ -102,49 +102,48 @@ async def test_migration_backfills_default_project_and_admin_memberships(tmp_pat
     'pre-existing' at migration time — see test_setup_wizard_admin_has_no_membership_but_still_administers
     below for why that path correctly produces NO membership row and relies on the global-admin
     superset instead)."""
-    import aiosqlite
+    import asyncpg
 
-    from db.database import _apply_migrations, utcnow
+    from db.database import _apply_migrations, _init_connection, utcnow
 
-    data_dir = tmp_path / "premigration"
-    data_dir.mkdir()
-    gateway_path = data_dir / "gateway.db"
-
-    # Build the pre-0011 schema by hand: apply every migration EXCEPT 0011_projects.sql, then
-    # seed three users directly (bypassing the app entirely) to simulate an instance that has
-    # been running through several prior enterprise releases already.
+    # Postgres cutover: built against a real Postgres database via asyncpg rather than a
+    # hand-made gateway.db file, and the migration under test is renumbered 0011 -> 0010. The
+    # scenario and the guarantee are unchanged: apply every migration EXCEPT the projects one,
+    # seed users/servers directly (bypassing the app entirely) to simulate an instance that has
+    # been running through several prior enterprise releases, then let the real Database class
+    # apply the projects migration and assert the backfill.
     pre_migrations = [
-        "0001_init.sql", "0002_tighten_slug_check.sql", "0003_add_upstream_credential.sql",
-        "0006_admin_events.sql", "0007_users.sql", "0008_gateway_dlp_config.sql",
-        "0009_server_health_reason.sql", "0010_usage_rollups.sql",
+        "0001_init.sql", "0002_upstream_credential.sql", "0003_audit_api_key_index.sql",
+        "0004_audit_origin.sql", "0005_admin_events.sql", "0006_users.sql",
+        "0007_dlp.sql", "0008_server_health_reason.sql", "0009_usage_rollups.sql",
     ]
-    conn = await aiosqlite.connect(gateway_path)
-    await conn.execute("PRAGMA foreign_keys=ON")
-    await _apply_migrations(conn, pre_migrations, "gateway.db")
+    conn = await asyncpg.connect(pg_dsn)
+    await _init_connection(conn)
+    await _apply_migrations(conn, pre_migrations)
 
     now = utcnow()
     for username, role in (("admin", "admin"), ("viewer-user", "viewer"), ("operator-user", "operator")):
         await conn.execute(
             """INSERT INTO users (username, password_hash, role, auth_source, enabled, created_at)
-               VALUES (?, 'x', ?, 'local', 1, ?)""",
-            (username, role, now),
+               VALUES ($1, 'x', $2, 'local', TRUE, $3)""",
+            username, role, now,
         )
-    cur = await conn.execute(
+    server_id = await conn.fetchval(
         "INSERT INTO servers (slug, name, upstream_url, enabled, in_aggregate, created_at, updated_at) "
-        "VALUES ('pre-existing', 'Pre', 'http://localhost:1/mcp', 1, 1, ?, ?)", (now, now),
+        "VALUES ('pre-existing', 'Pre', 'http://localhost:1/mcp', TRUE, TRUE, $1, $2) RETURNING id",
+        now, now,
     )
     await conn.execute(
-        "INSERT INTO server_policies (server_id, mode, updated_at) VALUES (?, 'passthrough', ?)",
-        (cur.lastrowid, now),
+        "INSERT INTO server_policies (server_id, mode, updated_at) VALUES ($1, 'passthrough', $2)",
+        server_id, now,
     )
-    await conn.commit()
     await conn.close()
 
-    # Now open it through the REAL Database class, which applies 0011_projects.sql (the only
+    # Now open it through the REAL Database class, which applies 0010_projects.sql (the only
     # migration this pre-seeded DB hasn't seen yet) — this is the actual migration under test.
     from db.database import Database
 
-    db = Database(data_dir)
+    db = Database(pg_dsn)
     await db.connect()
     try:
         project_repo = ProjectRepo(db)
@@ -473,12 +472,13 @@ async def test_garbage_project_role_denied_everywhere(mt_app, two_projects):
     assert resp.status_code == 200
 
     # Hand-edit directly in the DB to a nonsense value, bypassing the API's own role validation.
-    async with app.state.db.gateway_write_lock:
-        await app.state.db.gateway.execute(
-            "UPDATE project_members SET role = 'super-project-mode' WHERE user_id = ? AND project_id = ?",
-            (user.id, alpha.id),
+    # Postgres cutover: gateway_write_lock is gone — hand-edit through the writer pool directly.
+    async with app.state.db.writer.acquire() as conn:
+        await conn.execute(
+            "UPDATE project_members SET role = 'super-project-mode' "
+            "WHERE user_id = $1 AND project_id = $2",
+            user.id, alpha.id,
         )
-        await app.state.db.gateway.commit()
 
     await admin_client.post(
         "/api/v1/servers",
