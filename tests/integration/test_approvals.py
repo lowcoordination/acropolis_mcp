@@ -159,26 +159,134 @@ async def test_enabled_policy_put_queues_and_applies_nothing(app_client):
     assert events[0]["target_id"] == str(body["proposal_id"])
 
 
-async def test_proposals_routes_are_admin_only(app_client):
+async def test_proposal_approve_reject_require_project_admin(app_client):
+    """Remediation (review 2026-08-10): approve/reject require PROJECT admin, not global
+    admin — a global-viewer/operator who IS project-poweruser (the default membership
+    _create_user grants — see its own comment) can still see the proposal (list + detail,
+    viewer-level), but cannot approve or reject it (needs project-admin). Superseded
+    test_proposals_routes_are_admin_only's "everything 403s for a non-admin" claim, which
+    predates project-scoped proposals (0012_proposals_project_scope.sql)."""
     app, transport, admin = app_client
     await _create_server(admin)
     await _enable_approvals(admin)
-    await admin.put("/api/v1/servers/test-server/policy", json=_policy_body())
+    proposal_id = (await admin.put(
+        "/api/v1/servers/test-server/policy", json=_policy_body()
+    )).json()["proposal_id"]
 
     await _create_user(app, admin, "op-user", "operator")
     operator = await _login(transport, "op-user", "password-12345")
 
-    # /proposals list, detail, approve, reject are ALL admin-gated (they expose full policy
-    # intent / import YAML, which can contain plaintext credentials).
+    # List and detail are viewer-level — op-user is project-poweruser in 'default' (where
+    # test-server lives, via _create_user's own default-project grant), which qualifies.
+    list_resp = await operator.get("/api/v1/proposals")
+    assert list_resp.status_code == 200
+    assert any(p["id"] == proposal_id for p in list_resp.json())
+
+    detail_resp = await operator.get(f"/api/v1/proposals/{proposal_id}")
+    assert detail_resp.status_code == 200
+
+    # Approve/reject need project-ADMIN — poweruser is insufficient.
     for method, path in [
-        ("GET", "/api/v1/proposals"),
-        ("GET", "/api/v1/proposals/1"),
-        ("POST", "/api/v1/proposals/1/approve"),
-        ("POST", "/api/v1/proposals/1/reject"),
+        ("POST", f"/api/v1/proposals/{proposal_id}/approve"),
+        ("POST", f"/api/v1/proposals/{proposal_id}/reject"),
     ]:
         resp = await operator.request(method, path, json={})
         assert resp.status_code == 403, f"{method} {path} -> {resp.status_code}"
     await operator.aclose()
+
+
+async def test_proposal_project_isolation(app_client):
+    """A project-A admin cannot see or act on a project-B proposal, even though they're a real
+    admin — just not in project B. Proves the disclosure half of the finding is fixed (list
+    filters by membership, detail/approve/reject 403 for a non-member) without relying on the
+    global-admin superset masking the gap, the way single-project fixtures did before."""
+    app, transport, admin = app_client
+    project_repo = ProjectRepo(app.state.db)
+    member_repo = ProjectMemberRepo(app.state.db)
+    await project_repo.create(slug="project-b", name="Project B")
+
+    await _create_server(admin, slug="server-a")  # lands in 'default'
+    await admin.post("/api/v1/servers", json={
+        "slug": "server-b", "name": "Server B", "upstream_url": "http://localhost:8000/mcp",
+        "project_slug": "project-b",
+    })
+    await _enable_approvals(admin)
+
+    proposal_a = (await admin.put(
+        "/api/v1/servers/server-a/policy", json=_policy_body()
+    )).json()["proposal_id"]
+    proposal_b = (await admin.put(
+        "/api/v1/servers/server-b/policy", json=_policy_body()
+    )).json()["proposal_id"]
+
+    # user-a: project-admin in 'default' only, no membership in project-b.
+    create_resp = await admin.post(
+        "/api/v1/users", json={"username": "user-a", "password": "password-12345", "role": "viewer"}
+    )
+    default_project = await project_repo.get("default")
+    await member_repo.upsert(
+        user_id=create_resp.json()["id"], project_id=default_project.id, role="admin",
+    )
+    user_a = await _login(transport, "user-a", "password-12345")
+
+    # Sees project-a's proposal in the list, not project-b's.
+    list_resp = await user_a.get("/api/v1/proposals")
+    assert list_resp.status_code == 200
+    seen_ids = {p["id"] for p in list_resp.json()}
+    assert proposal_a in seen_ids
+    assert proposal_b not in seen_ids
+
+    # Can approve project-a's own proposal — the deadlock fix: project-admin, global-viewer,
+    # no global role bump needed.
+    approve_a = await user_a.post(f"/api/v1/proposals/{proposal_a}/approve", json={})
+    assert approve_a.status_code == 200, approve_a.text
+
+    # Cannot see or act on project-b's proposal.
+    detail_b = await user_a.get(f"/api/v1/proposals/{proposal_b}")
+    assert detail_b.status_code == 403
+    approve_b = await user_a.post(f"/api/v1/proposals/{proposal_b}/approve", json={})
+    assert approve_b.status_code == 403
+    reject_b = await user_a.post(f"/api/v1/proposals/{proposal_b}/reject", json={})
+    assert reject_b.status_code == 403
+    await user_a.aclose()
+
+
+async def test_config_import_proposal_requires_global_admin_even_for_project_admin_everywhere(app_client):
+    """A config_import proposal's project_id is NULL by design (it can touch servers across
+    every project in one file) — proves the None-branch in require_proposal_project_role
+    requires GLOBAL admin explicitly, not a silent permissive fallthrough for a user who
+    happens to be project-admin in every project they're a member of."""
+    app, transport, admin = app_client
+    await _enable_approvals(admin)
+
+    yaml_text = (
+        "version: 1\nservers:\n  - slug: from-import\n    name: From Import\n"
+        "    upstream_url: http://localhost:9000/mcp\n"
+    )
+    import_resp = await admin.post(
+        "/api/v1/config/import", json={"yaml": yaml_text, "apply": True}
+    )
+    assert import_resp.status_code == 202, import_resp.text
+    proposal_id = import_resp.json()["proposal_id"]
+
+    project_repo = ProjectRepo(app.state.db)
+    member_repo = ProjectMemberRepo(app.state.db)
+    create_resp = await admin.post(
+        "/api/v1/users", json={"username": "user-a", "password": "password-12345", "role": "viewer"}
+    )
+    default_project = await project_repo.get("default")
+    await member_repo.upsert(
+        user_id=create_resp.json()["id"], project_id=default_project.id, role="admin",
+    )
+    user_a = await _login(transport, "user-a", "password-12345")
+
+    # Project-admin in the only project they're a member of — still not global admin, so the
+    # config_import proposal (project_id IS NULL) must stay out of reach.
+    detail = await user_a.get(f"/api/v1/proposals/{proposal_id}")
+    assert detail.status_code == 403
+    approve = await user_a.post(f"/api/v1/proposals/{proposal_id}/approve", json={})
+    assert approve.status_code == 403
+    await user_a.aclose()
 
 
 async def test_proposals_state_filter_validates(app_client):

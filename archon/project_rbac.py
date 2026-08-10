@@ -142,6 +142,78 @@ async def _project_id_from_key_id(request: Request, key_id_param: str) -> int:
     return key.project_id
 
 
+async def _proposal_from_path_param(request: Request, param_name: str):
+    """Loads the ProposalRecord named by the route's path param, 404ing if it doesn't exist —
+    same not-found convention as the other resolvers. Returns the full record (not just an id)
+    because `require_proposal_project_role` needs BOTH `proposal.project_id` (may legitimately
+    be None — see below) and the record itself, and re-fetching it a second time in the route
+    handler would be wasted work on every request."""
+    from db.repo import ProposalNotFoundError
+
+    raw = request.path_params.get(param_name)
+    if raw is None:
+        raise HTTPException(status_code=500, detail=f"route missing path param {param_name!r}")
+    try:
+        proposal_id = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=404, detail="proposal not found")
+    proposal_repo = request.app.state.proposal_repo
+    try:
+        return await proposal_repo.get(proposal_id)
+    except ProposalNotFoundError:
+        raise HTTPException(status_code=404, detail="proposal not found")
+
+
+def require_proposal_project_role(minimum: str, *, proposal_id_param: str = "proposal_id"):
+    """Project-scoped gate for the /proposals* routes (remediation, review 2026-08-10 — see
+    0012_proposals_project_scope.sql's header for the finding this fixes).
+
+    Deliberately NOT built on top of `require_project_role` above: every other resolver in this
+    module always produces a real project_id or 404s — the project is a property of a resource
+    that unconditionally belongs to exactly one project. A proposal is different. A
+    'server_policy' proposal's project_id is real (the target server's project); a
+    'config_import' proposal's project_id is NULL by design (config import can span every
+    project in one file — see archon/approvals.py's propose_config_import). That NULL case is
+    not a missing-data problem to paper over; it must force GLOBAL admin, explicitly, never
+    silently fall through to "no project = no access" (which `resolve_project_role` would
+    otherwise do for a bare project_id of None, since it has no membership row to look up) and
+    never fall through to some permissive default either. Hence a dedicated dependency instead
+    of another `project_id_param`/`server_slug_param`/`key_id_param` variant on the shared one.
+    """
+    if minimum not in PROJECT_ROLE_RANK:
+        raise ValueError(f"require_proposal_project_role: unknown minimum project role {minimum!r}")
+    minimum_rank = PROJECT_ROLE_RANK[minimum]
+
+    async def _dep(
+        request: Request,
+        principal: Principal = Depends(require_admin),
+    ) -> Principal:
+        proposal = await _proposal_from_path_param(request, proposal_id_param)
+        if proposal.project_id is None:
+            # config_import proposal (or a server_policy proposal whose target server has since
+            # been deleted — see the migration's backfill comment): instance-wide, global-admin
+            # only. Explicit branch, not a fallthrough — resolve_project_role has no notion of
+            # "no project" other than "no access", which would be the WRONG failure mode here
+            # (a global admin must still be able to act on this proposal).
+            if principal.role != "admin":
+                raise HTTPException(status_code=403, detail="insufficient role")
+            request.state.project_id = None
+            return principal
+
+        project_member_repo = request.app.state.project_member_repo
+        role = await resolve_project_role(
+            principal=principal, project_id=proposal.project_id,
+            project_member_repo=project_member_repo,
+        )
+        rank = PROJECT_ROLE_RANK.get(role) if role is not None else None
+        if rank is None or rank < minimum_rank:
+            raise HTTPException(status_code=403, detail="insufficient project role")
+        request.state.project_id = proposal.project_id
+        return principal
+
+    return _dep
+
+
 def require_project_role(
     minimum: str, *, project_id_param: Optional[str] = "project_id",
     server_slug_param: Optional[str] = None, key_id_param: Optional[str] = None,

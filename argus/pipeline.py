@@ -252,7 +252,17 @@ class Pipeline:
         # `server` is the SAME record _resolve_server already fetched in handle() above — reused
         # here rather than re-querying by slug, since this method now runs strictly after that
         # resolution on every real call path.
-        if record.project_id != server.project_id:
+        #
+        # Hardening (remediation, review 2026-08-10): explicit `is None` check rather than
+        # relying on `!=` alone. In Python `None != None` is False, so a bare
+        # `record.project_id != server.project_id` would treat a project-less KEY and a
+        # project-less SERVER as matching — currently unreachable (0010_projects.sql backfills
+        # every existing row to 'default', and both ApiKeyRepo.create/ServerRepo.create resolve
+        # an explicit project_id at write time — see that migration's header), but this is the
+        # one project-boundary check in the codebase that didn't fail closed on NULL the way
+        # archon/project_rbac.py's resolvers all deliberately do. Made explicit so it holds even
+        # if that invariant is ever violated by a future code path, not just by luck today.
+        if record.project_id is None or record.project_id != server.project_id:
             raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
         return record.id
 

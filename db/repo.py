@@ -1631,6 +1631,11 @@ class ProposalRecord(BaseModel):
     resolver_user_id: Optional[int] = None
     resolver: Optional[str] = None
     resolution_reason: Optional[str] = None
+    # 0012_proposals_project_scope.sql (remediation, review 2026-08-10): populated for
+    # 'server_policy' proposals (the target server's project), NULL for 'config_import'
+    # proposals (instance-wide by nature — a config import can touch every project in one
+    # file, so it stays global-admin-gated, not project-gated). See that migration's header.
+    project_id: Optional[int] = None
 
     def parse_payload(self) -> dict:
         import json
@@ -1652,6 +1657,7 @@ def _row_to_proposal(row: asyncpg.Record) -> ProposalRecord:
         resolver_user_id=row["resolver_user_id"],
         resolver=row["resolver"],
         resolution_reason=row["resolution_reason"],
+        project_id=row["project_id"],
     )
 
 
@@ -1676,17 +1682,26 @@ class ProposalRepo(_PoolAccess):
         payload: str,
         proposer_user_id: Optional[int],
         proposer: str,
+        project_id: Optional[int] = None,
     ) -> ProposalRecord:
-        """Insert one pending proposal. `payload` must already be a JSON string."""
+        """Insert one pending proposal. `payload` must already be a JSON string.
+
+        `project_id` (0012_proposals_project_scope.sql, remediation 2026-08-10): the caller
+        (ApprovalService) is responsible for resolving this — None for a 'config_import'
+        proposal (instance-wide, by design), the target server's project_id for a
+        'server_policy' proposal. This repo just stores whatever it's given; it has no opinion
+        on the target_type/project_id relationship, same as it has no opinion on any other
+        payload shape."""
         # [SINGLE-STATEMENT] replaces gateway_write_lock. One INSERT; RETURNING id replaces
         # lastrowid exactly as AdminEventRepo.insert does.
         async with self._write() as conn:
             row = await conn.fetchrow(
                 """INSERT INTO proposals
-                   (target_type, target_id, payload, proposer_user_id, proposer, created_at)
-                   VALUES ($1, $2, $3, $4, $5, $6)
+                   (target_type, target_id, payload, proposer_user_id, proposer, created_at,
+                    project_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
                    RETURNING *""",
-                target_type, target_id, payload, proposer_user_id, proposer, utcnow(),
+                target_type, target_id, payload, proposer_user_id, proposer, utcnow(), project_id,
             )
         return _row_to_proposal(row)
 
@@ -1698,19 +1713,34 @@ class ProposalRepo(_PoolAccess):
         return _row_to_proposal(row)
 
     async def list(
-        self, *, state: Optional[str] = None, limit: int = 200
+        self, *, state: Optional[str] = None, project_id: Optional[int] = None, limit: int = 200
     ) -> list[ProposalRecord]:
-        """List proposals, newest first. `state` filters to a single state (None = all)."""
+        """List proposals, newest first. `state` filters to a single state (None = all).
+
+        `project_id` (remediation, review 2026-08-10): filters to one project's proposals —
+        used by GET /proposals when the caller is a project admin, not a global admin, mirroring
+        GET /keys's own project_id query-param branch. None means "no project filter" (the
+        global-admin default), NOT "only proposals with no project" — a caller who wants only
+        the instance-wide config_import proposals has no query-param spelling for that today,
+        since nothing has needed it yet."""
+        clauses: list[str] = []
+        params: list = []
+
+        def _p(value) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
+        if state is not None:
+            clauses.append(f"state = {_p(state)}")
+        if project_id is not None:
+            clauses.append(f"project_id = {_p(project_id)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_ph = _p(limit)
         async with self._read() as conn:
-            if state is not None:
-                rows = await conn.fetch(
-                    "SELECT * FROM proposals WHERE state = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
-                    state, limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT * FROM proposals ORDER BY created_at DESC, id DESC LIMIT $1", limit
-                )
+            rows = await conn.fetch(
+                f"SELECT * FROM proposals {where} ORDER BY created_at DESC, id DESC LIMIT {limit_ph}",
+                *params,
+            )
         return [_row_to_proposal(r) for r in rows]
 
     async def resolve(
