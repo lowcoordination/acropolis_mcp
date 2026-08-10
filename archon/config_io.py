@@ -19,7 +19,7 @@ from archon.schemas import _validate_upstream_url
 from archon.secrets import is_reference
 from db.database import utcnow
 from db.models import ServerPolicy
-from db.repo import ServerNotFoundError, ServerRepo, SettingsRepo
+from db.repo import ProjectNotFoundError, ProjectRepo, ServerNotFoundError, ServerRepo, SettingsRepo
 
 EXPORT_VERSION = 1
 
@@ -101,6 +101,7 @@ async def export_config(
     server_repo: ServerRepo,
     settings_repo: SettingsRepo,
     include_credentials: bool = False,
+    project_repo: Optional[ProjectRepo] = None,
 ) -> ExportResult:
     """Build the versioned export envelope.
 
@@ -116,10 +117,21 @@ async def export_config(
     argument for the whole secret-backends item per the plan: it's what makes committed
     policy-as-code (enterprise #6/#7) viable with real credentials rather than a deliberately
     incomplete file.
+
+    Enterprise #4 (multi-tenancy, issue #5): `project_repo`, optional so every pre-feature call
+    site (and test) that constructs this without one keeps working — carries each server's
+    `project_slug` in the export so a re-import can preserve project assignment (see
+    `plan_import`'s project_slug handling below). Slug, not id: ids aren't stable across
+    instances (e.g. exporting from one Acropolis and importing into another), slugs are the
+    portable identity GitOps/config-io already uses everywhere else.
     """
     result = ExportResult(data={})
     servers_out: list[dict[str, Any]] = []
     servers_with_credentials: list[str] = []
+
+    project_slugs_by_id: dict[int, str] = {}
+    if project_repo is not None:
+        project_slugs_by_id = {p.id: p.slug for p in await project_repo.list()}
 
     for server in await server_repo.list():
         policy = await server_repo.get_policy(server.id)
@@ -133,6 +145,8 @@ async def export_config(
             # the file stays diffable instead of full of `max_value: null` noise.
             "policy": policy.model_dump(exclude_none=True),
         }
+        if server.project_id is not None and server.project_id in project_slugs_by_id:
+            entry["project_slug"] = project_slugs_by_id[server.project_id]
         if server.upstream_auth_header is not None:
             if is_reference(server.upstream_auth_header):
                 # Not a secret — always safe to include, no warning.
@@ -205,6 +219,11 @@ class _ParsedServer:
     in_aggregate: bool
     policy: ServerPolicy
     upstream_auth_header: Optional[str]
+    # Enterprise #4: None means "not present in the file" (an export from a pre-feature build,
+    # or a hand-written file) — plan_import treats that as "default", never as "unassign the
+    # project of an existing server", so importing an old-shaped file can't silently move a
+    # server OUT of whatever project it's actually in today.
+    project_slug: Optional[str] = None
 
 
 def _parse(yaml_text: str) -> tuple[list[_ParsedServer], dict[str, str], list[str]]:
@@ -281,6 +300,7 @@ def _parse(yaml_text: str) -> tuple[list[_ParsedServer], dict[str, str], list[st
                 in_aggregate=bool(raw.get("in_aggregate", True)),
                 policy=policy,
                 upstream_auth_header=raw.get("upstream_auth_header"),
+                project_slug=raw.get("project_slug"),
             )
         )
 
@@ -292,16 +312,41 @@ async def plan_import(
     settings_repo: SettingsRepo,
     yaml_text: str,
     apply: bool = False,
+    project_repo: Optional[ProjectRepo] = None,
 ) -> ImportPlan:
     """Compute (and optionally apply) the delta between an export file and current state.
 
     Import is destructive, so `apply` defaults to False: the same call that previews is the one
     that writes, which keeps the preview honest — there is no second code path that could drift
     from what was shown.
+
+    Enterprise #4 (multi-tenancy, issue #5): `project_repo` optional for the same reason as
+    export_config's — every pre-feature call site keeps working unchanged. A server entry
+    carrying `project_slug` resolves it to a project_id and applies it on both create AND
+    update (so re-importing an export with a project reassignment actually moves the server);
+    an unknown project_slug is a plan ERROR (not silently ignored, not silently defaulted) —
+    consistent with this function's existing "never half-apply" discipline for any other bad
+    entry. A server entry with NO project_slug at all (an old-shaped file) is left alone on
+    update (never un-assigns an existing server's project) and lands in the caller-resolved
+    default project on CREATE (see archon/api.py's import_configuration, which passes the
+    'default' project's id as the fallback for brand-new servers with no project_slug in the
+    file) — this keeps a partial/legacy file from creating orphaned, project-less servers.
     """
     plan = ImportPlan()
     servers, settings, errors = _parse(yaml_text)
     plan.errors.extend(errors)
+
+    project_ids_by_slug: dict[str, int] = {}
+    default_project_id: Optional[int] = None
+    if project_repo is not None:
+        all_projects = await project_repo.list()
+        project_ids_by_slug = {p.slug: p.id for p in all_projects}
+        default_project_id = project_ids_by_slug.get("default")
+        for parsed in servers:
+            if parsed.project_slug is not None and parsed.project_slug not in project_ids_by_slug:
+                plan.errors.append(
+                    f"server '{parsed.slug}': unknown project_slug {parsed.project_slug!r}"
+                )
 
     if plan.errors:
         # Never half-apply. If any entry is invalid the whole file is rejected, so the operator
@@ -314,15 +359,22 @@ async def plan_import(
         except ServerNotFoundError:
             existing = None
 
+        target_project_id = (
+            project_ids_by_slug.get(parsed.project_slug) if parsed.project_slug is not None
+            else default_project_id
+        )
+
         if existing is None:
-            plan.actions.append(
-                ImportAction("create", f"server '{parsed.slug}'", f"-> {parsed.upstream_url}")
-            )
+            create_detail = f"-> {parsed.upstream_url}"
+            if parsed.project_slug is not None:
+                create_detail += f" (project: {parsed.project_slug})"
+            plan.actions.append(ImportAction("create", f"server '{parsed.slug}'", create_detail))
             if apply:
                 created = await server_repo.create(
                     slug=parsed.slug, name=parsed.name, upstream_url=parsed.upstream_url,
                     enabled=parsed.enabled, in_aggregate=parsed.in_aggregate,
                     upstream_auth_header=parsed.upstream_auth_header,
+                    project_id=target_project_id,
                 )
                 await server_repo.set_policy(created.id, parsed.policy)
             continue
@@ -336,6 +388,12 @@ async def plan_import(
             field_deltas.append(f"enabled: {existing.enabled} -> {parsed.enabled}")
         if existing.in_aggregate != parsed.in_aggregate:
             field_deltas.append(f"in_aggregate: {existing.in_aggregate} -> {parsed.in_aggregate}")
+        if (
+            parsed.project_slug is not None
+            and target_project_id is not None
+            and existing.project_id != target_project_id
+        ):
+            field_deltas.append(f"project: {existing.project_id} -> {parsed.project_slug}")
 
         current_policy = await server_repo.get_policy(existing.id)
         field_deltas.extend(_policy_diff(current_policy, parsed.policy))
@@ -348,12 +406,19 @@ async def plan_import(
                 ImportAction("update", f"server '{parsed.slug}'", "; ".join(field_deltas))
             )
             if apply:
+                update_kwargs: dict[str, Any] = {}
+                if parsed.upstream_auth_header is not None:
+                    update_kwargs["upstream_auth_header"] = parsed.upstream_auth_header
                 await server_repo.update(
                     slug=parsed.slug, name=parsed.name, upstream_url=parsed.upstream_url,
                     enabled=parsed.enabled, in_aggregate=parsed.in_aggregate,
-                    **({"upstream_auth_header": parsed.upstream_auth_header}
-                       if parsed.upstream_auth_header is not None else {}),
+                    **update_kwargs,
                 )
+                if parsed.project_slug is not None and target_project_id is not None:
+                    # ServerRepo.update has no project_id parameter (project reassignment via
+                    # config import is rare enough not to warrant threading it through every
+                    # other update() call site) — a direct, scoped write here instead.
+                    await server_repo.set_project(parsed.slug, target_project_id)
                 await server_repo.set_policy(existing.id, parsed.policy)
         else:
             plan.actions.append(ImportAction("unchanged", f"server '{parsed.slug}'"))

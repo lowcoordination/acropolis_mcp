@@ -126,6 +126,11 @@ class ServerCreateRequest(BaseModel):
     # practical here (the gateway needs the plaintext on every proxied call), so instead it's
     # simply never returned by GET/list endpoints — see ServerResponse below.
     upstream_auth_header: Optional[str] = None
+    # Enterprise #4 (multi-tenancy, issue #5): which project this server belongs to, by slug.
+    # Optional in the request shape — omitted (or "default") targets the backfilled default
+    # project, so an existing integration/script that never heard of projects keeps working
+    # unchanged. archon/api.py resolves this to a project_id and 404s on an unknown slug.
+    project_slug: str = "default"
 
     @field_validator("slug")
     @classmethod
@@ -182,6 +187,11 @@ class ServerResponse(BaseModel):
     # AND the specific cause was a secret-resolution failure (see stoa/health.py's probe_server).
     # Never contains the resolved plaintext credential.
     health_reason: Optional[str] = None
+    # Enterprise #4 (multi-tenancy): the project this server belongs to. project_slug is what
+    # the frontend renders (a project column/filter needs the human-readable slug, not a bare
+    # id); project_id rides along for API clients that want the stable numeric key.
+    project_id: Optional[int] = None
+    project_slug: Optional[str] = None
 
 
 class PolicyResponse(BaseModel):
@@ -266,6 +276,10 @@ class KeyCreateRequest(BaseModel):
     # tests/integration/test_quotas.py::TestNoQuotaConfiguredIsUnchangedBehavior).
     quota_calls: Optional[int] = None
     quota_period: Optional[str] = None  # "day" | "month"
+    # Enterprise #4 (multi-tenancy, issue #5): same default-to-"default" shape as
+    # ServerCreateRequest.project_slug — a key minted with no project_slug lands in the
+    # backfilled default project, matching pre-feature behavior on a single-project instance.
+    project_slug: str = "default"
 
     @model_validator(mode="after")
     def _quota_fields_are_paired(self) -> "KeyCreateRequest":
@@ -290,6 +304,8 @@ class KeyResponse(BaseModel):
     last_used_at: Optional[str]
     quota_calls: Optional[int] = None
     quota_period: Optional[str] = None
+    project_id: Optional[int] = None
+    project_slug: Optional[str] = None
 
 
 class KeyQuotaUpdateRequest(BaseModel):
@@ -546,3 +562,50 @@ class OidcStatusResponse(BaseModel):
 class PasswordChangeRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+# --- Enterprise #4 (multi-tenancy, issue #5) ---------------------------------------------------
+
+class ProjectCreateRequest(BaseModel):
+    slug: str
+    name: str
+
+    @field_validator("slug")
+    @classmethod
+    def _check_slug(cls, v: str) -> str:
+        return _validate_slug(v)
+
+
+class ProjectResponse(BaseModel):
+    id: int
+    slug: str
+    name: str
+    created_at: str
+
+
+class ProjectMemberResponse(BaseModel):
+    """One membership row, with the username/email joined in for display — a bare user_id would
+    force the frontend into a second round-trip against GET /users (admin-only, and a project
+    admin who is NOT a global admin/user-manager has no access to that route at all) just to
+    render a member list."""
+    user_id: int
+    username: str
+    role: str  # viewer | poweruser | admin
+
+
+class ProjectMemberUpsertRequest(BaseModel):
+    """Add a member or change an existing member's role — same route either way (idempotent
+    upsert on the (user_id, project_id) primary key), mirroring project_members' own PK shape
+    rather than having separate add/update routes for what the DB already treats as one
+    operation."""
+    user_id: int
+    role: str
+
+    @field_validator("role")
+    @classmethod
+    def _check_role(cls, v: str) -> str:
+        from archon.project_rbac import is_valid_project_role
+
+        if not is_valid_project_role(v):
+            raise ValueError(f"role must be one of viewer, poweruser, admin, got {v!r}")
+        return v

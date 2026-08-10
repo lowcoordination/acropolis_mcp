@@ -22,6 +22,9 @@ export interface ServerResponse {
   // rather than a literal — lets the UI show "externalized" vs "literal" without ever exposing
   // the value. Meaningless (false) when has_upstream_auth_header is false.
   upstream_auth_header_is_reference: boolean
+  // Enterprise #4 (multi-tenancy): the project this server belongs to.
+  project_id: number | null
+  project_slug: string | null
 }
 
 export interface ServerCreateRequest {
@@ -33,6 +36,8 @@ export interface ServerCreateRequest {
   // Enterprise #5: either a literal Authorization header value or a vault://<mount>/<path>#<key>
   // reference — never returned back by any GET/list response, see ServerResponse above.
   upstream_auth_header?: string
+  // Enterprise #4: defaults server-side to "default" when omitted.
+  project_slug?: string
 }
 
 export interface ServerUpdateRequest {
@@ -106,6 +111,9 @@ export interface KeyResponse {
   // Enterprise #11: nullable, null = unlimited (the default) — see docs/quotas.md.
   quota_calls: number | null
   quota_period: QuotaPeriod | null
+  // Enterprise #4 (multi-tenancy): the project this key belongs to.
+  project_id: number | null
+  project_slug: string | null
 }
 
 export interface KeyCreatedResponse {
@@ -301,4 +309,40 @@ export interface CurrentUserResponse {
 export interface OidcStatusResponse {
   enabled: boolean
   login_url: string | null
+}
+
+// Enterprise #4 (multi-tenancy, issue #5). A SEPARATE role space from the global `Role` above —
+// see archon/project_rbac.py's module docstring for why 'poweruser' here has no relationship to
+// global 'operator' beyond playing the analogous middle tier. Never compare a ProjectRole and a
+// Role directly; they are different rank spaces.
+export type ProjectRole = 'viewer' | 'poweruser' | 'admin'
+
+export const PROJECT_ROLE_RANK: Record<ProjectRole, number> = { viewer: 10, poweruser: 20, admin: 30 }
+
+export function hasProjectRole(current: ProjectRole | undefined, minimum: ProjectRole): boolean {
+  if (!current) return false
+  return PROJECT_ROLE_RANK[current] >= PROJECT_ROLE_RANK[minimum]
+}
+
+export interface ProjectResponse {
+  id: number
+  slug: string
+  name: string
+  created_at: string
+}
+
+export interface ProjectCreateRequest {
+  slug: string
+  name: string
+}
+
+export interface ProjectMemberResponse {
+  user_id: number
+  username: string
+  role: ProjectRole
+}
+
+export interface ProjectMemberUpsertRequest {
+  user_id: number
+  role: ProjectRole
 }

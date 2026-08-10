@@ -160,7 +160,7 @@ class Pipeline:
             try:
                 server = await self._resolve_server(slug)
                 api_key_id = (
-                    None if skip_api_key_auth else await self._authenticate(request, slug)
+                    None if skip_api_key_auth else await self._authenticate(request, slug, server)
                 )
                 body_bytes = (
                     self._guard_body_size(body_override) if body_override is not None
@@ -227,7 +227,7 @@ class Pipeline:
             raise RoutingError(401, rpc_error(None, "invalid or disabled api key"))
         return record.id
 
-    async def _authenticate(self, request: Request, slug: str) -> Optional[int]:
+    async def _authenticate(self, request: Request, slug: str, server: ServerRecord) -> Optional[int]:
         if await self._current_auth_mode() == "open":
             return None
 
@@ -239,6 +239,20 @@ class Pipeline:
         if record is None:
             raise RoutingError(401, rpc_error(None, "invalid or disabled api key"))
         if not self._api_keys.key_permits_server(record, slug):
+            raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
+        # Enterprise #4 (multi-tenancy, issue #5): a SEPARATE check from key_permits_server above
+        # — server_scopes is an operator-configured allowlist of slugs (may be None = "any
+        # server"), while this is the project-agreement invariant that must hold regardless of
+        # what server_scopes says: a key minted in project A must never reach a server in
+        # project B, even if server_scopes was (mis)configured to name that server by slug. The
+        # two checks COMPOSE (both must pass), neither replaces the other. Deliberately does NOT
+        # consult any notion of "global admin" — there is no Principal/session on the data plane,
+        # only a key; the global-admin-superset rule is a CONTROL-plane (session-based) concept
+        # in archon/project_rbac.py and must never leak into this purely key-vs-server check.
+        # `server` is the SAME record _resolve_server already fetched in handle() above — reused
+        # here rather than re-querying by slug, since this method now runs strictly after that
+        # resolution on every real call path.
+        if record.project_id != server.project_id:
             raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
         return record.id
 
@@ -787,6 +801,10 @@ class Pipeline:
         try:
             await self._usage.increment(
                 ts_iso=utcnow(), api_key_id=api_key_id, server_id=server.id, tool=tool_name,
+                # Enterprise #4: attribute the rollup to the SERVER's project (a server belongs
+                # to exactly one project; the calling key's project is checked for AGREEMENT with
+                # this in _authenticate below, not used as the attribution source here).
+                project_id=server.project_id,
             )
         except Exception:
             logger.error(

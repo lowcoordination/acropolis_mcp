@@ -15,7 +15,7 @@ from archon.settings import Settings
 from archon.rbac import ROLE_RANK
 from argus.app import create_app
 from db.database import Database
-from db.repo import SettingsRepo, UserRepo
+from db.repo import ProjectMemberRepo, ProjectRepo, SettingsRepo, UserRepo
 
 
 @pytest.fixture
@@ -54,11 +54,36 @@ async def _create_user_and_login(
 ) -> httpx.AsyncClient:
     """Creates a user via the real admin API, then authenticates as them through the real
     POST /api/v1/login route (not a forged cookie) — this is the actual login path an operator
-    or viewer created via the Users page would use, and is the thing that was broken pre-fix."""
+    or viewer created via the Users page would use, and is the thing that was broken pre-fix.
+
+    Enterprise #4 (multi-tenancy): POST /api/v1/users deliberately does NOT auto-enroll the new
+    user in any project — project access is opt-in per project, granted explicitly, same
+    fail-closed-by-default discipline every other feature in this codebase follows (a brand-new
+    user should not silently inherit access to every server just by existing). That means a
+    freshly created user has ZERO project-scoped access until someone grants it — this fixture
+    grants membership in the 'default' project (the one every pre-migration server/key lives
+    in) at a role matching the new user's global role, mirroring what a real admin would do
+    immediately after creating an operator/viewer who needs to actually work with 'default's
+    resources. This keeps test_rbac.py's route×GLOBAL-role matrix testing what it has always
+    tested (global role enforcement) without being confused by the orthogonal project-role
+    dimension, which has its own dedicated coverage in test_multi_tenancy.py."""
     resp = await admin_client.post(
         "/api/v1/users", json={"username": username, "password": password, "role": role}
     )
     assert resp.status_code == 201, resp.text
+    user_id = resp.json()["id"]
+
+    project_repo = ProjectRepo(app.state.db)
+    member_repo = ProjectMemberRepo(app.state.db)
+    default_project = await project_repo.get("default")
+    # Global role -> matching project role: viewer/operator map directly onto the project
+    # hierarchy's viewer/poweruser names (see 03-multi-tenancy.md's revision note — poweruser is
+    # the project-scoped name for the tier operator plays globally). Global admin doesn't need a
+    # row at all (the superset short-circuit), but granting one here is harmless and keeps this
+    # helper's behavior uniform across all three roles rather than special-casing admin out.
+    project_role = {"viewer": "viewer", "operator": "poweruser", "admin": "admin"}[role]
+    await member_repo.upsert(user_id=user_id, project_id=default_project.id, role=project_role)
+
     return await _login_as(transport, username, password)
 
 
@@ -160,7 +185,15 @@ async def test_route_role_matrix(rbac_app, role_clients, method, path, minimum_r
         )
 
     minimum_rank = ROLE_RANK[minimum_role]
-    for role_name, client in role_clients.items():
+    # Pre-existing ordering bug (found while verifying enterprise #4's changes, unrelated to
+    # project scoping): role_clients is iterated in insertion order (admin, operator, viewer).
+    # For a DESTRUCTIVE route like DELETE, the first client whose rank clears minimum_rank
+    # actually performs the delete — if that happens to run before a lower-rank client's DENIED
+    # check, the resource is already gone and the denied client gets 404 (resource doesn't
+    # exist) instead of 403 (resource exists, caller lacks permission), a false failure with
+    # nothing to do with authorization. Sorting ascending by rank guarantees every DENIED check
+    # runs against a still-existing resource, before the one ALLOWED client (if any) consumes it.
+    for role_name, client in sorted(role_clients.items(), key=lambda item: ROLE_RANK[item[0]]):
         should_allow = ROLE_RANK[role_name] >= minimum_rank
         resp = await client.request(method, path, json=body)
         if should_allow:

@@ -11,6 +11,9 @@ export interface AuditQuery {
   after?: string
   before?: string
   search?: string
+  // Enterprise #4: optional project filter — instance-wide (unfiltered) by default, matching
+  // pre-feature behavior exactly.
+  project_id?: number
 }
 
 // Filters shared between the history query and the CSV export — before_id/limit are
@@ -34,7 +37,8 @@ export const auditApi = {
     const suffix = qs.toString() ? `?${qs}` : ''
     return api.get<AuditEvent[]>(`/audit${suffix}`)
   },
-  stats: () => api.get<StatsResponse>('/stats'),
+  stats: (projectId?: number) =>
+    api.get<StatsResponse>(`/stats${projectId != null ? `?project_id=${projectId}` : ''}`),
   // Not fetched through the API client — the browser handles the download (and its
   // Content-Disposition attachment header) natively via a plain <a href>.
   exportCsvUrl: (params: AuditFilters = {}) => {

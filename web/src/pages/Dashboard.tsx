@@ -1,10 +1,12 @@
 import { Link } from 'react-router'
 import { useStats } from '../lib/useStats'
+import { useActiveProject } from '../lib/ProjectContext'
 import { StatTile } from '../components/StatTile'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
 
 export function Dashboard() {
-  const { data: stats, isLoading, isError } = useStats()
+  const { activeProjectId } = useActiveProject()
+  const { data: stats, isLoading, isError } = useStats(activeProjectId)
 
   if (isLoading) {
     return <p style={{ color: 'var(--text-muted)' }}>Loading…</p>

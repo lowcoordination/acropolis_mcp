@@ -35,13 +35,14 @@ class ApiKeyService:
     async def create(
         self, name: str, server_scopes: Optional[list[str]] = None,
         quota_calls: Optional[int] = None, quota_period: Optional[str] = None,
+        project_id: Optional[int] = None,
     ) -> GeneratedKey:
         plaintext = _generate_plaintext()
         key_hash = _hash_key(plaintext)
         display_prefix = plaintext[:DISPLAY_PREFIX_LEN]
         record = await self._repo.create(
             name=name, key_hash=key_hash, key_prefix=display_prefix, server_scopes=server_scopes,
-            quota_calls=quota_calls, quota_period=quota_period,
+            quota_calls=quota_calls, quota_period=quota_period, project_id=project_id,
         )
         return GeneratedKey(record=record, plaintext=plaintext)
 
@@ -68,8 +69,8 @@ class ApiKeyService:
             return True  # no scopes recorded = access to all servers
         return slug in record.server_scopes
 
-    async def list(self) -> list[ApiKeyRecord]:
-        return await self._repo.list()
+    async def list(self, project_id: Optional[int] = None) -> list[ApiKeyRecord]:
+        return await self._repo.list(project_id=project_id)
 
     async def get(self, key_id: int) -> Optional[ApiKeyRecord]:
         """Get a key by ID, or None if not found. Used by admin_audit for before/after diff."""

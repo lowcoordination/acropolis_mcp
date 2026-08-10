@@ -2,6 +2,8 @@ import { NavLink, Outlet } from 'react-router'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { setupApi } from '../api/settings'
 import { useCurrentUser } from '../lib/useUsers'
+import { useActiveProject } from '../lib/ProjectContext'
+import { useProjects } from '../lib/useProjects'
 import { hasRole, type Role } from '../api/types'
 
 const navItems: { to: string; label: string; end?: boolean; minRole?: Role }[] = [
@@ -10,9 +12,43 @@ const navItems: { to: string; label: string; end?: boolean; minRole?: Role }[] =
   { to: '/keys', label: 'API Keys', minRole: 'admin' },
   { to: '/usage', label: 'Usage' },
   { to: '/audit', label: 'Audit' },
+  { to: '/projects', label: 'Projects', minRole: 'admin' },
   { to: '/users', label: 'Users', minRole: 'admin' },
   { to: '/settings', label: 'Settings' },
 ]
+
+// Enterprise #4: the project switcher. Same "courtesy, not a security boundary" discipline as
+// hasRole above — selecting a project here just sets a `project_id` query filter each page
+// passes to its own list/get calls; every backend route still enforces its own gate regardless
+// of what's selected. Rendered even for a caller with zero project memberships (they'll just see
+// "All projects" plus whatever their global-admin superset or explicit memberships surface via
+// GET /projects, which is viewer+ instance-wide — see archon/api.py's list_projects docstring).
+function ProjectSwitcher() {
+  const { data: projects } = useProjects()
+  const { activeProjectId, setActiveProjectId } = useActiveProject()
+
+  if (!projects || projects.length <= 1) return null
+
+  return (
+    <div className="px-3 pb-2">
+      <label className="block text-xs font-medium mb-1 px-1" style={{ color: 'var(--text-muted)' }}>
+        Project
+      </label>
+      <select
+        className="w-full rounded-md px-2 py-1.5 text-sm"
+        value={activeProjectId ?? ''}
+        onChange={(e) => setActiveProjectId(e.target.value ? Number(e.target.value) : null)}
+      >
+        <option value="">All projects</option>
+        {projects.map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.name}
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
 
 export function Layout() {
   const queryClient = useQueryClient()
@@ -46,6 +82,7 @@ export function Layout() {
           </span>
           <span className="font-semibold tracking-tight">Acropolis</span>
         </div>
+        <ProjectSwitcher />
         <nav className="flex-1 px-2 space-y-0.5">
           {visibleNavItems.map((item) => (
             <NavLink

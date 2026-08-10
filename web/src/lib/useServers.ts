@@ -2,10 +2,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { serversApi } from '../api/servers'
 import type { PolicyResponse, ServerCreateRequest, ServerUpdateRequest } from '../api/types'
 
-export function useServers() {
+export function useServers(projectId?: number | null) {
   return useQuery({
-    queryKey: ['servers'],
-    queryFn: () => serversApi.list(),
+    queryKey: ['servers', projectId ?? 'all'],
+    queryFn: () => serversApi.list(projectId ?? undefined),
     refetchInterval: 10_000,
   })
 }
@@ -46,7 +46,7 @@ export function useCreateServer() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: ServerCreateRequest) => serversApi.create(body),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['servers'] }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['servers'], exact: false }),
   })
 }
 

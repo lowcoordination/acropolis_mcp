@@ -7,9 +7,10 @@ export interface QuotaFields {
 }
 
 export const keysApi = {
-  list: () => api.get<KeyResponse[]>('/keys'),
-  create: (name: string, server_scopes?: string[], quota?: QuotaFields) =>
-    api.post<KeyCreatedResponse>('/keys', { name, server_scopes, ...quota }),
+  list: (projectId?: number) =>
+    api.get<KeyResponse[]>(`/keys${projectId != null ? `?project_id=${projectId}` : ''}`),
+  create: (name: string, server_scopes?: string[], quota?: QuotaFields, project_slug?: string) =>
+    api.post<KeyCreatedResponse>('/keys', { name, server_scopes, project_slug, ...quota }),
   setEnabled: (id: number, enabled: boolean) =>
     api.patch<KeyResponse>(`/keys/${id}`, { enabled: String(enabled) }),
   setQuota: (id: number, quota: QuotaFields) =>

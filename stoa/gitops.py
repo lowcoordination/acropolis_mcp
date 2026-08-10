@@ -21,7 +21,7 @@ import httpx
 
 from archon.config_io import ImportPlan, plan_import
 from archon.schemas import _validate_webhook_url
-from db.repo import ServerRepo, SettingsRepo
+from db.repo import ProjectRepo, ServerRepo, SettingsRepo
 
 logger = logging.getLogger("stoa.gitops")
 
@@ -71,9 +71,16 @@ class ConfigSource:
         server_repo: ServerRepo,
         settings_repo: SettingsRepo,
         http_client: Optional[httpx.AsyncClient] = None,
+        project_repo: Optional[ProjectRepo] = None,
     ):
         self._server_repo = server_repo
         self._settings_repo = settings_repo
+        # Enterprise #4: optional, same "every pre-feature call site keeps working" shape as
+        # config_io.py's own project_repo parameters — GitOps reconcile/drift carry
+        # project_slug per server in the diff (see plan_import) but this stays instance-wide/
+        # global-admin-only regardless (03-multi-tenancy.md design decision 8); project_repo
+        # here is ONLY for round-tripping the YAML shape, never a role gate.
+        self._project_repo = project_repo
         # If no client provided, we create one and own its lifecycle
         self._http = http_client or httpx.AsyncClient(
             timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=False
@@ -194,7 +201,8 @@ class ConfigSource:
         # Compute drift using the same plan_import as a hand-uploaded file
         try:
             plan = await plan_import(
-                self._server_repo, self._settings_repo, yaml_text, apply=False
+                self._server_repo, self._settings_repo, yaml_text, apply=False,
+                project_repo=self._project_repo,
             )
         except Exception as e:
             self._state.status = "error"
@@ -244,7 +252,8 @@ class ConfigSource:
 
         # Apply with apply=True
         plan = await plan_import(
-            self._server_repo, self._settings_repo, yaml_text, apply=True
+            self._server_repo, self._settings_repo, yaml_text, apply=True,
+            project_repo=self._project_repo,
         )
 
         # Clear drift state after successful apply

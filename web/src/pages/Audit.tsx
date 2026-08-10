@@ -3,6 +3,7 @@ import { useAuditQuery } from '../lib/useAuditQuery'
 import { useAuditTail } from '../lib/useAuditTail'
 import { useServers } from '../lib/useServers'
 import { useKeys } from '../lib/useKeys'
+import { useActiveProject } from '../lib/ProjectContext'
 import { auditApi } from '../api/audit'
 import { DecisionBadge } from '../components/DecisionBadge'
 import type { AuditEvent } from '../api/types'
@@ -62,8 +63,9 @@ function localDateTimeToIso(value: string): string | undefined {
 }
 
 export function Audit() {
-  const { data: servers } = useServers()
-  const { data: keys } = useKeys()
+  const { activeProjectId } = useActiveProject()
+  const { data: servers } = useServers(activeProjectId)
+  const { data: keys } = useKeys(activeProjectId)
   const [serverFilter, setServerFilter] = useState('')
   const [decisionFilter, setDecisionFilter] = useState('')
   const [apiKeyFilter, setApiKeyFilter] = useState('')
@@ -91,6 +93,7 @@ export function Audit() {
     before,
     search: search || undefined,
     limit: 100,
+    project_id: activeProjectId ?? undefined,
   })
 
   const liveEvents = useAuditTail(tailPaused)
@@ -118,6 +121,7 @@ export function Audit() {
     after,
     before,
     search: search || undefined,
+    project_id: activeProjectId ?? undefined,
   })
 
   return (
