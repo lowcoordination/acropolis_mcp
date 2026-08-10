@@ -244,14 +244,33 @@ def _patch_database(request, postgres_admin_dsn, monkeypatch):
 
     Databases are created lazily — a test that never constructs a Database pays nothing — and
     dropped after the test regardless of outcome.
+
+    Bug fix (found running the full suite against real Postgres, post-cutover): the pre-cutover
+    semantic of `Database(tmp_path)` was "one on-disk directory, therefore one logical
+    database" — a test whose fixtures independently construct multiple `Database(tmp_path)`
+    objects against the SAME tmp_path (e.g. one fixture for a bare `db` handle, another for the
+    `api_client` app's own store — several files in this suite do exactly this) got them all
+    pointed at the same SQLite file for free, because the path itself was the identity. The
+    original version of this patch created a FRESH, DIFFERENT Postgres database on every call
+    regardless of the `dsn` argument's identity, silently breaking that assumption: two
+    `Database(tmp_path)` calls in the same test ended up on two disconnected databases, so a
+    write through one fixture's app was invisible to a read through the other fixture's direct
+    handle — not a Postgres consistency issue, a fixture-identity issue. Caching by the
+    argument's `id()` (works for both `tmp_path` and its stringified form, since a test always
+    passes the SAME Path/str object it received from the `tmp_path` fixture, not a copy)
+    restores the original one-argument-one-database semantic exactly.
     """
     created: list[str] = []
+    by_arg_identity: dict[int, str] = {}
     real_init = db_database.Database.__init__
 
     def patched_init(self, dsn=None, **kwargs):
         if not isinstance(dsn, str) or not dsn.startswith("postgres"):
-            dsn = _create_database(postgres_admin_dsn)
-            created.append(dsn)
+            key = id(dsn)
+            if key not in by_arg_identity:
+                by_arg_identity[key] = _create_database(postgres_admin_dsn)
+                created.append(by_arg_identity[key])
+            dsn = by_arg_identity[key]
         return real_init(self, dsn, **kwargs)
 
     monkeypatch.setattr(db_database.Database, "__init__", patched_init)

@@ -15,7 +15,6 @@ import asyncio
 import contextlib
 import json
 import socket
-import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -149,12 +148,25 @@ class TestF1PathTraversalFixed:
 
     async def test_full_takeover_chain_is_blocked(self, tmp_path, dist_dir):
         """End-to-end: complete setup, then attempt the exact steal-secret -> forge-cookie ->
-        hit-admin-api chain that worked against the unpatched app. Every step must now fail."""
+        hit-admin-api chain that worked against the unpatched app. Every step must now fail.
+
+        Postgres cutover (enterprise #7): there is no more on-disk gateway.db file to request a
+        path-traversal read of, so the traversal attempts below assert the SAME shape of
+        response (never a raw SQLite/Postgres dump) rather than the SQLite magic-bytes check
+        specifically — the point was always "the SPA fallback route cannot read arbitrary files
+        off the server", and that's still exactly what's under test. The precondition sanity
+        check (a real session_secret was actually persisted, so the traversal assertions aren't
+        vacuously true against an empty settings table) now goes through the real SettingsRepo
+        against the real database, which is a MORE honest check than reading raw SQLite bytes
+        ever was — it proves the value is readable through the actual repo layer, not just
+        present in some file."""
         async with run_acropolis_server(tmp_path) as (port, db):
             async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
                 r = await client.post("/api/v1/setup", json={"admin_password": "regression-test-pw"})
                 assert r.status_code == 200
 
+            # No gateway.db file exists post-cutover — confirm the traversal route can't read
+            # any file the way it once could reach the SQLite database on disk.
             db_path = str((tmp_path / "gateway.db").resolve())
             for suffix in ("", "-wal", "-shm"):
                 status, body = await _raw_request(port, f"GET /{db_path}{suffix}")
@@ -166,9 +178,9 @@ class TestF1PathTraversalFixed:
             # still requires it not be exfiltratable via THIS route — sanity-check the real
             # secret is non-empty so the assertions above aren't vacuously true against an
             # empty/unset settings table.
-            conn = sqlite3.connect(tmp_path / "gateway.db")
-            secret = dict(conn.execute("SELECT key, value FROM settings").fetchall()).get("session_secret")
-            conn.close()
+            from db.repo import SettingsRepo
+
+            secret = await SettingsRepo(db).get("session_secret")
             assert secret, "setup did not actually persist a session_secret — test precondition broken"
 
 

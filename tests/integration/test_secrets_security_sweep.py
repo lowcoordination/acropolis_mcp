@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import sqlite3
 from pathlib import Path
 
 import httpx
@@ -29,27 +28,37 @@ CANARY = "Bearer sk-SWEEP-CANARY-4b7e91a02c88ff33-must-not-leak"
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _all_gateway_db_text(data_dir: Path) -> str:
-    """Reads every row of every table in gateway.db as text, for a substring sweep.
+async def _all_gateway_db_text(db: Database) -> str:
+    """Reads every row of every table in the database as text, for a substring sweep.
 
-    Table names come from sqlite_master itself (never attacker- or network-controlled — this is
-    a local test fixture's own schema), but interpolating them into SQL still goes through an
-    identifier allowlist check first rather than directly, per this repo's own f-string-in-SQL
-    convention (see archon/secrets/openbao.py's docstring on why SQL identifiers can't be
-    parameterized the way values can — the same reasoning applies here)."""
-    conn = sqlite3.connect(data_dir / "gateway.db")
-    try:
-        tables = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()]
+    Postgres cutover (enterprise #7): this used to open gateway.db directly with stdlib
+    sqlite3. That version had a silent-vacuous-pass failure mode worth naming explicitly, since
+    it's exactly the kind of bug a canary sweep exists to prevent in OTHER code and should not
+    itself have: sqlite3.connect() against a NONEXISTENT path lazily creates an empty database
+    file rather than erroring, so `_all_gateway_db_text` would happily return "" against a
+    stale/wrong path and every `assert CANARY not in db_text` below would pass having swept
+    zero rows — a green test that checked nothing. Reading through db.reader (the real
+    connection pool this fixture's own `db` object already holds, the same one every other
+    query in the app goes through) has no such failure mode: a bad connection raises loudly.
+
+    Table names come from information_schema itself (never attacker- or network-controlled —
+    this is a local test fixture's own schema), but interpolating them into SQL still goes
+    through an identifier allowlist check first rather than directly, per this repo's own
+    f-string-in-SQL convention (see archon/secrets/openbao.py's docstring on why SQL
+    identifiers can't be parameterized the way values can — the same reasoning applies here)."""
+    async with db.reader.acquire() as conn:
+        tables = [
+            r["table_name"] for r in await conn.fetch(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+            )
+        ]
         chunks = []
         for table in tables:
             assert _TABLE_NAME_RE.match(table), f"unexpected table name shape: {table!r}"
-            rows = conn.execute(f"SELECT * FROM {table}").fetchall()  # nosec: identifier allowlisted above
-            chunks.append(str(rows))
+            rows = await conn.fetch(f"SELECT * FROM {table}")  # nosec: identifier allowlisted above
+            chunks.append(str([dict(r) for r in rows]))
         return "\n".join(chunks)
-    finally:
-        conn.close()
 
 
 async def test_encrypted_tier_canary_absent_from_db_export_and_logs(tmp_path: Path, monkeypatch, caplog):
@@ -94,12 +103,12 @@ async def test_encrypted_tier_canary_absent_from_db_export_and_logs(tmp_path: Pa
                 get_resp = await client.get("/api/v1/servers/sweep-encrypted")
                 api_response_text = get_resp.text
 
+    db_text = await _all_gateway_db_text(db)
     await db.close()
 
-    db_text = _all_gateway_db_text(tmp_path)
     log_text = "\n".join(record.getMessage() for record in caplog.records)
 
-    assert CANARY not in db_text, "canary plaintext leaked into gateway.db"
+    assert CANARY not in db_text, "canary plaintext leaked into the database"
     assert CANARY not in export_text, "canary plaintext leaked into a config export"
     assert CANARY not in api_response_text, "canary plaintext leaked into an API response"
     assert CANARY not in log_text, "canary plaintext leaked into a log line"
@@ -166,9 +175,9 @@ async def test_openbao_tier_canary_absent_from_db_export_and_logs(tmp_path: Path
                     get_resp = await client.get("/api/v1/servers/sweep-openbao")
                     api_response_text = get_resp.text
 
+        db_text = await _all_gateway_db_text(db)
         await db.close()
 
-        db_text = _all_gateway_db_text(tmp_path)
         log_text = "\n".join(record.getMessage() for record in caplog.records)
 
         assert CANARY not in db_text

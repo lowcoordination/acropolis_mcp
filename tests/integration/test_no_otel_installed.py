@@ -78,27 +78,30 @@ class TestOtelGenuinelyAbsent:
             f"stdout={result.stdout}\nstderr={result.stderr}"
         )
 
-    def test_app_boots_and_serves_with_tracing_disabled(self, no_otel_venv, tmp_path):
+    def test_app_boots_and_serves_with_tracing_disabled(self, no_otel_venv, pg_dsn):
         """The default, overwhelmingly common case: no ACROPOLIS_OTEL_ENABLED at all, no otel
         installed. The app must start, run its lifespan, and handle a request — completely
-        unaffected by this feature's existence."""
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
+        unaffected by this feature's existence.
+
+        Postgres cutover (enterprise #7): `Database` is URL-only. This script runs in a
+        SEPARATE subprocess/venv (the whole point of this test file), so it is outside
+        conftest.py's autouse `_patch_database` fixture, which only wraps the constructor inside
+        THIS pytest process — the subprocess needs a real DSN passed in explicitly. `pg_dsn`
+        gives a fresh, uniquely-named database exactly like every other test that needs one
+        directly."""
         result = _run_script(no_otel_venv, f"""
             import asyncio
             import httpx
-            from pathlib import Path
             from archon.settings import Settings
             from argus.app import create_app
             from db.database import Database
 
             async def main():
-                data_dir = Path({str(data_dir)!r})
                 settings = Settings(
-                    data_dir=str(data_dir), auth_mode="open",
+                    database_url={pg_dsn!r}, auth_mode="open",
                     health_poll_enabled=False, audit_retention_enabled=False,
                 )
-                db = Database(data_dir)
+                db = Database({pg_dsn!r})
                 await db.connect()
                 app = create_app(settings, db)
                 async with app.router.lifespan_context(app):
@@ -116,29 +119,28 @@ class TestOtelGenuinelyAbsent:
         assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
         assert "SUBPROCESS_OK" in result.stdout
 
-    def test_app_boots_with_otel_enabled_env_var_but_package_absent(self, no_otel_venv, tmp_path):
+    def test_app_boots_with_otel_enabled_env_var_but_package_absent(self, no_otel_venv, pg_dsn):
         """The genuinely interesting case: an operator sets ACROPOLIS_OTEL_ENABLED=true on a
         base install that never got `pip install acropolis[otel]`. Must degrade to a logged
         warning and an inactive (but harmless) TracingManager — never crash startup, never
-        break request handling."""
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
+        break request handling.
+
+        Postgres cutover (enterprise #7): see the DSN note on the test above — same reasoning,
+        this subprocess also needs a real `pg_dsn` passed in explicitly."""
         result = _run_script(no_otel_venv, f"""
             import asyncio
             import logging
             import httpx
-            from pathlib import Path
             from archon.settings import Settings
             from argus.app import create_app
             from db.database import Database
 
             async def main():
-                data_dir = Path({str(data_dir)!r})
                 settings = Settings(
-                    data_dir=str(data_dir), auth_mode="open",
+                    database_url={pg_dsn!r}, auth_mode="open",
                     health_poll_enabled=False, audit_retention_enabled=False,
                 )
-                db = Database(data_dir)
+                db = Database({pg_dsn!r})
                 await db.connect()
                 app = create_app(settings, db)
                 async with app.router.lifespan_context(app):
