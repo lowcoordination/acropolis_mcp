@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from db.models import ApiKeyRecord
-from db.repo import ApiKeyRepo
+from db.repo import ApiKeyRepo, ServerNotFoundError
 
 KEY_PREFIX = "acropolis_"
 KEY_RANDOM_BYTES = 32
