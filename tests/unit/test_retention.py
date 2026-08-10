@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import asyncpg
 import pytest
 
 from db.database import Database
@@ -24,11 +25,9 @@ def _iso(dt: datetime) -> str:
 
 async def _seed_event(repo: AuditRepo, age_days: float, server_slug: str = "shell") -> None:
     ts = _iso(datetime.now(timezone.utc) - timedelta(days=age_days))
-    await repo._conn.execute(
-        "INSERT INTO audit_events (ts, server_slug, decision) VALUES (?, ?, ?)",
-        (ts, server_slug, "ALLOWED"),
-    )
-    await repo._conn.commit()
+    # Postgres cutover: seeds go through the repo's public insert_many() rather than a private
+    # connection (repos no longer hold one — they acquire from a pool per call).
+    await repo.insert_many([{"ts": ts, "server_slug": server_slug, "decision": "ALLOWED"}])
 
 
 async def test_prunes_events_older_than_configured_days(db):
@@ -127,11 +126,9 @@ async def test_boundary_row_at_exact_cutoff_instant_is_not_pruned(db, monkeypatc
     await settings_repo.set_many({"audit_retention_days": "7"})
 
     boundary_instant = frozen_now - timedelta(days=7)
-    await audit_repo._conn.execute(
-        "INSERT INTO audit_events (ts, server_slug, decision) VALUES (?, ?, ?)",
-        (boundary_instant.isoformat(), "shell", "ALLOWED"),
-    )
-    await audit_repo._conn.commit()
+    await audit_repo.insert_many([
+        {"ts": boundary_instant.isoformat(), "server_slug": "shell", "decision": "ALLOWED"}
+    ])
 
     job = AuditRetentionJob(audit_repo, settings_repo)
     await job.run_once()
@@ -144,36 +141,40 @@ async def test_boundary_row_at_exact_cutoff_instant_is_not_pruned(db, monkeypatc
 
 
 async def test_prune_older_than_batches_large_deletes(db):
-    """§26 fix (review 2026-08-04): prune_older_than used to run a single unbounded DELETE —
-    on audit.db's single connection (AuditLogger's batched flush is its only normal writer),
-    a large backlog would hold one long-running transaction and block new events from being
-    persisted for however long the DELETE took.
+    """§26 fix (review 2026-08-04): prune_older_than used to run a single unbounded DELETE. The
+    original SQLite-specific harm (one long transaction on audit.db's single connection blocking
+    AuditLogger's flush loop) no longer applies post-cutover, but batching is deliberately KEPT —
+    a single giant DELETE bloats WAL, defers autovacuum's ability to reclaim any dead tuples
+    until it commits, and holds a long-lived lock set. See AuditRepo.prune_older_than's comment.
 
     Asserting only the end result (all rows gone) does NOT distinguish batched from unbatched —
     a single unbounded DELETE satisfies that just as well, which is precisely why an earlier
-    version of this test passed against the pre-fix code by accident. The actual, distinguishing
-    behavior is that MULTIPLE DELETE statements run (one per batch) rather than one — confirmed
-    by counting DELETE executions via a spy on the connection."""
+    version of this test passed against the pre-fix code by accident. The distinguishing
+    behavior is that MULTIPLE delete statements run (one per batch) rather than one.
+
+    Postgres cutover: the spy moved from the repo's (now nonexistent) private connection to
+    asyncpg's Connection.fetchval, which is what the batched delete CTE runs through. Counting
+    is filtered to statements containing DELETE so unrelated reads don't inflate it."""
     audit_repo = AuditRepo(db)
 
     for _ in range(25):
         await _seed_event(audit_repo, age_days=10)
 
     delete_statement_count = 0
-    original_execute = audit_repo._conn.execute
+    original_fetchval = asyncpg.Connection.fetchval
 
-    async def counting_execute(sql, *args, **kwargs):
+    async def counting_fetchval(self, query, *args, **kwargs):
         nonlocal delete_statement_count
-        if sql.strip().upper().startswith("DELETE"):
+        if "DELETE" in query.upper():
             delete_statement_count += 1
-        return await original_execute(sql, *args, **kwargs)
+        return await original_fetchval(self, query, *args, **kwargs)
 
-    audit_repo._conn.execute = counting_execute
+    asyncpg.Connection.fetchval = counting_fetchval
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
         deleted = await audit_repo.prune_older_than(cutoff, batch_size=10)
     finally:
-        audit_repo._conn.execute = original_execute
+        asyncpg.Connection.fetchval = original_fetchval
 
     assert deleted == 25
     remaining = await audit_repo.query()

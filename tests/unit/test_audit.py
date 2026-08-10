@@ -20,21 +20,17 @@ async def _seed(repo: AuditRepo, **overrides) -> None:
         "ts": _iso(datetime.now(timezone.utc)), "server_slug": "shell", "api_key_id": None,
         "client_ip": None, "endpoint": None, "rpc_method": None, "tool": None,
         "decision": "ALLOWED", "rule": None, "matched": None, "reason": None,
-        "args_summary": None, "bridged": 0, "status_code": None, "latency_ms": None,
+        # bridged is a real BOOLEAN column post-cutover, not SQLite's 0/1 INTEGER.
+        "args_summary": None, "bridged": False, "status_code": None, "latency_ms": None,
         "origin": None,
     }
     row.update(overrides)
-    await repo._conn.execute(
-        """INSERT INTO audit_events
-           (ts, server_slug, api_key_id, client_ip, endpoint, rpc_method, tool,
-            decision, rule, matched, reason, args_summary, bridged, status_code, latency_ms,
-            origin)
-           VALUES (:ts, :server_slug, :api_key_id, :client_ip, :endpoint, :rpc_method, :tool,
-                   :decision, :rule, :matched, :reason, :args_summary, :bridged, :status_code,
-                   :latency_ms, :origin)""",
-        row,
-    )
-    await repo._conn.commit()
+    # Postgres cutover: seeds now go through the repo's own public insert_many() rather than
+    # reaching into a private connection (`repo._conn`, which no longer exists — repos acquire
+    # from a pool per call instead of holding one). This is strictly better as a test: it
+    # exercises the same write path production uses, so a bug in insert_many's column mapping
+    # can't hide behind a hand-written INSERT in the test helper.
+    await repo.insert_many([row])
 
 
 @pytest.fixture

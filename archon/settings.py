@@ -6,9 +6,30 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ACROPOLIS_")
 
+    # Enterprise #7 (issue #8): Postgres is a HARD REQUIREMENT. There is no SQLite fallback and
+    # no embedded default — the app refuses to start without a reachable Postgres, the same
+    # fail-loud-at-boot posture used for a misconfigured secret provider or webhook URL. A
+    # data store that silently degrades to "empty but running" is worse than one that won't boot.
+    #
+    # Typed Optional[str] with a None default rather than a required field so that the error an
+    # operator sees is db/database.py's DatabaseNotConfiguredError (which names the variable and
+    # points at docs/postgres.md) rather than a pydantic validation traceback at import time.
+    database_url: str | None = None
+
+    # data_dir survives the cutover but no longer holds gateway.db/audit.db — nothing in the
+    # database layer reads it now. Kept because it is still the documented location for
+    # non-database on-disk state (e.g. ACROPOLIS_SECRET_KEY_FILE's default neighbourhood in
+    # docs/secrets.md) and removing the setting would break existing deployments' env files for
+    # no benefit.
     data_dir: str = "./data"
     host: str = "0.0.0.0"
     port: int = 8000
+
+    # Connection pool sizing. Defaults match db/database.py's; exposed here so an operator
+    # running several replicas can keep total connections under the server's max_connections
+    # (each replica opens up to writer+reader of these). See docs/postgres.md.
+    db_writer_pool_max: int = 5
+    db_reader_pool_max: int = 10
 
     # "open" = no API key required (trusted LAN); "keyed" = Bearer key required on /mcp/*
     auth_mode: str = "keyed"

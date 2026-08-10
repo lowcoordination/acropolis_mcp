@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-import aiosqlite
+import asyncpg
 from pydantic import BaseModel, ValidationError
 
 from .database import Database, utcnow
@@ -24,6 +24,53 @@ from .models import (
 logger = logging.getLogger("db.repo")
 
 _UNSET = object()  # sentinel: distinguishes "argument omitted" from "argument is None"
+
+
+# ─── gateway_write_lock conversion audit (enterprise #7, issue #8) ────────────────────────────
+#
+# Every write path in this module used to run inside `async with self._db.gateway_write_lock`, a
+# per-process asyncio.Lock that serialized all writes because SQLite has a single writer. That
+# lock is DELETED. Being per-process, it was also exactly what made multi-replica deployment
+# impossible: a second pod would not have contended for it, so every invariant it "protected"
+# would have silently stopped holding the moment anyone scaled past one instance.
+#
+# Each site was converted individually rather than blanket-removed. Each carries an inline
+# comment naming its replacement; the shapes used, and when each applies:
+#
+#   [SINGLE-STATEMENT]  One INSERT/UPDATE/DELETE, no read-then-write. asyncpg runs a lone
+#                       statement in an implicit transaction and Postgres makes it atomic, so the
+#                       lock was pure overhead here. No explicit transaction added — wrapping a
+#                       single statement in BEGIN/COMMIT buys nothing and just costs round-trips.
+#
+#   [TRANSACTION]       Multi-statement write that must be all-or-nothing and must never be
+#                       observed half-applied by a reader. Replaced with an explicit
+#                       `async with conn.transaction()`. Postgres MVCC additionally guarantees no
+#                       reader sees the gap — which under SQLite required the separate-connection
+#                       WAL trick the old Database docstring described at length.
+#
+#   [UPSERT]            Read-modify-write collapsed into a single atomic
+#                       `INSERT ... ON CONFLICT DO UPDATE`. Preferred over transaction+lock
+#                       wherever the operation is expressible this way, because it is race-free
+#                       without holding anything: concurrent callers serialize on the row itself.
+#
+#   [ATOMIC-RMW]        Read-modify-write expressed as one statement operating on the stored
+#                       value (`SET x = x + 1`) plus `RETURNING`, so no read happens outside the
+#                       write. Replaces the read-after-write-under-lock pattern.
+#
+#   [FOR UPDATE]        A genuine check-then-act across statements where the checked row must not
+#                       change underneath. Takes a row lock inside a transaction. Used sparingly —
+#                       most apparent instances are better served by a UNIQUE constraint plus
+#                       catching the violation, which is what the create paths do (a UNIQUE index
+#                       is a stronger guarantee than any lock this code could take, since it also
+#                       holds against writers that never run this code).
+#
+# The check-slug-then-INSERT paths (ServerRepo.create, ProjectRepo.create, UserRepo.create) are
+# the subtlest: the pre-flight SELECT is kept for a clean, typed error on the common case, but it
+# is NO LONGER what makes the operation correct. The UNIQUE constraint is, and each of those
+# methods now catches asyncpg.UniqueViolationError and converts it to the same conflict exception
+# the pre-flight check raises — so the loser of a true race gets the identical error shape rather
+# than an unhandled 500. Race coverage: tests/integration/test_postgres_races.py.
+# ──────────────────────────────────────────────────────────────────────────────────────────────
 
 
 # Enterprise #10 (DLP): dlp_detectors + dlp_custom_patterns are stored as ONE JSON TEXT column
@@ -83,7 +130,15 @@ class ProjectSlugConflictError(Exception):
     pass
 
 
-def _row_to_server(row: aiosqlite.Row) -> ServerRecord:
+def _row_to_server(row: asyncpg.Record) -> ServerRecord:
+    # The `if "x" in row.keys()` guards the SQLite version carried on health_reason/project_id
+    # are gone: they defended against reading a row from a database where a later ALTER TABLE
+    # hadn't run yet, which was reachable because some tests built bare connections against a
+    # partially-migrated schema. Post-cutover every connection goes through Database.connect(),
+    # which applies the full migration set before handing back a pool, so these columns always
+    # exist. asyncpg.Record supports `in` via its keys() the same way, so the guard could have
+    # been kept — dropped deliberately, because it silently masked "you're talking to an
+    # unmigrated database" as "this field is None".
     return ServerRecord(
         id=row["id"],
         slug=row["slug"],
@@ -93,17 +148,17 @@ def _row_to_server(row: aiosqlite.Row) -> ServerRecord:
         in_aggregate=bool(row["in_aggregate"]),
         upstream_protocol=row["upstream_protocol"],
         health_status=row["health_status"],
-        health_reason=row["health_reason"] if "health_reason" in row.keys() else None,
+        health_reason=row["health_reason"],
         last_seen_at=row["last_seen_at"],
         discover_json=row["discover_json"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         upstream_auth_header=row["upstream_auth_header"],
-        project_id=row["project_id"] if "project_id" in row.keys() else None,
+        project_id=row["project_id"],
     )
 
 
-async def _default_project_id(conn: aiosqlite.Connection) -> Optional[int]:
+async def _default_project_id(conn: asyncpg.Connection) -> Optional[int]:
     """Enterprise #4: resolves the backfilled 'default' project's id, used by ServerRepo.create/
     ApiKeyRepo.create as the fallback when a caller passes project_id=None (or omits it) —
     NOT left as a literal NULL row. Every server/key created through the real control-plane API
@@ -115,45 +170,50 @@ async def _default_project_id(conn: aiosqlite.Connection) -> Optional[int]:
     project limbo that every project-scoping filter (and the pipeline's key/server agreement
     check) would then treat as "belongs to no project" and silently exclude/refuse.
 
-    Returns None only if 'default' itself doesn't exist yet (unreachable post-migration on any
-    real database — 0011_projects.sql always creates it — but reachable in a throwaway
-    connection built directly against a fresh, unmigrated schema, e.g. some unit tests that
-    construct a bare aiosqlite connection without going through Database.connect()); callers
-    treat that None exactly like an explicitly-passed None, i.e. the row's project_id stays NULL,
-    consistent with this migration's own fail-closed discipline rather than raising.
+    Returns None only if 'default' itself doesn't exist yet — unreachable post-migration on any
+    real database, since 0010_projects.sql always creates it. Callers treat that None exactly
+    like an explicitly-passed None, i.e. the row's project_id stays NULL, consistent with the
+    migration's own fail-closed discipline rather than raising.
+
+    The pre-cutover version also caught aiosqlite.OperationalError here, to survive being handed a
+    connection whose schema predated the projects migration. That branch is dropped: every
+    connection now comes from a pool built by Database.connect(), which applies migrations before
+    returning, so a missing `projects` table means something is genuinely wrong and should
+    surface rather than be silently absorbed into a NULL project_id.
     """
-    try:
-        cur = await conn.execute("SELECT id FROM projects WHERE slug = 'default'")
-        row = await cur.fetchone()
-    except aiosqlite.OperationalError:
-        # `projects` table doesn't exist at all yet (pre-0011 schema) — same "no default to fall
-        # back to" outcome as the row-not-found case above.
-        return None
-    return row[0] if row else None
+    return await conn.fetchval("SELECT id FROM projects WHERE slug = 'default'")
 
 
-class ServerRepo:
-    """CRUD for `servers` + their attached `server_policies` / `tool_policies` / `param_rules`.
+class _PoolAccess:
+    """Shared pool accessors for every repo in this module.
 
-    F7: reads and writes go through SEPARATE connections (see Database's docstring) — writes
-    additionally serialize through `gateway_write_lock` and use an explicit transaction so a
-    multi-statement write (create, set_policy) is atomic from every reader's perspective, not
-    just readable-or-not on the writer's own connection."""
+    Replaces the per-repo `_read`/`_write` properties that each returned one of Database's three
+    long-lived aiosqlite connections (and re-set `row_factory` on every access). Reads acquire
+    from the reader pool, writes from the writer pool; both are async context managers, so a
+    connection is ALWAYS returned to its pool on the way out, including on an exception path —
+    which the old shared-connection model had no notion of, because nothing was ever acquired or
+    released in the first place.
+    """
 
     def __init__(self, db: Database):
         self._db = db
 
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
+    def _read(self):
+        assert self._db.reader is not None, "Database.connect() not awaited"
+        return self._db.reader.acquire()
 
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
+    def _write(self):
+        assert self._db.writer is not None, "Database.connect() not awaited"
+        return self._db.writer.acquire()
+
+
+class ServerRepo(_PoolAccess):
+    """CRUD for `servers` + their attached `server_policies` / `tool_policies` / `param_rules`.
+
+    Reads come from the reader pool, writes from the writer pool. Multi-statement writes (create,
+    set_policy) run in an explicit transaction so they are atomic and never observable
+    half-applied — under SQLite that required the dedicated-writer-connection + WAL arrangement
+    the old Database docstring described; under Postgres it is what a transaction already means."""
 
     async def list(self, project_id: Optional[int] = None) -> list[ServerRecord]:
         # F4 fix (review 2026-08-04): defense-in-depth half. The CREATE path now validates the
@@ -169,13 +229,13 @@ class ServerRepo:
         # Enterprise #4: `project_id=None` means "no project filter" (every existing caller pre-
         # this-feature, and every instance-wide use like the health poller) — NOT "servers with
         # no project". Pass a real project id explicitly to scope.
-        if project_id is not None:
-            cur = await self._read.execute(
-                "SELECT * FROM servers WHERE project_id = ? ORDER BY slug", (project_id,)
-            )
-        else:
-            cur = await self._read.execute("SELECT * FROM servers ORDER BY slug")
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            if project_id is not None:
+                rows = await conn.fetch(
+                    "SELECT * FROM servers WHERE project_id = $1 ORDER BY slug", project_id
+                )
+            else:
+                rows = await conn.fetch("SELECT * FROM servers ORDER BY slug")
         result = []
         for r in rows:
             try:
@@ -187,15 +247,15 @@ class ServerRepo:
         return result
 
     async def get(self, slug: str) -> ServerRecord:
-        cur = await self._read.execute("SELECT * FROM servers WHERE slug = ?", (slug,))
-        row = await cur.fetchone()
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM servers WHERE slug = $1", slug)
         if row is None:
             raise ServerNotFoundError(slug)
         return _row_to_server(row)
 
     async def get_by_id(self, server_id: int) -> ServerRecord:
-        cur = await self._read.execute("SELECT * FROM servers WHERE id = ?", (server_id,))
-        row = await cur.fetchone()
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM servers WHERE id = $1", server_id)
         if row is None:
             raise ServerNotFoundError(str(server_id))
         return _row_to_server(row)
@@ -210,38 +270,54 @@ class ServerRepo:
         upstream_auth_header: Optional[str] = None,
         project_id: Optional[int] = None,
     ) -> ServerRecord:
-        # F7: two-table write (servers + server_policies) — serialize against other gateway.db
-        # writers so a concurrent commit can't land between the INSERT and its paired policy row.
-        async with self._db.gateway_write_lock:
-            existing = await self._write.execute("SELECT 1 FROM servers WHERE slug = ?", (slug,))
-            if await existing.fetchone() is not None:
-                raise SlugConflictError(slug)
+        # [TRANSACTION + UNIQUE-violation catch] replaces gateway_write_lock.
+        #
+        # Two things were tangled together under the old lock. The two-table write (servers +
+        # its paired server_policies row) needed atomicity — that is the transaction below, and
+        # it is a straight translation.
+        #
+        # The check-slug-then-INSERT was the actual TOCTOU risk, and a lock is the WRONG fix for
+        # it even in principle: an asyncio.Lock only excludes other coroutines in THIS process,
+        # so it never protected against a second replica (the thing this whole cutover exists to
+        # enable). The pre-flight SELECT is kept because it produces a clean typed error for the
+        # overwhelmingly common non-racing case without burning a failed INSERT, but it is no
+        # longer what makes this correct. `servers.slug UNIQUE` is. The loser of a genuine race
+        # gets asyncpg.UniqueViolationError from the INSERT, which is converted to the SAME
+        # SlugConflictError the pre-flight check raises — so callers see one error shape whether
+        # they lost the race or never entered it. Covered by
+        # tests/integration/test_postgres_races.py::TestServerCreateRace.
+        async with self._write() as conn:
+            async with conn.transaction():
+                if await conn.fetchval("SELECT 1 FROM servers WHERE slug = $1", slug):
+                    raise SlugConflictError(slug)
 
-            # Enterprise #4: project_id=None (the default, and every pre-projects caller's
-            # implicit choice) resolves to the 'default' project rather than staying NULL — see
-            # _default_project_id's docstring for why this must not be a literal NULL row.
-            if project_id is None:
-                project_id = await _default_project_id(self._write)
+                # Enterprise #4: project_id=None (the default, and every pre-projects caller's
+                # implicit choice) resolves to the 'default' project rather than staying NULL —
+                # see _default_project_id's docstring for why this must not be a NULL row.
+                if project_id is None:
+                    project_id = await _default_project_id(conn)
 
-            await self._write.execute("BEGIN IMMEDIATE")
-            try:
                 now = utcnow()
-                cur = await self._write.execute(
-                    """INSERT INTO servers
-                       (slug, name, upstream_url, enabled, in_aggregate, upstream_auth_header,
-                        created_at, updated_at, project_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (slug, name, upstream_url, int(enabled), int(in_aggregate),
-                     upstream_auth_header, now, now, project_id),
+                try:
+                    server_id = await conn.fetchval(
+                        """INSERT INTO servers
+                           (slug, name, upstream_url, enabled, in_aggregate, upstream_auth_header,
+                            created_at, updated_at, project_id)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                           RETURNING id""",
+                        slug, name, upstream_url, enabled, in_aggregate,
+                        upstream_auth_header, now, now, project_id,
+                    )
+                except asyncpg.UniqueViolationError as e:
+                    raise SlugConflictError(slug) from e
+                # RETURNING id replaces cur.lastrowid, which asyncpg has no equivalent for —
+                # and which was never safe under concurrency anyway (it read a connection-wide
+                # "last inserted rowid", not this statement's).
+                await conn.execute(
+                    "INSERT INTO server_policies (server_id, mode, updated_at) "
+                    "VALUES ($1, 'passthrough', $2)",
+                    server_id, now,
                 )
-                await self._write.execute(
-                    "INSERT INTO server_policies (server_id, mode, updated_at) VALUES (?, 'passthrough', ?)",
-                    (cur.lastrowid, now),
-                )
-                await self._write.commit()
-            except BaseException:
-                await self._write.rollback()
-                raise
         return await self.get(slug)
 
     async def update(
@@ -254,41 +330,53 @@ class ServerRepo:
         upstream_auth_header: object = _UNSET,
     ) -> ServerRecord:
         current = await self.get(slug)
+        # Placeholders are generated positionally ($1, $2, ...) rather than as literal "?"s. The
+        # field NAMES are still hardcoded string literals in this function — never caller input —
+        # so this stays parameterized: values only ever reach the database as bound parameters.
         fields, values = [], []
+
+        def _next(column: str, value) -> None:
+            values.append(value)
+            fields.append(f"{column} = ${len(values)}")
+
         if name is not None:
-            fields.append("name = ?")
-            values.append(name)
+            _next("name", name)
         if upstream_url is not None:
-            fields.append("upstream_url = ?")
-            values.append(upstream_url)
+            _next("upstream_url", upstream_url)
         if enabled is not None:
-            fields.append("enabled = ?")
-            values.append(int(enabled))
+            _next("enabled", enabled)
         if in_aggregate is not None:
-            fields.append("in_aggregate = ?")
-            values.append(int(in_aggregate))
+            _next("in_aggregate", in_aggregate)
         if upstream_auth_header is not _UNSET:
             # F23: unlike the other fields, None here is meaningful ("clear the configured
             # credential"), so a sentinel distinguishes "field omitted, don't touch it" from
             # "field explicitly set to null" — the None-means-omitted convention every other
             # field on this method uses would make it impossible to ever clear a credential.
-            fields.append("upstream_auth_header = ?")
-            values.append(upstream_auth_header)
+            _next("upstream_auth_header", upstream_auth_header)
         if not fields:
             return current
-        fields.append("updated_at = ?")
-        values.append(utcnow())
+        _next("updated_at", utcnow())
         values.append(current.id)
-        async with self._db.gateway_write_lock:
-            await self._write.execute(f"UPDATE servers SET {', '.join(fields)} WHERE id = ?", values)
-            await self._write.commit()
+        # [SINGLE-STATEMENT] replaces gateway_write_lock. One UPDATE against one row, no
+        # read-then-write inside the write itself — Postgres makes it atomic on its own, and the
+        # row-level lock it takes is exactly as much serialization as this needs. (The get() above
+        # is a read for the caller's return value and for the not-found check, not a value this
+        # UPDATE derives from — every SET here is a caller-supplied constant, so there is no
+        # lost-update hazard for a lock to protect against.)
+        async with self._write() as conn:
+            await conn.execute(
+                f"UPDATE servers SET {', '.join(fields)} WHERE id = ${len(values)}", *values
+            )
         return await self.get(slug)
 
     async def delete(self, slug: str) -> None:
         current = await self.get(slug)
-        async with self._db.gateway_write_lock:
-            await self._write.execute("DELETE FROM servers WHERE id = ?", (current.id,))
-            await self._write.commit()
+        # [SINGLE-STATEMENT] replaces gateway_write_lock. ON DELETE CASCADE on server_policies /
+        # tool_policies / param_rules / tools_cache means this one statement is the whole write;
+        # the cascade runs inside its implicit transaction, so there is no window where a server
+        # is gone but its policy rows survive.
+        async with self._write() as conn:
+            await conn.execute("DELETE FROM servers WHERE id = $1", current.id)
 
     async def set_project(self, slug: str, project_id: int) -> ServerRecord:
         """Enterprise #4: reassign an EXISTING server to a different project. Deliberately a
@@ -298,57 +386,73 @@ class ServerRepo:
         ambiguity (unlike upstream_auth_header, "don't reassign" here is simply "don't call
         this method" — there's no legitimate "clear the project" operation)."""
         current = await self.get(slug)
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                "UPDATE servers SET project_id = ?, updated_at = ? WHERE id = ?",
-                (project_id, utcnow(), current.id),
+        # [SINGLE-STATEMENT] replaces gateway_write_lock — one UPDATE, caller-supplied value.
+        async with self._write() as conn:
+            await conn.execute(
+                "UPDATE servers SET project_id = $1, updated_at = $2 WHERE id = $3",
+                project_id, utcnow(), current.id,
             )
-            await self._write.commit()
         return await self.get(slug)
 
     async def set_health(
         self, slug: str, health_status: str, upstream_protocol: Optional[str] = None,
         discover_json: Optional[str] = None, health_reason: Optional[str] = None,
     ) -> None:
-        # Enterprise #5: health_reason is NOT COALESCE'd like upstream_protocol/discover_json
-        # above — it must be overwritten with exactly what THIS probe found (None when the
-        # cause wasn't a secret-resolution failure), or a stale reason from a previous failed
-        # probe would keep showing after the server recovers or the cause changes to a plain
-        # network outage.
+        # Enterprise #5: health_reason is NOT COALESCE'd like upstream_protocol/discover_json —
+        # it must be overwritten with exactly what THIS probe found (None when the cause wasn't a
+        # secret-resolution failure), or a stale reason from a previous failed probe would keep
+        # showing after the server recovers or the cause changes to a plain network outage.
+        #
+        # [ATOMIC-RMW] replaces gateway_write_lock. The COALESCE(?, column) form makes this a
+        # read-modify-write — upstream_protocol/discover_json keep their STORED value when the
+        # probe passes None. Expressing it as one statement (rather than SELECT-then-UPDATE) is
+        # what makes it race-free: the read of the old value happens inside the same statement
+        # that writes the new one, under the row lock Postgres takes for the UPDATE, so two
+        # concurrent health probes cannot interleave a read and a write. This shape was already
+        # correct pre-cutover; removing the lock around it changes nothing about its atomicity.
+        # Covered by tests/integration/test_postgres_races.py::TestHealthWriteRace.
         current = await self.get(slug)
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                """UPDATE servers SET health_status = ?, upstream_protocol = COALESCE(?, upstream_protocol),
-                   discover_json = COALESCE(?, discover_json), health_reason = ?,
-                   last_seen_at = ?, updated_at = ?
-                   WHERE id = ?""",
-                (health_status, upstream_protocol, discover_json, health_reason,
-                 utcnow(), utcnow(), current.id),
+        now = utcnow()
+        async with self._write() as conn:
+            await conn.execute(
+                """UPDATE servers SET health_status = $1,
+                   upstream_protocol = COALESCE($2, upstream_protocol),
+                   discover_json = COALESCE($3, discover_json), health_reason = $4,
+                   last_seen_at = $5, updated_at = $6
+                   WHERE id = $7""",
+                health_status, upstream_protocol, discover_json, health_reason,
+                now, now, current.id,
             )
-            await self._write.commit()
 
     async def get_policy(self, server_id: int) -> ServerPolicy:
-        cur = await self._read.execute(
-            "SELECT mode, rate_limit, dlp_config FROM server_policies WHERE server_id = ?", (server_id,)
-        )
-        row = await cur.fetchone()
-        mode = row["mode"] if row else "passthrough"
-        rate_limit = row["rate_limit"] if row else None
-        dlp_detectors, dlp_custom_patterns = _decode_dlp_config(row["dlp_config"] if row else None)
+        # All three reads share ONE pooled connection. Under SQLite they shared the single
+        # long-lived reader connection by construction; holding one connection for the method
+        # keeps that property (and keeps the three reads on a consistent view of the database
+        # under Postgres' default READ COMMITTED, rather than potentially spanning a concurrent
+        # set_policy commit if each read grabbed a different pooled connection).
+        async with self._read() as conn:
+            row = await conn.fetchrow(
+                "SELECT mode, rate_limit, dlp_config FROM server_policies WHERE server_id = $1",
+                server_id,
+            )
+            mode = row["mode"] if row else "passthrough"
+            rate_limit = row["rate_limit"] if row else None
+            dlp_detectors, dlp_custom_patterns = _decode_dlp_config(
+                row["dlp_config"] if row else None
+            )
 
-        cur = await self._read.execute(
-            "SELECT tool_name, action FROM tool_policies WHERE server_id = ?", (server_id,)
-        )
-        rows = await cur.fetchall()
-        allowed = [r["tool_name"] for r in rows if r["action"] == "allow"]
-        denied = [r["tool_name"] for r in rows if r["action"] == "deny"]
+            rows = await conn.fetch(
+                "SELECT tool_name, action FROM tool_policies WHERE server_id = $1", server_id
+            )
+            allowed = [r["tool_name"] for r in rows if r["action"] == "allow"]
+            denied = [r["tool_name"] for r in rows if r["action"] == "deny"]
 
-        cur = await self._read.execute(
-            """SELECT tool_name, param_name, max_length, max_value, min_value, denied, block_patterns
-               FROM param_rules WHERE server_id = ?""",
-            (server_id,),
-        )
-        rows = await cur.fetchall()
+            rows = await conn.fetch(
+                """SELECT tool_name, param_name, max_length, max_value, min_value, denied,
+                          block_patterns
+                   FROM param_rules WHERE server_id = $1""",
+                server_id,
+            )
         param_rules: dict[str, dict[str, ParamRule]] = {}
         for r in rows:
             param_rules.setdefault(r["tool_name"], {})[r["param_name"]] = ParamRule(
@@ -370,33 +474,42 @@ class ServerRepo:
         a loop — 3N queries for N registered servers. One query per table with
         `WHERE server_id IN (...)`, grouped in Python, returns the same data in 3 queries
         total regardless of how many servers are being fetched. Servers with no policy row yet
-        get the same passthrough/no-rate-limit default get_policy() returns."""
+        get the same passthrough/no-rate-limit default get_policy() returns.
+
+        Postgres port: the three `IN (...)` clauses became `= ANY($1)` with the id list bound as
+        a single array parameter, replacing the f-string-built `?,?,?` placeholder run. Besides
+        being cleaner, this removes the only place in this module that interpolated a
+        caller-length-dependent fragment into SQL text, and it lets these three statements share
+        one prepared-statement plan regardless of how many servers are being fetched."""
         if not server_ids:
             return {}
-        placeholders = ",".join("?" for _ in server_ids)
 
-        cur = await self._read.execute(
-            f"SELECT server_id, mode, rate_limit, dlp_config FROM server_policies WHERE server_id IN ({placeholders})",
-            server_ids,
-        )
-        policy_rows = {r["server_id"]: r for r in await cur.fetchall()}
+        async with self._read() as conn:
+            rows = await conn.fetch(
+                "SELECT server_id, mode, rate_limit, dlp_config FROM server_policies "
+                "WHERE server_id = ANY($1)",
+                server_ids,
+            )
+            policy_rows = {r["server_id"]: r for r in rows}
 
-        cur = await self._read.execute(
-            f"SELECT server_id, tool_name, action FROM tool_policies WHERE server_id IN ({placeholders})",
-            server_ids,
-        )
+            tool_rows = await conn.fetch(
+                "SELECT server_id, tool_name, action FROM tool_policies WHERE server_id = ANY($1)",
+                server_ids,
+            )
+            param_rows = await conn.fetch(
+                """SELECT server_id, tool_name, param_name, max_length, max_value, min_value,
+                          denied, block_patterns
+                   FROM param_rules WHERE server_id = ANY($1)""",
+                server_ids,
+            )
+
         allowed_by_id: dict[int, list[str]] = {sid: [] for sid in server_ids}
         denied_by_id: dict[int, list[str]] = {sid: [] for sid in server_ids}
-        for r in await cur.fetchall():
+        for r in tool_rows:
             (allowed_by_id if r["action"] == "allow" else denied_by_id)[r["server_id"]].append(r["tool_name"])
 
-        cur = await self._read.execute(
-            f"""SELECT server_id, tool_name, param_name, max_length, max_value, min_value, denied, block_patterns
-                FROM param_rules WHERE server_id IN ({placeholders})""",
-            server_ids,
-        )
         param_rules_by_id: dict[int, dict[str, dict[str, ParamRule]]] = {sid: {} for sid in server_ids}
-        for r in await cur.fetchall():
+        for r in param_rows:
             param_rules_by_id[r["server_id"]].setdefault(r["tool_name"], {})[r["param_name"]] = ParamRule(
                 max_length=r["max_length"],
                 max_value=r["max_value"],
@@ -421,75 +534,86 @@ class ServerRepo:
         return result
 
     async def set_policy(self, server_id: int, policy: ServerPolicy) -> None:
-        # F7: this is the exact multi-statement write (DELETE-then-reinsert across three
-        # tables) that motivated the read/write connection split — see Database's docstring.
-        # Readers use a SEPARATE WAL connection, so they only ever see the state before this
-        # BEGIN IMMEDIATE or after this COMMIT — never the gap in between.
-        async with self._db.gateway_write_lock:
-            await self._write.execute("BEGIN IMMEDIATE")
-            try:
-                dlp_config_json = _encode_dlp_config(policy.dlp_detectors, policy.dlp_custom_patterns)
-                await self._write.execute(
+        # [TRANSACTION] replaces gateway_write_lock. This is THE method the old F7 machinery
+        # existed for — a DELETE-then-reinsert across three tables, where a reader catching the
+        # gap would see an EMPTY denylist and the gateway would transiently fail open on every
+        # policy save. SQLite could only prevent that with a dedicated writer connection, WAL
+        # mode, and a process-wide lock; Postgres prevents it with the word "transaction". No
+        # reader on any connection, in any process, can observe a state between this BEGIN and
+        # COMMIT.
+        #
+        # The explicit rollback-on-BaseException is gone because conn.transaction() is a context
+        # manager that rolls back on ANY exception (including CancelledError) by construction —
+        # the hand-rolled try/except/rollback it replaces existed only because aiosqlite has no
+        # such context manager.
+        #
+        # Also note the ON CONFLICT clause needed no dialect change: SQLite borrowed upsert
+        # syntax from Postgres, so `ON CONFLICT (col) DO UPDATE SET x = excluded.x` is already
+        # native here. Only the placeholders changed.
+        # Covered by tests/integration/test_postgres_races.py::TestPolicyWriteRace, which asserts
+        # a concurrent reader NEVER observes a partially-applied policy.
+        dlp_config_json = _encode_dlp_config(policy.dlp_detectors, policy.dlp_custom_patterns)
+        async with self._write() as conn:
+            async with conn.transaction():
+                await conn.execute(
                     """INSERT INTO server_policies (server_id, mode, rate_limit, dlp_config, updated_at)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(server_id) DO UPDATE SET mode=excluded.mode,
-                           rate_limit=excluded.rate_limit, dlp_config=excluded.dlp_config,
-                           updated_at=excluded.updated_at""",
-                    (server_id, policy.mode, policy.rate_limit, dlp_config_json, utcnow()),
+                       VALUES ($1, $2, $3, $4, $5)
+                       ON CONFLICT (server_id) DO UPDATE SET mode = excluded.mode,
+                           rate_limit = excluded.rate_limit, dlp_config = excluded.dlp_config,
+                           updated_at = excluded.updated_at""",
+                    server_id, policy.mode, policy.rate_limit, dlp_config_json, utcnow(),
                 )
-                await self._write.execute("DELETE FROM tool_policies WHERE server_id = ?", (server_id,))
-                for tool_name in policy.allowed:
-                    await self._write.execute(
-                        "INSERT INTO tool_policies (server_id, tool_name, action) VALUES (?, ?, 'allow')",
-                        (server_id, tool_name),
+                await conn.execute("DELETE FROM tool_policies WHERE server_id = $1", server_id)
+                # executemany replaces the per-row await loops — one round-trip per table instead
+                # of one per tool, inside the same transaction.
+                if policy.allowed:
+                    await conn.executemany(
+                        "INSERT INTO tool_policies (server_id, tool_name, action) "
+                        "VALUES ($1, $2, 'allow')",
+                        [(server_id, t) for t in policy.allowed],
                     )
-                for tool_name in policy.denied:
-                    await self._write.execute(
-                        "INSERT INTO tool_policies (server_id, tool_name, action) VALUES (?, ?, 'deny')",
-                        (server_id, tool_name),
+                if policy.denied:
+                    await conn.executemany(
+                        "INSERT INTO tool_policies (server_id, tool_name, action) "
+                        "VALUES ($1, $2, 'deny')",
+                        [(server_id, t) for t in policy.denied],
                     )
-                await self._write.execute("DELETE FROM param_rules WHERE server_id = ?", (server_id,))
-                for tool_name, params in policy.param_rules.items():
-                    for param_name, rule in params.items():
-                        await self._write.execute(
-                            """INSERT INTO param_rules
-                               (server_id, tool_name, param_name, max_length, max_value, min_value, denied, block_patterns)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                server_id, tool_name, param_name, rule.max_length, rule.max_value,
-                                rule.min_value, int(rule.denied), json.dumps(rule.block_patterns),
-                            ),
-                        )
-                await self._write.commit()
-            except BaseException:
-                await self._write.rollback()
-                raise
+                await conn.execute("DELETE FROM param_rules WHERE server_id = $1", server_id)
+                param_rows = [
+                    (server_id, tool_name, param_name, rule.max_length, rule.max_value,
+                     rule.min_value, rule.denied, json.dumps(rule.block_patterns))
+                    for tool_name, params in policy.param_rules.items()
+                    for param_name, rule in params.items()
+                ]
+                if param_rows:
+                    await conn.executemany(
+                        """INSERT INTO param_rules
+                           (server_id, tool_name, param_name, max_length, max_value, min_value,
+                            denied, block_patterns)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+                        param_rows,
+                    )
 
 
-class ApiKeyRepo:
+class ApiKeyRepo(_PoolAccess):
     # F7: touch_last_used used to commit() on every authenticated data-plane request — a
     # gratuitous disk write on its own, and the specific trigger that made set_policy's
-    # DELETE-then-reinsert race real (see Database's docstring). Debounced in-process rather
-    # than removed outright, since "last used" is still useful for an operator auditing which
-    # keys are stale — freshness within this window is a fine trade for not writing on every
-    # single proxied call.
+    # DELETE-then-reinsert race real (see the pre-cutover Database docstring). Debounced
+    # in-process rather than removed outright, since "last used" is still useful for an operator
+    # auditing which keys are stale — freshness within this window is a fine trade for not
+    # writing on every single proxied call.
+    #
+    # Kept post-cutover even though the race it was tuned for is gone: the debounce's OTHER
+    # justification (don't issue a write per proxied request) is, if anything, stronger against a
+    # networked database than against a local file, since every write is now a round-trip. Note
+    # the debounce is per-PROCESS state (`_last_touch`), so N replicas can each write once per
+    # window rather than once globally — acceptable for an advisory "last used" timestamp, and
+    # called out here so it isn't mistaken for a correctness guarantee.
     _TOUCH_DEBOUNCE_SECONDS = 60
 
     def __init__(self, db: Database):
-        self._db = db
+        super().__init__(db)
         self._last_touch: dict[int, float] = {}
-
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
-
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
 
     async def create(self, name: str, key_hash: str, key_prefix: str,
                       server_scopes: Optional[list[str]] = None,
@@ -497,68 +621,79 @@ class ApiKeyRepo:
                       quota_period: Optional[str] = None,
                       project_id: Optional[int] = None) -> ApiKeyRecord:
         now = utcnow()
-        async with self._db.gateway_write_lock:
-            # Enterprise #4: same 'default'-project fallback as ServerRepo.create — see
-            # _default_project_id's docstring.
-            if project_id is None:
-                project_id = await _default_project_id(self._write)
-            cur = await self._write.execute(
-                """INSERT INTO api_keys
-                   (name, key_hash, key_prefix, server_scopes, created_at, quota_calls, quota_period,
-                    project_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (name, key_hash, key_prefix, json.dumps(server_scopes) if server_scopes else None, now,
-                 quota_calls, quota_period, project_id),
-            )
-            await self._write.commit()
-        return await self.get_by_id(cur.lastrowid)
+        # [TRANSACTION] replaces gateway_write_lock. Two statements when project_id must be
+        # resolved (SELECT default project, then INSERT) — wrapped so the resolved project can't
+        # be deleted between the lookup and the insert (the FK would then reject the INSERT, but
+        # inside one transaction the read sees a consistent snapshot and the FK check is against
+        # the same one). RETURNING id replaces cur.lastrowid.
+        async with self._write() as conn:
+            async with conn.transaction():
+                # Enterprise #4: same 'default'-project fallback as ServerRepo.create — see
+                # _default_project_id's docstring.
+                if project_id is None:
+                    project_id = await _default_project_id(conn)
+                key_id = await conn.fetchval(
+                    """INSERT INTO api_keys
+                       (name, key_hash, key_prefix, server_scopes, created_at, quota_calls,
+                        quota_period, project_id)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                       RETURNING id""",
+                    name, key_hash, key_prefix,
+                    json.dumps(server_scopes) if server_scopes else None, now,
+                    quota_calls, quota_period, project_id,
+                )
+        return await self.get_by_id(key_id)
 
     async def get_by_id(self, key_id: int) -> ApiKeyRecord:
-        cur = await self._read.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,))
-        row = await cur.fetchone()
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM api_keys WHERE id = $1", key_id)
         if row is None:
             raise ServerNotFoundError(str(key_id))
         return self._row_to_record(row)
 
     async def get_by_hash(self, key_hash: str) -> Optional[ApiKeyRecord]:
-        cur = await self._read.execute(
-            "SELECT * FROM api_keys WHERE key_hash = ? AND enabled = 1", (key_hash,)
-        )
-        row = await cur.fetchone()
+        # `enabled = 1` became `enabled IS TRUE` — the column is a real BOOLEAN now, and Postgres
+        # will not implicitly compare boolean to integer.
+        async with self._read() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM api_keys WHERE key_hash = $1 AND enabled IS TRUE", key_hash
+            )
         return self._row_to_record(row) if row else None
 
     async def list(self, project_id: Optional[int] = None) -> list[ApiKeyRecord]:
         # Enterprise #4: same None-means-unfiltered convention as ServerRepo.list.
-        if project_id is not None:
-            cur = await self._read.execute(
-                "SELECT * FROM api_keys WHERE project_id = ? ORDER BY created_at DESC", (project_id,)
-            )
-        else:
-            cur = await self._read.execute("SELECT * FROM api_keys ORDER BY created_at DESC")
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            if project_id is not None:
+                rows = await conn.fetch(
+                    "SELECT * FROM api_keys WHERE project_id = $1 ORDER BY created_at DESC",
+                    project_id,
+                )
+            else:
+                rows = await conn.fetch("SELECT * FROM api_keys ORDER BY created_at DESC")
         return [self._row_to_record(r) for r in rows]
 
     async def set_enabled(self, key_id: int, enabled: bool) -> None:
-        async with self._db.gateway_write_lock:
-            await self._write.execute("UPDATE api_keys SET enabled = ? WHERE id = ?", (int(enabled), key_id))
-            await self._write.commit()
+        # [SINGLE-STATEMENT] replaces gateway_write_lock.
+        async with self._write() as conn:
+            await conn.execute("UPDATE api_keys SET enabled = $1 WHERE id = $2", enabled, key_id)
 
     async def set_quota(self, key_id: int, quota_calls: Optional[int], quota_period: Optional[str]) -> None:
         """Both fields are written together, always — a NULL quota_calls with a non-NULL
         quota_period (or vice versa) is a nonsensical half-state, so there is no partial-update
         path here the way ServerRepo.update has per-field optionality. Callers (the PATCH
         /keys/{id} route) pass both, always, even when clearing (None, None)."""
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                "UPDATE api_keys SET quota_calls = ?, quota_period = ? WHERE id = ?",
-                (quota_calls, quota_period, key_id),
+        # [SINGLE-STATEMENT] replaces gateway_write_lock. Both columns in one UPDATE, which is
+        # what makes the "never a half-state" property above hold — it was never the lock.
+        async with self._write() as conn:
+            await conn.execute(
+                "UPDATE api_keys SET quota_calls = $1, quota_period = $2 WHERE id = $3",
+                quota_calls, quota_period, key_id,
             )
-            await self._write.commit()
 
     async def delete(self, key_id: int) -> None:
-        async with self._db.gateway_write_lock:
-            await self._write.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
-            await self._write.commit()
+        # [SINGLE-STATEMENT] replaces gateway_write_lock.
+        async with self._write() as conn:
+            await conn.execute("DELETE FROM api_keys WHERE id = $1", key_id)
 
     async def touch_last_used(self, key_id: int) -> None:
         now = time.monotonic()
@@ -566,14 +701,15 @@ class ApiKeyRepo:
         if last is not None and (now - last) < self._TOUCH_DEBOUNCE_SECONDS:
             return
         self._last_touch[key_id] = now
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                "UPDATE api_keys SET last_used_at = ? WHERE id = ?", (utcnow(), key_id)
+        # [SINGLE-STATEMENT] replaces gateway_write_lock. Last-writer-wins on a purely advisory
+        # timestamp; concurrent touches racing is not a correctness problem (and never was).
+        async with self._write() as conn:
+            await conn.execute(
+                "UPDATE api_keys SET last_used_at = $1 WHERE id = $2", utcnow(), key_id
             )
-            await self._write.commit()
 
     @staticmethod
-    def _row_to_record(row: aiosqlite.Row) -> ApiKeyRecord:
+    def _row_to_record(row: asyncpg.Record) -> ApiKeyRecord:
         return ApiKeyRecord(
             id=row["id"],
             name=row["name"],
@@ -582,36 +718,52 @@ class ApiKeyRepo:
             server_scopes=json.loads(row["server_scopes"]) if row["server_scopes"] else None,
             created_at=row["created_at"],
             last_used_at=row["last_used_at"],
-            quota_calls=row["quota_calls"] if "quota_calls" in row.keys() else None,
-            quota_period=row["quota_period"] if "quota_period" in row.keys() else None,
-            project_id=row["project_id"] if "project_id" in row.keys() else None,
+            quota_calls=row["quota_calls"],
+            quota_period=row["quota_period"],
+            project_id=row["project_id"],
         )
 
 
-class AuditRepo:
-    def __init__(self, db: Database):
-        self._db = db
+class AuditRepo(_PoolAccess):
+    """The data-plane traffic log.
 
-    @property
-    def _conn(self) -> aiosqlite.Connection:
-        assert self._db.audit is not None
-        self._db.audit.row_factory = aiosqlite.Row
-        return self._db.audit
+    Post-cutover this is a TABLE in the main database rather than its own audit.db file, so it
+    uses the same reader/writer pools as every other repo instead of the third dedicated
+    connection it used to hold. See 0001_init.sql's header for the one-database decision."""
 
     async def insert_many(self, events: list[dict]) -> None:
         if not events:
             return
-        await self._conn.executemany(
-            """INSERT INTO audit_events
-               (ts, server_slug, api_key_id, client_ip, endpoint, rpc_method, tool,
-                decision, rule, matched, reason, args_summary, bridged, status_code, latency_ms,
-                origin, dlp_detector, dlp_action, dlp_match_count)
-               VALUES (:ts, :server_slug, :api_key_id, :client_ip, :endpoint, :rpc_method, :tool,
-                       :decision, :rule, :matched, :reason, :args_summary, :bridged, :status_code,
-                       :latency_ms, :origin, :dlp_detector, :dlp_action, :dlp_match_count)""",
-            events,
+        # asyncpg has no named-parameter (:name) binding — it is positional-only. The event dicts
+        # produced by AuditLogger are projected into positional tuples in a FIXED column order
+        # declared right here, so the mapping stays visible in one place rather than depending on
+        # dict ordering.
+        #
+        # `bridged` is NOT NULL DEFAULT FALSE. A column default only applies when the column is
+        # OMITTED from the INSERT — naming it and binding None is an explicit NULL, which the
+        # constraint (correctly) rejects. Since this statement names every column, an event dict
+        # that omits `bridged` would otherwise fail rather than pick up the default. Defaulted
+        # here instead, so a partial event dict behaves the way the schema promises.
+        # AuditLogger always supplies it; this covers other callers.
+        columns = (
+            "ts", "server_slug", "api_key_id", "client_ip", "endpoint", "rpc_method", "tool",
+            "decision", "rule", "matched", "reason", "args_summary", "bridged", "status_code",
+            "latency_ms", "origin", "dlp_detector", "dlp_action", "dlp_match_count",
         )
-        await self._conn.commit()
+        _defaults = {"bridged": False}
+        placeholders = ", ".join(f"${i}" for i in range(1, len(columns) + 1))
+        rows = [
+            tuple(
+                e.get(c) if e.get(c) is not None else _defaults.get(c)
+                for c in columns
+            )
+            for e in events
+        ]
+        async with self._write() as conn:
+            await conn.executemany(
+                f"INSERT INTO audit_events ({', '.join(columns)}) VALUES ({placeholders})",
+                rows,
+            )
 
     async def query(
         self, server_slug: Optional[str] = None, decision: Optional[str] = None,
@@ -633,61 +785,76 @@ class AuditRepo:
         "don't filter on origin at all" (the default, returning both normal and 'test' rows).
         A plain `Optional[str] = None` couldn't express the first case.
 
-        `server_slug_in` (enterprise #4): audit_events lives in audit.db, a SEPARATE SQLite file/
-        connection from gateway.db where servers/projects live — there is no SQL JOIN across
-        them. Project-scoped callers (archon/api.py's GET /audit etc.) resolve their project's
-        server slugs via ServerRepo.list(project_id=...) first, then pass that slug set here as
-        an `IN (...)` filter, composing with (not replacing) the single-slug `server_slug` filter
-        above. An empty list means "this project has zero servers" and must match ZERO rows, not
-        every row — handled explicitly below since `IN ()` is invalid SQL."""
+        `server_slug_in` (enterprise #4): project-scoped callers (archon/api.py's GET /audit etc.)
+        resolve their project's server slugs via ServerRepo.list(project_id=...) first, then pass
+        that slug set here as a filter, composing with (not replacing) the single-slug
+        `server_slug` filter above. An empty list means "this project has zero servers" and must
+        match ZERO rows, not every row.
+
+        NOTE: this parameter's original reason for existing was a hard SQLite limitation —
+        audit_events lived in audit.db, a separate FILE and connection from gateway.db where
+        servers/projects live, so there was literally no way to JOIN and the slug set had to be
+        resolved in Python. Post-cutover both are tables in one database and a JOIN IS now
+        possible. Deliberately NOT rewritten as a join here: the callers, their signatures, and
+        their tests are all built around the resolved-slug-set shape, and changing the query
+        strategy would be a behavioural refactor riding along inside a storage-engine cutover.
+        Recorded as a now-available simplification rather than taken, so the constraint that
+        forced this design is not mistaken for a live one."""
+        # Placeholders are numbered as clauses are appended. Every caller-supplied VALUE is a
+        # bound parameter; only fixed column-name/operator text is ever interpolated.
         clauses, params = [], []
+
+        def _p(value) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
         if server_slug:
-            clauses.append("server_slug = ?")
-            params.append(server_slug)
+            clauses.append(f"server_slug = {_p(server_slug)}")
         if server_slug_in is not None:
             if not server_slug_in:
                 # Zero servers in this project -> zero possible audit rows. `1=0` short-circuits
                 # without needing special-case Python-side handling of an empty result set.
                 clauses.append("1=0")
             else:
-                placeholders = ",".join("?" for _ in server_slug_in)
-                clauses.append(f"server_slug IN ({placeholders})")
-                params.extend(server_slug_in)
+                # `= ANY($n)` with the list bound as one array parameter, replacing the
+                # f-string-built `?,?,?` run.
+                clauses.append(f"server_slug = ANY({_p(server_slug_in)})")
         if decision:
-            clauses.append("decision = ?")
-            params.append(decision)
+            clauses.append(f"decision = {_p(decision)}")
         if tool:
-            clauses.append("tool = ?")
-            params.append(tool)
+            clauses.append(f"tool = {_p(tool)}")
         if before_id is not None:
-            clauses.append("id < ?")
-            params.append(before_id)
+            clauses.append(f"id < {_p(before_id)}")
         if api_key_id is not None:
-            clauses.append("api_key_id = ?")
-            params.append(api_key_id)
+            clauses.append(f"api_key_id = {_p(api_key_id)}")
         if after:
-            clauses.append("ts >= ?")
-            params.append(after)
+            clauses.append(f"ts >= {_p(after)}")
         if before:
-            clauses.append("ts <= ?")
-            params.append(before)
+            clauses.append(f"ts <= {_p(before)}")
         if search:
+            # `%`/`_` in the term are escaped so a literal search (e.g. "100%") isn't interpreted
+            # as a LIKE wildcard. The ESCAPE character is written as a doubled backslash in the
+            # SQL literal ('\\') because Postgres' standard_conforming_strings is on by default,
+            # making '\' a literal backslash — SQLite accepted the single-backslash spelling, and
+            # carrying it over verbatim would have made every escaped search silently wrong.
             escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             like = f"%{escaped}%"
-            clauses.append("(reason LIKE ? ESCAPE '\\' OR args_summary LIKE ? ESCAPE '\\' OR matched LIKE ? ESCAPE '\\')")
-            params.extend([like, like, like])
+            clauses.append(
+                f"(reason LIKE {_p(like)} ESCAPE '\\' "
+                f"OR args_summary LIKE {_p(like)} ESCAPE '\\' "
+                f"OR matched LIKE {_p(like)} ESCAPE '\\')"
+            )
         if origin is not _UNSET:
             if origin is None:
                 clauses.append("origin IS NULL")
             else:
-                clauses.append("origin = ?")
-                params.append(origin)
+                clauses.append(f"origin = {_p(origin)}")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
-        cur = await self._conn.execute(
-            f"SELECT * FROM audit_events {where} ORDER BY id DESC LIMIT ?", params
-        )
-        rows = await cur.fetchall()
+        limit_ph = _p(limit)
+        async with self._read() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM audit_events {where} ORDER BY id DESC LIMIT {limit_ph}", *params
+            )
         return [dict(r) for r in rows]
 
     async def count_since(
@@ -696,41 +863,61 @@ class AuditRepo:
     ) -> int:
         # Always excludes origin='test' (Try-it calls) — this backs /stats, and a dashboard
         # counter that moves every time an operator tests their own policy would be useless.
-        clauses, params = ["ts >= ?", "origin IS NULL"], [since_iso]
+        params: list = [since_iso]
+
+        def _p(value) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
+        clauses = ["ts >= $1", "origin IS NULL"]
         if decision:
-            clauses.append("decision = ?")
-            params.append(decision)
+            clauses.append(f"decision = {_p(decision)}")
         if server_slug_in is not None:
             if not server_slug_in:
                 clauses.append("1=0")
             else:
-                placeholders = ",".join("?" for _ in server_slug_in)
-                clauses.append(f"server_slug IN ({placeholders})")
-                params.extend(server_slug_in)
-        cur = await self._conn.execute(
-            f"SELECT COUNT(*) FROM audit_events WHERE {' AND '.join(clauses)}", params
-        )
-        row = await cur.fetchone()
-        return row[0] if row else 0
+                clauses.append(f"server_slug = ANY({_p(server_slug_in)})")
+        async with self._read() as conn:
+            count = await conn.fetchval(
+                f"SELECT COUNT(*) FROM audit_events WHERE {' AND '.join(clauses)}", *params
+            )
+        return count or 0
 
     async def prune_older_than(self, cutoff_iso: str, batch_size: int = 5000) -> int:
-        # §26 fix (review 2026-08-04): a single unbounded DELETE here could touch an
-        # arbitrarily large number of rows in one transaction — e.g. after retention was
-        # disabled for a while and a large backlog built up. audit.db has a single connection
-        # (AuditLogger's batched flush is its only normal writer), and a long-running DELETE
-        # transaction would block that flush loop from persisting new events for however long
-        # the DELETE takes. SQLite has no native DELETE ... LIMIT, so batch via rowid subquery
-        # instead, committing between batches so the flush loop never waits longer than one
-        # batch's worth of work.
+        # §26 fix (review 2026-08-04): a single unbounded DELETE here could touch an arbitrarily
+        # large number of rows in one transaction — e.g. after retention was disabled for a while
+        # and a large backlog built up. The original reasoning was SQLite-specific (audit.db had
+        # ONE connection, and a long DELETE would block AuditLogger's flush loop on it).
+        #
+        # That specific blocking mechanism is gone — the flush loop now uses its own pooled
+        # connection and Postgres writers don't block each other on unrelated rows. Batching is
+        # KEPT anyway, for reasons that outlive the SQLite constraint: one giant DELETE holds a
+        # correspondingly giant transaction open, which bloats WAL, defers autovacuum's ability
+        # to reclaim any of the dead tuples until it commits, and takes a long-lived lock set
+        # that a rolling upgrade or a pg_dump would then contend with. Committing per batch keeps
+        # each transaction short and lets autovacuum reclaim as it goes.
+        #
+        # Postgres HAS no `DELETE ... LIMIT` either, so the subquery form carries over — now with
+        # `ctid IN (SELECT ... LIMIT)` semantics expressed via the primary key, plus `RETURNING`
+        # to count rows (asyncpg's execute() returns a status string like "DELETE 5000" rather
+        # than a rowcount attribute).
+        #
+        # Retention no longer runs any VACUUM: reclaiming space is autovacuum's job on Postgres,
+        # not something this application should manage (design decision 5 in the plan doc).
         total_deleted = 0
         while True:
-            cur = await self._conn.execute(
-                "DELETE FROM audit_events WHERE id IN "
-                "(SELECT id FROM audit_events WHERE ts < ? LIMIT ?)",
-                (cutoff_iso, batch_size),
-            )
-            await self._conn.commit()
-            deleted = cur.rowcount if cur.rowcount is not None else 0
+            async with self._write() as conn:
+                deleted = await conn.fetchval(
+                    """WITH doomed AS (
+                           SELECT id FROM audit_events WHERE ts < $1 ORDER BY id LIMIT $2
+                       ), removed AS (
+                           DELETE FROM audit_events WHERE id IN (SELECT id FROM doomed)
+                           RETURNING 1
+                       )
+                       SELECT count(*) FROM removed""",
+                    cutoff_iso, batch_size,
+                )
+            deleted = deleted or 0
             total_deleted += deleted
             if deleted < batch_size:
                 break
@@ -782,13 +969,13 @@ def _to_tool_sentinel(tool: Optional[str]) -> str:
     return tool if tool is not None else _NO_TOOL
 
 
-class UsageRepo:
+class UsageRepo(_PoolAccess):
     """Enterprise #11 (quotas + usage attribution): durable call-count rollups, one row per
     (UTC hour bucket, api_key_id, server_id, tool).
 
-    Lives in gateway.db, NOT audit.db — see 0010_usage_rollups.sql's header comment for why
-    (the short version: AuditRetentionJob prunes audit.db on a rolling window; a usage rollup
-    that lived there would lose exactly the history an operator most wants to look back over).
+    A separate TABLE from audit_events — see 0009_usage_rollups.sql's header comment for why
+    (the short version: AuditRetentionJob prunes audit_events on a rolling window; a usage rollup
+    subject to that job would lose exactly the history an operator most wants to look back over).
 
     `increment` is called from the SAME code path that emits the audit event
     (argus/pipeline.py, right where AuditLogger.log() is called for an ALLOWED/BLOCKED
@@ -802,21 +989,6 @@ class UsageRepo:
     fail-open policy baked into it; the policy decision belongs to the enforcement point, not
     the data-access layer.
     """
-
-    def __init__(self, db: Database):
-        self._db = db
-
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
-
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
 
     async def increment(
         self, *, ts_iso: str, api_key_id: Optional[int], server_id: Optional[int],
@@ -842,18 +1014,34 @@ class UsageRepo:
         real increment rather than staying NULL forever if the backfill's own UPDATE somehow
         missed it."""
         period_start = _hour_bucket(ts_iso)
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
+        # [UPSERT] replaces gateway_write_lock — and this is the site where the lock's removal
+        # matters MOST, because this runs on every single forwarded tools/call.
+        #
+        # The operation is a read-modify-write ("add `amount` to this bucket's count"), which is
+        # the classic lost-update shape. It is race-free WITHOUT any lock because the increment
+        # is expressed against the STORED value inside a single statement
+        # (`calls = usage_rollups.calls + excluded.calls`), and concurrent callers targeting the
+        # same bucket serialize on that row via the UNIQUE index — including callers in DIFFERENT
+        # PROCESSES, which the asyncio.Lock never covered. The old lock made concurrent
+        # increments correct within one process and did nothing across two; this is correct
+        # across any number.
+        #
+        # The bare `calls + excluded.calls` in the SQLite original is qualified to
+        # `usage_rollups.calls` here: Postgres requires the target table be named explicitly in
+        # an ON CONFLICT DO UPDATE SET expression, and an unqualified `calls` is ambiguous.
+        # Covered by tests/integration/test_postgres_races.py::TestUsageIncrementRace, which
+        # fires N concurrent increments at one bucket and asserts the total is exactly N.
+        async with self._write() as conn:
+            await conn.execute(
                 """INSERT INTO usage_rollups
                    (period_start, period_kind, api_key_id, server_id, tool, calls, project_id)
-                   VALUES (?, 'hour', ?, ?, ?, ?, ?)
-                   ON CONFLICT(period_start, api_key_id, server_id, tool)
-                   DO UPDATE SET calls = calls + excluded.calls,
+                   VALUES ($1, 'hour', $2, $3, $4, $5, $6)
+                   ON CONFLICT (period_start, api_key_id, server_id, tool)
+                   DO UPDATE SET calls = usage_rollups.calls + excluded.calls,
                        project_id = COALESCE(usage_rollups.project_id, excluded.project_id)""",
-                (period_start, _to_key_sentinel(api_key_id), _to_server_sentinel(server_id),
-                 _to_tool_sentinel(tool), amount, project_id),
+                period_start, _to_key_sentinel(api_key_id), _to_server_sentinel(server_id),
+                _to_tool_sentinel(tool), amount, project_id,
             )
-            await self._write.commit()
 
     async def total_since(self, *, api_key_id: int, since_iso: str) -> int:
         """Sum of `calls` across every hour bucket with period_start >= since_iso, for one key
@@ -861,12 +1049,15 @@ class UsageRepo:
         quota period (start of today or start of this month, in UTC); summing hourly buckets
         rather than storing a running total keeps this correct across period boundaries without
         a separate reset job (see docs/quotas.md's "why hourly buckets" section)."""
-        cur = await self._read.execute(
-            "SELECT COALESCE(SUM(calls), 0) FROM usage_rollups WHERE api_key_id = ? AND period_start >= ?",
-            (api_key_id, since_iso),
-        )
-        row = await cur.fetchone()
-        return row[0] if row else 0
+        async with self._read() as conn:
+            total = await conn.fetchval(
+                "SELECT COALESCE(SUM(calls), 0) FROM usage_rollups "
+                "WHERE api_key_id = $1 AND period_start >= $2",
+                api_key_id, since_iso,
+            )
+        # SUM() returns numeric/Decimal from Postgres where SQLite returned a plain int; the
+        # quota comparison and the API response both expect an int.
+        return int(total or 0)
 
     async def query(
         self, *, api_key_id: Optional[int] = None, server_id: Optional[int] = None,
@@ -891,90 +1082,74 @@ class UsageRepo:
         lives in gateway.db alongside servers/projects, so this can be a real column filter
         rather than needing a slug-set IN-list."""
         clauses, params = [], []
+
+        def _p(value) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
         if api_key_id is not None:
-            clauses.append("api_key_id = ?")
-            params.append(api_key_id)
+            clauses.append(f"api_key_id = {_p(api_key_id)}")
         if server_id is not None:
-            clauses.append("server_id = ?")
-            params.append(server_id)
+            clauses.append(f"server_id = {_p(server_id)}")
         if tool is not None:
-            clauses.append("tool = ?")
-            params.append(tool)
+            clauses.append(f"tool = {_p(tool)}")
         if since_iso is not None:
-            clauses.append("period_start >= ?")
-            params.append(since_iso)
+            clauses.append(f"period_start >= {_p(since_iso)}")
         if until_iso is not None:
-            clauses.append("period_start <= ?")
-            params.append(until_iso)
+            clauses.append(f"period_start <= {_p(until_iso)}")
         if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
+            clauses.append(f"project_id = {_p(project_id)}")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        cur = await self._read.execute(
-            f"""SELECT period_start, api_key_id, server_id, tool, calls
-                FROM usage_rollups {where} ORDER BY period_start DESC""",
-            params,
-        )
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            rows = await conn.fetch(
+                f"""SELECT period_start, api_key_id, server_id, tool, calls
+                    FROM usage_rollups {where} ORDER BY period_start DESC""",
+                *params,
+            )
         return [dict(r) for r in rows]
 
 
-class SettingsRepo:
+class SettingsRepo(_PoolAccess):
     """Key-value store for gateway-wide settings (auth_mode, aggregate default, retention,
     admin credentials). Values are stored as plain strings; callers coerce types."""
 
-    def __init__(self, db: Database):
-        self._db = db
-
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
-
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
-
     async def get(self, key: str) -> Optional[str]:
-        cur = await self._read.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = await cur.fetchone()
-        return row["value"] if row else None
+        async with self._read() as conn:
+            return await conn.fetchval("SELECT value FROM settings WHERE key = $1", key)
 
     async def get_all(self) -> dict[str, str]:
-        cur = await self._read.execute("SELECT key, value FROM settings")
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            rows = await conn.fetch("SELECT key, value FROM settings")
         return {r["key"]: r["value"] for r in rows}
 
     async def set(self, key: str, value: str) -> None:
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                """INSERT INTO settings (key, value) VALUES (?, ?)
-                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
-                (key, value),
+        # [UPSERT] replaces gateway_write_lock. One atomic INSERT ... ON CONFLICT DO UPDATE;
+        # concurrent writers to the same key serialize on the row, last writer wins — the same
+        # outcome the lock produced, without excluding writers to unrelated keys.
+        async with self._write() as conn:
+            await conn.execute(
+                """INSERT INTO settings (key, value) VALUES ($1, $2)
+                   ON CONFLICT (key) DO UPDATE SET value = excluded.value""",
+                key, value,
             )
-            await self._write.commit()
 
     async def set_many(self, values: dict[str, str]) -> None:
-        # F7: batch into ONE transaction under the write lock, rather than N separate set()
-        # calls each taking/releasing the lock — avoids interleaving another writer's change
-        # between two settings that are logically saved together (e.g. the setup wizard writing
-        # admin_password_hash + session_secret + auth_mode as one atomic unit).
-        async with self._db.gateway_write_lock:
-            await self._write.execute("BEGIN IMMEDIATE")
-            try:
-                for key, value in values.items():
-                    await self._write.execute(
-                        """INSERT INTO settings (key, value) VALUES (?, ?)
-                           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
-                        (key, value),
-                    )
-                await self._write.commit()
-            except BaseException:
-                await self._write.rollback()
-                raise
+        # [TRANSACTION] replaces gateway_write_lock. The reason this method exists at all is
+        # atomicity ACROSS KEYS — the setup wizard writes admin_password_hash + session_secret +
+        # auth_mode as one unit, and a reader (or a crash) must never catch a state where the
+        # password is set but the session secret isn't. The lock gave that within one process; a
+        # real transaction gives it across all of them, and also makes it crash-safe, which the
+        # lock never did.
+        # Covered by tests/integration/test_postgres_races.py::TestSettingsAtomicity.
+        if not values:
+            return
+        async with self._write() as conn:
+            async with conn.transaction():
+                await conn.executemany(
+                    """INSERT INTO settings (key, value) VALUES ($1, $2)
+                       ON CONFLICT (key) DO UPDATE SET value = excluded.value""",
+                    list(values.items()),
+                )
 
 
 class AdminEventRecord(BaseModel):
@@ -1004,29 +1179,16 @@ class AdminEventRecord(BaseModel):
         return json.loads(self.after)
 
 
-class AdminEventRepo:
+class AdminEventRepo(_PoolAccess):
     """Control-plane audit log — records administrative actions (server CRUD, policy changes,
     key mint/revoke, settings changes, config imports).
 
     Distinct from AuditRepo (data-plane traffic log): these are low-volume, high-value events
-    that must survive long-term. Stored in gateway.db (not audit.db) so a config restore brings
-    its own change history. NEVER pruned by AuditRetentionJob — that job only touches audit.db.
+    that must survive long-term. NEVER pruned by AuditRetentionJob — that job only ever DELETEs
+    from audit_events, which is what has always kept these rows safe (the pre-cutover phrasing
+    was "stored in gateway.db, not audit.db"; post-cutover both are tables in one database, and
+    the invariant is unchanged because it was always about table identity, not file identity).
     """
-
-    def __init__(self, db: Database):
-        self._db = db
-
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
-
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
 
     async def insert(
         self,
@@ -1040,15 +1202,23 @@ class AdminEventRepo:
         after: Optional[str] = None,
         client_ip: Optional[str] = None,
     ) -> int:
-        """Insert one admin event. Returns the new row id."""
-        async with self._db.gateway_write_lock:
-            cur = await self._write.execute(
-                """INSERT INTO admin_events (ts, actor, action, target_type, target_id, before, after, client_ip, summary)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (utcnow(), actor, action, target_type, target_id, before, after, client_ip, summary),
+        """Insert one admin event. Returns the new row id.
+
+        `before`/`after` arrive as JSON STRINGS (callers json.dumps their allowlisted field dict)
+        and land in JSONB columns. The identity JSON codec registered in db/database.py means the
+        string is passed through to Postgres as-is and parsed there — so an invalid JSON string
+        now fails loudly at insert instead of being stored as opaque TEXT the way SQLite did."""
+        # [SINGLE-STATEMENT] replaces gateway_write_lock. One INSERT; RETURNING id replaces
+        # cur.lastrowid (which read a connection-wide value, not this statement's, and was never
+        # concurrency-safe — it merely happened to be correct while the lock serialized writes).
+        async with self._write() as conn:
+            return await conn.fetchval(
+                """INSERT INTO admin_events
+                   (ts, actor, action, target_type, target_id, before, after, client_ip, summary)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                   RETURNING id""",
+                utcnow(), actor, action, target_type, target_id, before, after, client_ip, summary,
             )
-            await self._write.commit()
-            return cur.lastrowid
 
     async def query(
         self,
@@ -1062,28 +1232,31 @@ class AdminEventRepo:
         clauses = []
         params: list = []
 
+        def _p(value) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
         if action is not None:
-            clauses.append("action = ?")
-            params.append(action)
+            clauses.append(f"action = {_p(action)}")
         if target_type is not None:
-            clauses.append("target_type = ?")
-            params.append(target_type)
+            clauses.append(f"target_type = {_p(target_type)}")
         if since is not None:
-            clauses.append("ts >= ?")
-            params.append(since)
+            clauses.append(f"ts >= {_p(since)}")
 
         where = " AND ".join(clauses) if clauses else "1=1"
         limit = min(limit, 500)
+        limit_ph = _p(limit)
 
-        cur = await self._read.execute(
-            f"""SELECT id, ts, actor, action, target_type, target_id, before, after, client_ip, summary
-                FROM admin_events
-                WHERE {where}
-                ORDER BY ts DESC
-                LIMIT ?""",
-            (*params, limit),
-        )
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            rows = await conn.fetch(
+                f"""SELECT id, ts, actor, action, target_type, target_id, before, after,
+                           client_ip, summary
+                    FROM admin_events
+                    WHERE {where}
+                    ORDER BY ts DESC
+                    LIMIT {limit_ph}""",
+                *params,
+            )
         return [
             AdminEventRecord(
                 id=row["id"],
@@ -1101,7 +1274,7 @@ class AdminEventRepo:
         ]
 
 
-def _row_to_user(row: aiosqlite.Row) -> UserRecord:
+def _row_to_user(row: asyncpg.Record) -> UserRecord:
     return UserRecord(
         id=row["id"],
         username=row["username"],
@@ -1117,58 +1290,40 @@ def _row_to_user(row: aiosqlite.Row) -> UserRecord:
     )
 
 
-class UserRepo:
+class UserRepo(_PoolAccess):
     """CRUD for the `users` table — local + OIDC control-plane principals (enterprise #1/#2).
 
-    F7-style discipline: reads go through the dedicated read connection, writes serialize
-    through `gateway_write_lock` on the writer connection, same as every other repo in this
-    module — `users` lives in gateway.db alongside servers/keys/settings, not a separate store.
-    """
-
-    def __init__(self, db: Database):
-        self._db = db
-
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
-
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
+    Same discipline as every other repo here: reads from the reader pool, writes from the writer
+    pool, multi-statement writes in an explicit transaction."""
 
     async def count(self) -> int:
         """Used by archon/admin_auth.py to decide whether to fall back to the legacy
-        settings-based admin check — an empty/absent `users` table means a partially-applied
+        settings-based admin check — an empty `users` table means a partially-applied
         upgrade or a pre-migration database, and must degrade to "still works", not "locked out"."""
-        cur = await self._read.execute("SELECT COUNT(*) FROM users")
-        row = await cur.fetchone()
-        return row[0] if row else 0
+        async with self._read() as conn:
+            return await conn.fetchval("SELECT COUNT(*) FROM users") or 0
 
     async def get_by_id(self, user_id: int) -> UserRecord:
-        cur = await self._read.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        row = await cur.fetchone()
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
         if row is None:
             raise UserNotFoundError(str(user_id))
         return _row_to_user(row)
 
     async def get_by_username(self, username: str) -> Optional[UserRecord]:
-        cur = await self._read.execute("SELECT * FROM users WHERE username = ?", (username,))
-        row = await cur.fetchone()
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
         return _row_to_user(row) if row else None
 
     async def get_by_subject(self, oidc_subject: str) -> Optional[UserRecord]:
-        # Keyed on oidc_subject (IdP 'sub'), never email — see 0007_users.sql's header comment.
-        cur = await self._read.execute("SELECT * FROM users WHERE oidc_subject = ?", (oidc_subject,))
-        row = await cur.fetchone()
+        # Keyed on oidc_subject (IdP 'sub'), never email — see 0006_users.sql's header comment.
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE oidc_subject = $1", oidc_subject)
         return _row_to_user(row) if row else None
 
     async def list(self) -> list[UserRecord]:
-        cur = await self._read.execute("SELECT * FROM users ORDER BY username")
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            rows = await conn.fetch("SELECT * FROM users ORDER BY username")
         return [_row_to_user(r) for r in rows]
 
     async def create(
@@ -1181,77 +1336,98 @@ class UserRepo:
         oidc_subject: Optional[str] = None,
         enabled: bool = True,
     ) -> UserRecord:
-        # Self-review fix: the pre-flight username check below doesn't (and can't, on its own)
-        # rule out a concurrent oidc_subject collision — two simultaneous JIT-provisioning
-        # calls for the same brand-new `sub` (e.g. a double-clicked "Sign in with SSO", or two
-        # browser tabs) can both pass UserRepo.get_or_create_from_oidc's `existing is None`
-        # check before either has committed. The `oidc_subject UNIQUE` constraint in
-        # 0007_users.sql is the real backstop; without catching its violation here, the loser of
-        # the race got an unhandled aiosqlite.IntegrityError (a 500) instead of a clean outcome.
-        # Caught and converted to UsernameConflictError so callers (get_or_create_from_oidc's
-        # retry loop, and archon/setup.py's callback handler) have one exception shape to
-        # handle regardless of which UNIQUE constraint actually fired.
-        async with self._db.gateway_write_lock:
-            existing = await self._write.execute("SELECT 1 FROM users WHERE username = ?", (username,))
-            if await existing.fetchone() is not None:
-                raise UsernameConflictError(username)
-            now = utcnow()
-            try:
-                cur = await self._write.execute(
-                    """INSERT INTO users
-                       (username, email, password_hash, role, auth_source, oidc_subject, enabled, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (username, email, password_hash, role, auth_source, oidc_subject, int(enabled), now),
-                )
-            except aiosqlite.IntegrityError as e:
-                raise UsernameConflictError(username) from e
-            await self._write.commit()
-            new_id = cur.lastrowid
+        # Self-review fix (pre-cutover, still load-bearing): the pre-flight username check below
+        # doesn't (and can't, on its own) rule out a concurrent oidc_subject collision — two
+        # simultaneous JIT-provisioning calls for the same brand-new `sub` (a double-clicked
+        # "Sign in with SSO", or two browser tabs) can both pass
+        # UserRepo.get_or_create_from_oidc's `existing is None` check before either has
+        # committed. The `oidc_subject UNIQUE` constraint is the real backstop; without catching
+        # its violation here the loser of the race got an unhandled driver IntegrityError (a 500)
+        # instead of a clean outcome.
+        #
+        # [TRANSACTION + UNIQUE-violation catch] replaces gateway_write_lock. This site is the
+        # clearest illustration of why the lock was never the guarantee: the comment above
+        # already described a race the lock did NOT close (it closed the username half within one
+        # process and nothing across processes), and the fix even then was catching the UNIQUE
+        # violation. Removing the lock doesn't widen the race — it removes a partial mitigation
+        # that the constraint already fully covers. asyncpg.UniqueViolationError replaces
+        # aiosqlite.IntegrityError and is still converted to UsernameConflictError so callers
+        # have ONE exception shape regardless of which UNIQUE constraint (username or
+        # oidc_subject) actually fired.
+        # Covered by tests/integration/test_postgres_races.py::TestUserCreateRace.
+        async with self._write() as conn:
+            async with conn.transaction():
+                if await conn.fetchval("SELECT 1 FROM users WHERE username = $1", username):
+                    raise UsernameConflictError(username)
+                now = utcnow()
+                try:
+                    new_id = await conn.fetchval(
+                        """INSERT INTO users
+                           (username, email, password_hash, role, auth_source, oidc_subject,
+                            enabled, created_at)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                           RETURNING id""",
+                        username, email, password_hash, role, auth_source, oidc_subject,
+                        enabled, now,
+                    )
+                except asyncpg.UniqueViolationError as e:
+                    raise UsernameConflictError(username) from e
         return await self.get_by_id(new_id)
 
     async def update_role(self, user_id: int, role: str) -> UserRecord:
-        async with self._db.gateway_write_lock:
-            await self._write.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
-            await self._write.commit()
+        # [SINGLE-STATEMENT] replaces gateway_write_lock.
+        async with self._write() as conn:
+            await conn.execute("UPDATE users SET role = $1 WHERE id = $2", role, user_id)
         return await self.get_by_id(user_id)
 
     async def set_enabled(self, user_id: int, enabled: bool) -> UserRecord:
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                "UPDATE users SET enabled = ? WHERE id = ?", (int(enabled), user_id)
-            )
-            await self._write.commit()
+        # [SINGLE-STATEMENT] replaces gateway_write_lock. `enabled` is a real BOOLEAN column
+        # now, so the int() coercion the SQLite schema needed is gone.
+        async with self._write() as conn:
+            await conn.execute("UPDATE users SET enabled = $1 WHERE id = $2", enabled, user_id)
         return await self.get_by_id(user_id)
 
     async def set_password_hash(self, user_id: int, password_hash: str) -> UserRecord:
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                "UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id)
+        # [SINGLE-STATEMENT] replaces gateway_write_lock.
+        async with self._write() as conn:
+            await conn.execute(
+                "UPDATE users SET password_hash = $1 WHERE id = $2", password_hash, user_id
             )
-            await self._write.commit()
         return await self.get_by_id(user_id)
 
     async def touch_last_login(self, user_id: int) -> None:
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                "UPDATE users SET last_login_at = ? WHERE id = ?", (utcnow(), user_id)
+        # [SINGLE-STATEMENT] replaces gateway_write_lock.
+        async with self._write() as conn:
+            await conn.execute(
+                "UPDATE users SET last_login_at = $1 WHERE id = $2", utcnow(), user_id
             )
-            await self._write.commit()
 
     async def bump_session_version(self, user_id: int) -> int:
         """Per-user analogue of the global session_version bump in settings — invalidates every
         outstanding session token for exactly this one user (disable, role change, password
         change, explicit logout-all-for-this-user), without touching anyone else's session."""
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                "UPDATE users SET session_version = session_version + 1 WHERE id = ?", (user_id,)
+        # [ATOMIC-RMW] replaces gateway_write_lock — and this was a REAL lost-update risk, not a
+        # nominal one. The old shape was UPDATE ... SET v = v + 1, COMMIT, then a SEPARATE SELECT
+        # to read the new value back, with the lock as the only thing preventing a second bumper
+        # from committing in between and making this caller return the OTHER caller's version
+        # number. Returning a stale/foreign session_version here is a security-relevant bug: it
+        # is the value written into the freshly-issued session token, so a token could be minted
+        # carrying a version that is already invalid (locking the user out) or, worse, the
+        # caller's own revocation could appear to have taken effect at a version that other
+        # still-live tokens also satisfy.
+        #
+        # RETURNING collapses the increment and the read-back into ONE statement, so the value
+        # returned is definitionally the one this statement wrote. No lock, no window.
+        # Covered by tests/integration/test_postgres_races.py::TestSessionVersionRace, which
+        # bumps concurrently from two tasks and asserts the returned versions are distinct and
+        # the final stored value equals the number of bumps.
+        async with self._write() as conn:
+            version = await conn.fetchval(
+                "UPDATE users SET session_version = session_version + 1 WHERE id = $1 "
+                "RETURNING session_version",
+                user_id,
             )
-            await self._write.commit()
-            cur = await self._write.execute(
-                "SELECT session_version FROM users WHERE id = ?", (user_id,)
-            )
-            row = await cur.fetchone()
-            return row["session_version"] if row else 0
+        return version if version is not None else 0
 
     async def get_or_create_from_oidc(
         self,
@@ -1302,60 +1478,53 @@ class UserRepo:
                     raise
 
 
-def _row_to_project(row: aiosqlite.Row) -> ProjectRecord:
+def _row_to_project(row: asyncpg.Record) -> ProjectRecord:
     return ProjectRecord(id=row["id"], slug=row["slug"], name=row["name"], created_at=row["created_at"])
 
 
-class ProjectRepo:
+class ProjectRepo(_PoolAccess):
     """CRUD for `projects` (enterprise #4, issue #5). Deliberately thin — no membership logic
     here (see ProjectMemberRepo below); this repo only owns the project row itself."""
 
-    def __init__(self, db: Database):
-        self._db = db
-
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
-
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
-
     async def list(self) -> list[ProjectRecord]:
-        cur = await self._read.execute("SELECT * FROM projects ORDER BY slug")
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            rows = await conn.fetch("SELECT * FROM projects ORDER BY slug")
         return [_row_to_project(r) for r in rows]
 
     async def get(self, slug: str) -> ProjectRecord:
-        cur = await self._read.execute("SELECT * FROM projects WHERE slug = ?", (slug,))
-        row = await cur.fetchone()
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM projects WHERE slug = $1", slug)
         if row is None:
             raise ProjectNotFoundError(slug)
         return _row_to_project(row)
 
     async def get_by_id(self, project_id: int) -> ProjectRecord:
-        cur = await self._read.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
-        row = await cur.fetchone()
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
         if row is None:
             raise ProjectNotFoundError(str(project_id))
         return _row_to_project(row)
 
     async def create(self, slug: str, name: str) -> ProjectRecord:
-        async with self._db.gateway_write_lock:
-            existing = await self._write.execute("SELECT 1 FROM projects WHERE slug = ?", (slug,))
-            if await existing.fetchone() is not None:
-                raise ProjectSlugConflictError(slug)
-            now = utcnow()
-            cur = await self._write.execute(
-                "INSERT INTO projects (slug, name, created_at) VALUES (?, ?, ?)",
-                (slug, name, now),
-            )
-            await self._write.commit()
-        return await self.get_by_id(cur.lastrowid)
+        # [TRANSACTION + UNIQUE-violation catch] replaces gateway_write_lock — identical shape
+        # and reasoning to ServerRepo.create: the pre-flight SELECT gives a clean typed error on
+        # the common path, `projects.slug UNIQUE` is what actually makes it correct, and the
+        # loser of a real race is converted to the same ProjectSlugConflictError rather than
+        # surfacing a driver exception.
+        # Covered by tests/integration/test_postgres_races.py::TestProjectCreateRace.
+        async with self._write() as conn:
+            async with conn.transaction():
+                if await conn.fetchval("SELECT 1 FROM projects WHERE slug = $1", slug):
+                    raise ProjectSlugConflictError(slug)
+                try:
+                    project_id = await conn.fetchval(
+                        "INSERT INTO projects (slug, name, created_at) VALUES ($1, $2, $3) "
+                        "RETURNING id",
+                        slug, name, utcnow(),
+                    )
+                except asyncpg.UniqueViolationError as e:
+                    raise ProjectSlugConflictError(slug) from e
+        return await self.get_by_id(project_id)
 
     async def delete(self, slug: str) -> None:
         # ON DELETE CASCADE on project_members handles membership cleanup. Servers/keys are NOT
@@ -1364,49 +1533,38 @@ class ProjectRepo:
         # rather than silently orphaning or cascading away real infrastructure; see that route's
         # own comment for the exact check.
         current = await self.get(slug)
-        async with self._db.gateway_write_lock:
-            await self._write.execute("DELETE FROM projects WHERE id = ?", (current.id,))
-            await self._write.commit()
+        # [SINGLE-STATEMENT] replaces gateway_write_lock. project_members cascades; servers/keys
+        # deliberately do NOT (their project_id FK has no ON DELETE clause), so if any still
+        # reference this project the FK rejects the DELETE — which is a stronger guarantee than
+        # the API-layer pre-check described above, and now actually enforced rather than merely
+        # checked-then-hoped under a per-process lock.
+        async with self._write() as conn:
+            await conn.execute("DELETE FROM projects WHERE id = $1", current.id)
 
 
-def _row_to_member(row: aiosqlite.Row) -> ProjectMemberRecord:
+def _row_to_member(row: asyncpg.Record) -> ProjectMemberRecord:
     return ProjectMemberRecord(user_id=row["user_id"], project_id=row["project_id"], role=row["role"])
 
 
-class ProjectMemberRepo:
+class ProjectMemberRepo(_PoolAccess):
     """CRUD for `project_members` — the (user_id, project_id) -> role membership table backing
     archon/project_rbac.py's `require_project_role`. Every read here is the DB-is-authoritative
     lookup that dependency performs on every request (no caching), same discipline as
     archon/admin_auth.py's auth_mode/session_version checks."""
 
-    def __init__(self, db: Database):
-        self._db = db
-
-    @property
-    def _read(self) -> aiosqlite.Connection:
-        assert self._db.gateway_read is not None
-        self._db.gateway_read.row_factory = aiosqlite.Row
-        return self._db.gateway_read
-
-    @property
-    def _write(self) -> aiosqlite.Connection:
-        assert self._db.gateway is not None
-        self._db.gateway.row_factory = aiosqlite.Row
-        return self._db.gateway
-
     async def get_membership(self, *, user_id: int, project_id: int) -> Optional[ProjectMemberRecord]:
-        cur = await self._read.execute(
-            "SELECT * FROM project_members WHERE user_id = ? AND project_id = ?",
-            (user_id, project_id),
-        )
-        row = await cur.fetchone()
+        async with self._read() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM project_members WHERE user_id = $1 AND project_id = $2",
+                user_id, project_id,
+            )
         return _row_to_member(row) if row else None
 
     async def list_for_project(self, project_id: int) -> list[ProjectMemberRecord]:
-        cur = await self._read.execute(
-            "SELECT * FROM project_members WHERE project_id = ? ORDER BY user_id", (project_id,)
-        )
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM project_members WHERE project_id = $1 ORDER BY user_id", project_id
+            )
         return [_row_to_member(r) for r in rows]
 
     async def list_for_user(self, user_id: int) -> list[ProjectMemberRecord]:
@@ -1417,26 +1575,31 @@ class ProjectMemberRepo:
         project this principal can act on" (e.g. the frontend's project switcher) must special-
         case principal.role == 'admin' -> list every project, same as
         resolve_project_role does for a single project."""
-        cur = await self._read.execute(
-            "SELECT * FROM project_members WHERE user_id = ? ORDER BY project_id", (user_id,)
-        )
-        rows = await cur.fetchall()
+        async with self._read() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM project_members WHERE user_id = $1 ORDER BY project_id", user_id
+            )
         return [_row_to_member(r) for r in rows]
 
     async def upsert(self, *, user_id: int, project_id: int, role: str) -> ProjectMemberRecord:
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                """INSERT INTO project_members (user_id, project_id, role) VALUES (?, ?, ?)
-                   ON CONFLICT(user_id, project_id) DO UPDATE SET role = excluded.role""",
-                (user_id, project_id, role),
+        # [UPSERT] replaces gateway_write_lock. Single atomic INSERT ... ON CONFLICT DO UPDATE;
+        # two concurrent role changes for the same (user, project) serialize on the row and the
+        # last one wins, which is the same outcome the lock produced. RETURNING the row directly
+        # would save a round-trip, but the follow-up get_membership() read is kept so the
+        # returned record comes from the same read path every other method uses.
+        # Covered by tests/integration/test_postgres_races.py::TestMembershipRace.
+        async with self._write() as conn:
+            await conn.execute(
+                """INSERT INTO project_members (user_id, project_id, role) VALUES ($1, $2, $3)
+                   ON CONFLICT (user_id, project_id) DO UPDATE SET role = excluded.role""",
+                user_id, project_id, role,
             )
-            await self._write.commit()
         return await self.get_membership(user_id=user_id, project_id=project_id)
 
     async def remove(self, *, user_id: int, project_id: int) -> None:
-        async with self._db.gateway_write_lock:
-            await self._write.execute(
-                "DELETE FROM project_members WHERE user_id = ? AND project_id = ?",
-                (user_id, project_id),
+        # [SINGLE-STATEMENT] replaces gateway_write_lock.
+        async with self._write() as conn:
+            await conn.execute(
+                "DELETE FROM project_members WHERE user_id = $1 AND project_id = $2",
+                user_id, project_id,
             )
-            await self._write.commit()

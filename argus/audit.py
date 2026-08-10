@@ -76,7 +76,11 @@ class AuditLogger:
             "matched": matched,
             "reason": reason,
             "args_summary": json.dumps(args_summary) if args_summary is not None else None,
-            "bridged": int(bridged),
+            # Postgres cutover (enterprise #7): audit_events.bridged is a real BOOLEAN column now,
+            # not SQLite's 0/1 INTEGER, and Postgres will not coerce an int into it. Passed
+            # through as the bool it already is — `int()` here was only ever a SQLite storage
+            # detail leaking into the event dict.
+            "bridged": bool(bridged),
             "status_code": status_code,
             "latency_ms": latency_ms,
             "origin": origin,

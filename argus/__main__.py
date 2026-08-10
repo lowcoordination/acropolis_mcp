@@ -15,6 +15,22 @@ from db.database import Database
 from db.repo import ServerRepo, SettingsRepo
 
 
+def _make_db(settings: Settings) -> Database:
+    """Build the Database from settings.
+
+    Enterprise #7: this used to be `Database(Path(settings.data_dir))` at five call sites. It is
+    now one helper because the construction takes three settings rather than one, and because
+    every entry point (server, import, export, import-config, check) must fail the same way with
+    the same message when ACROPOLIS_DATABASE_URL is unset — Database.__init__ raises
+    DatabaseNotConfiguredError, which names the variable and points at docs/postgres.md.
+    """
+    return Database(
+        settings.database_url,
+        writer_pool_max=settings.db_writer_pool_max,
+        reader_pool_max=settings.db_reader_pool_max,
+    )
+
+
 def _run_server() -> None:
     settings = Settings()
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
@@ -33,7 +49,7 @@ def _run_server() -> None:
     # uvicorn's `Server` class driven directly inside one loop rather than `uvicorn.run()`,
     # which is a bigger change than this cleanup pass warrants.
     async def _make_app():
-        db = Database(Path(settings.data_dir))
+        db = _make_db(settings)
         await db.connect()
         return create_app(settings, db)
 
@@ -51,7 +67,7 @@ async def _run_import(path: str, dry_run: bool) -> None:
     for warning in result.warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
-    db = Database(Path(settings.data_dir))
+    db = _make_db(settings)
     await db.connect()
     try:
         repo = ServerRepo(db)
@@ -68,7 +84,7 @@ async def _run_import(path: str, dry_run: bool) -> None:
 
 async def _run_export(path: str | None, include_credentials: bool, stable: bool = False) -> None:
     settings = Settings()
-    db = Database(Path(settings.data_dir))
+    db = _make_db(settings)
     await db.connect()
     try:
         result = await export_config(
@@ -90,7 +106,7 @@ async def _run_export(path: str | None, include_credentials: bool, stable: bool 
 
 async def _run_import_config(path: str, apply: bool) -> None:
     settings = Settings()
-    db = Database(Path(settings.data_dir))
+    db = _make_db(settings)
     await db.connect()
     try:
         plan = await plan_import(
@@ -122,7 +138,7 @@ async def _run_check(path: str) -> int:
     needs to distinguish "config drifted" (actionable) from "file is malformed" (fix the file).
     """
     settings = Settings()
-    db = Database(Path(settings.data_dir))
+    db = _make_db(settings)
     await db.connect()
     try:
         plan = await plan_import(
