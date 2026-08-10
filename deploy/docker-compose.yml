@@ -1,4 +1,31 @@
 services:
+  postgres:
+    # Same image family as tests/conftest.py's own ephemeral test Postgres (postgres:17-alpine) —
+    # keeping the two in sync means "works in CI" and "works via docker compose up" are backed by
+    # the same server version, not two versions that could drift apart silently.
+    image: postgres:17-alpine
+    container_name: acropolis-postgres
+    restart: unless-stopped
+    environment:
+      # Dev/homelab defaults. ACROPOLIS_DB_PASSWORD has no built-in default on purpose — see the
+      # `:?` below — so this file can't be copy-pasted into a real deployment with a known
+      # throwaway password still in place; ${VAR:-x} would silently do exactly that.
+      - POSTGRES_USER=${ACROPOLIS_DB_USER:-acropolis}
+      - POSTGRES_PASSWORD=${ACROPOLIS_DB_PASSWORD:?Set ACROPOLIS_DB_PASSWORD in your .env — no default, so a real deployment can't accidentally ship with a known password}
+      - POSTGRES_DB=${ACROPOLIS_DB_NAME:-acropolis}
+    volumes:
+      - acropolis-pgdata:/var/lib/postgresql/data
+    # Not exposed to the host by default — only the acropolis service needs to reach it, over the
+    # compose network. Uncomment if you want `psql`/pg_dump from the host directly.
+    # ports:
+    #   - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ACROPOLIS_DB_USER:-acropolis} -d ${ACROPOLIS_DB_NAME:-acropolis}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   acropolis:
     build:
       context: ..
@@ -6,6 +33,12 @@ services:
     image: acropolis:latest
     container_name: acropolis
     restart: unless-stopped
+    depends_on:
+      postgres:
+        # Waits for postgres's healthcheck (pg_isready), not just "container started" — a plain
+        # `depends_on: postgres` only orders container CREATION, not readiness, and asyncpg's
+        # first connection attempt at boot would otherwise race Postgres's own startup.
+        condition: service_healthy
     ports:
       - "8000:8000"
     volumes:
@@ -20,6 +53,11 @@ services:
     cap_drop:
       - ALL
     environment:
+      # Postgres is a hard boot requirement as of enterprise #7 (issue #8) — see
+      # db/database.py's DatabaseNotConfiguredError and docs/postgres.md. Built from the same
+      # ACROPOLIS_DB_* vars as the postgres service above, over the compose network (service name
+      # "postgres" resolves via compose's internal DNS), not localhost.
+      - ACROPOLIS_DATABASE_URL=postgresql://${ACROPOLIS_DB_USER:-acropolis}:${ACROPOLIS_DB_PASSWORD:?Set ACROPOLIS_DB_PASSWORD in your .env}@postgres:5432/${ACROPOLIS_DB_NAME:-acropolis}
       # Optional: a bearer-token override for the /api/v1 control plane, for scripts/CI that
       # shouldn't go through the browser login flow. Leave unset for normal use — visiting the
       # UI for the first time walks you through setting an admin password instead.
@@ -30,3 +68,4 @@ services:
 
 volumes:
   acropolis-data:
+  acropolis-pgdata:

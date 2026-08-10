@@ -15,11 +15,18 @@ This guide gets you from nothing to a locked-down MCP server in about five minut
 
 ## 1. Start Acropolis
 
+Acropolis stores its state in Postgres — `docker compose` bundles one for you, but it needs a
+password before it'll start (deliberately no built-in default, so you can't end up running a real
+deployment on a copy-pasted throwaway password):
+
 ```bash
 git clone https://github.com/lowcoordination/acropolis_mcp.git
 cd acropolis_mcp
+echo "ACROPOLIS_DB_PASSWORD=$(openssl rand -hex 24)" > deploy/.env
 docker compose -f deploy/docker-compose.yml up
 ```
+
+See [Postgres](postgres.md) if you'd rather point at a Postgres you already run somewhere else.
 
 The first run builds the image (a minute or two); after that, startup is a few seconds.
 Once you see `Uvicorn running on http://0.0.0.0:8000`, open **http://localhost:8000**.
