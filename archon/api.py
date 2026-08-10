@@ -38,6 +38,7 @@ from archon.project_rbac import (
     PROJECT_ROLE_RANK,
     is_valid_project_role,
     require_project_role,
+    require_proposal_project_role,
     resolve_project_role,
 )
 from archon.secrets import SecretProvider, is_reference, provider_tier_name, store_upstream_auth_header
@@ -1056,13 +1057,22 @@ def build_control_plane_router(
             )
 
     if approvals is not None:
-        # Enterprise #9: the approval-workflow surface. Everything here is global-admin-gated
-        # (require_role("admin"), same gate as config import): proposals carry the full policy
-        # intent / import YAML, which can include plaintext upstream credentials when an
-        # operator imports a file exported with include_credentials=true — a viewer or
-        # poweruser must never be able to list those. The four-eyes *proposer* gate stays where
-        # it always was (the write routes above queue proposals from anyone who could have made
-        # the write directly); the *approver* gate is here.
+        # Enterprise #9, remediated 2026-08-10 (review finding — see
+        # 0012_proposals_project_scope.sql's header): originally EVERYTHING here was
+        # global-admin-gated (require_role("admin"), same gate as config import). That was too
+        # broad — a 'server_policy' proposal targets a project-owned server, and gating its
+        # approval on GLOBAL admin meant (a) any global admin could preview every project's
+        # pending changes, and (b) a project-admin-who-is-global-viewer could propose a change
+        # but never approve one in their own project. Detail/approve/reject now gate on
+        # require_proposal_project_role, which resolves the proposal's OWN project_id (None for
+        # config_import, which stays global-admin-only — see that migration's header) rather
+        # than a path param. List is project-filtered for non-global-admins, mirroring GET
+        # /keys's project_id query-param branch — but defaults to STRICTER than /keys/servers:
+        # a bare GET /proposals with no project_id from a non-global-admin returns their OWN
+        # projects' proposals only (never the instance-wide list /servers gives a global
+        # viewer), because preview() computes a LIVE diff of unapplied intent — genuinely new
+        # information beyond what /audit already exposes to any viewer, unlike a server's
+        # already-visible slug/policy shape.
 
         def _proposal_to_response(proposal) -> ProposalResponse:
             return ProposalResponse(
@@ -1075,24 +1085,49 @@ def build_control_plane_router(
                 resolved_at=proposal.resolved_at,
                 resolver=proposal.resolver,
                 resolution_reason=proposal.resolution_reason,
+                project_id=proposal.project_id,
             )
 
-        @router.get(
-            "/proposals", response_model=list[ProposalResponse],
-            dependencies=[Depends(require_role("admin"))],
-        )
-        async def list_proposals(state: Optional[str] = None):
+        @router.get("/proposals", response_model=list[ProposalResponse])
+        async def list_proposals(
+            state: Optional[str] = None,
+            principal: Principal = Depends(require_role("viewer")),
+        ):
             if state is not None and state not in ("pending", "approved", "rejected", "expired"):
                 raise HTTPException(
                     status_code=400,
                     detail=f"invalid state {state!r}; must be one of: pending, approved, "
                            "rejected, expired",
                 )
-            return [_proposal_to_response(p) for p in await proposal_repo.list(state=state)]
+            if principal.role == "admin":
+                proposals = await proposal_repo.list(state=state)
+            else:
+                # A global viewer/operator sees only proposals in projects they're a member of
+                # — never the instance-wide list, and never another project's. Deliberately no
+                # single-project_id query param (unlike GET /keys): a caller could be a member
+                # of several projects, and there's no reason to force one request per project
+                # when the repo can filter on the whole membership set at once.
+                # project_member_repo is Optional at router-build time (see this function's
+                # signature) — a caller with no repo wired sees no memberships, same
+                # fail-closed direction as principal.user_id is None below, not a crash.
+                memberships = (
+                    await project_member_repo.list_for_user(principal.user_id)
+                    if project_member_repo is not None and principal.user_id is not None
+                    else []
+                )
+                if not memberships:
+                    return []
+                visible_project_ids = {m.project_id for m in memberships}
+                all_matching = await proposal_repo.list(state=state)
+                return [
+                    _proposal_to_response(p) for p in all_matching
+                    if p.project_id in visible_project_ids
+                ]
+            return [_proposal_to_response(p) for p in proposals]
 
         @router.get(
             "/proposals/{proposal_id}", response_model=ProposalDetailResponse,
-            dependencies=[Depends(require_role("admin"))],
+            dependencies=[Depends(require_proposal_project_role("viewer"))],
         )
         async def get_proposal(proposal_id: int):
             try:
@@ -1108,7 +1143,7 @@ def build_control_plane_router(
         )
         async def approve_proposal(
             proposal_id: int, body: ProposalApproveRequest, request: Request,
-            principal: Principal = Depends(require_role("admin")),
+            principal: Principal = Depends(require_proposal_project_role("admin")),
         ):
             try:
                 resolved = await approvals.approve(
@@ -1137,7 +1172,7 @@ def build_control_plane_router(
         )
         async def reject_proposal(
             proposal_id: int, body: ProposalRejectRequest, request: Request,
-            principal: Principal = Depends(require_role("admin")),
+            principal: Principal = Depends(require_proposal_project_role("admin")),
         ):
             try:
                 resolved = await approvals.reject(

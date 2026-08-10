@@ -27,11 +27,17 @@ With `approvals_enabled` on (Settings → *Require approval for policy and confi
   `{proposal_id}`** instead of applying. Nothing changes server-side.
 - `POST /api/v1/config/import` with `apply: true` returns **202 + `{proposal_id}`** instead of
   importing. Dry-run previews (`apply: false`) are unchanged — a preview changes nothing.
-- The proposal is visible under **Approvals** in the UI (admin only), with the plan
-  **recomputed against current state** every time it's viewed — never a stored stale diff.
+- The proposal is visible under **Approvals** in the UI, with the plan **recomputed against
+  current state** every time it's viewed — never a stored stale diff. **Who can see and act on
+  it is project-scoped** (remediation, 2026-08-10): a policy-change proposal is scoped to its
+  target server's project — a project admin can approve it without needing a global role, and a
+  global admin (or a project admin elsewhere) never sees it in their list. A config-import
+  proposal stays instance-wide and global-admin-only, since one import file can touch servers
+  across every project.
 - A **different admin** approves or rejects it (four-eyes is enforced on user identity, not
   role; an admin's own proposal needs a different admin, and an admin-token/break-glass
-  proposal can only be approved by a real user).
+  proposal can only be approved by a real user) — "admin" here means whatever tier the proposal
+  is scoped to: project-admin for a policy change, global admin for a config import.
 - On approval, the change applies **only if the target hasn't drifted** since the proposal was
   created; otherwise it's refused with `state changed, re-review` (HTTP 409).
 - Pending proposals expire after `approvals_ttl_days` (default 7); expired proposals cannot be
@@ -45,8 +51,10 @@ With `approvals_enabled` on (Settings → *Require approval for policy and confi
 Only **policy-shaped mutations** go through approvals: per-server policy edits (which include
 DLP config), and config import. Server CRUD, API keys, user management, and settings stay
 direct-with-audit — gating everything would turn the gateway into a ticketing system. There are
-no approval chains, no per-project approvers, and no email notifications (webhook + UI badge
-only).
+no approval CHAINS (multi-stage sign-off), no separate per-project approver LIST or its own
+notification routing, and no email notifications (webhook + UI badge only) — approval
+*authority* does follow project membership (see above), that's just not the same feature as a
+dedicated approver-list/notification system.
 
 ### Why "intent, not a frozen diff"
 

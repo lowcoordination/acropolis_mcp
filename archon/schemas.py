@@ -528,6 +528,10 @@ class ProposalResponse(BaseModel):
     resolved_at: Optional[str] = None
     resolver: Optional[str] = None
     resolution_reason: Optional[str] = None
+    # Remediation (review 2026-08-10): None for a 'config_import' proposal (instance-wide by
+    # design), the target server's project for a 'server_policy' proposal. See
+    # 0012_proposals_project_scope.sql's header.
+    project_id: Optional[int] = None
 
 
 class ProposalDetailResponse(ProposalResponse):

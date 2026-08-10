@@ -162,6 +162,11 @@ class ApprovalService:
             payload=payload,
             proposer_user_id=proposer.user_id,
             proposer=proposer.actor,
+            # Remediation (review 2026-08-10): a server_policy proposal is scoped to its
+            # target server's project — this is what lets /proposals* gate on
+            # require_project_role instead of global require_role("admin"). See
+            # 0012_proposals_project_scope.sql's header for the full rationale.
+            project_id=server.project_id,
         )
         await self._record_event(
             proposal, proposer, client_ip,
@@ -201,6 +206,12 @@ class ApprovalService:
             payload=payload,
             proposer_user_id=proposer.user_id,
             proposer=proposer.actor,
+            # Remediation (review 2026-08-10): explicitly None, not omitted — a config import
+            # can touch servers across every project in one file, so it stays instance-wide
+            # and global-admin-gated. Written out at the call site (rather than relying on
+            # create()'s default) so the asymmetry with propose_policy_change above is visible
+            # here, not just implied by absence.
+            project_id=None,
         )
         await self._record_event(
             proposal, proposer, client_ip,

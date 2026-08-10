@@ -29,6 +29,7 @@ MIGRATIONS = [
     "0009_usage_rollups.sql",
     "0010_projects.sql",
     "0011_proposals.sql",
+    "0012_proposals_project_scope.sql",
 ]
 
 
