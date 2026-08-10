@@ -798,7 +798,12 @@ def build_control_plane_router(
                 client_ip=request.client.host if request.client else None,
             )
 
-        return _key_to_response(key_after)
+        # Fix (review 2026-08-10): every other _key_to_response call site passes the
+        # project_slugs map (see list_keys/create_key above) so KeyResponse.project_slug is
+        # populated; this route omitted it, so a PATCHed key with a real project would come
+        # back with project_slug: null until the next full GET/list refetched it.
+        project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
+        return _key_to_response(key_after, project_slugs)
 
     @router.patch(
         "/keys/{key_id}/quota", response_model=KeyResponse,
@@ -839,7 +844,8 @@ def build_control_plane_router(
                 client_ip=request.client.host if request.client else None,
             )
 
-        return _key_to_response(key_after)
+        project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
+        return _key_to_response(key_after, project_slugs)
 
     @router.delete("/keys/{key_id}", status_code=204)
     async def delete_key(
@@ -1207,10 +1213,13 @@ def build_control_plane_router(
             )
 
         # Enterprise #4: same instance-wide-by-default, optional project_id filter shape as
-        # /stats above — audit_events lives in audit.db (a separate connection from
-        # servers/projects), so project scoping here resolves the project's server slugs first
-        # and passes them as server_slug_in (see AuditRepo.query's own docstring on why this is
-        # a slug-set filter rather than a JOIN).
+        # /stats above. Post-Postgres-cutover, audit_events and servers/projects live in the
+        # SAME database (see db/database.py) — this is NOT a cross-database limitation anymore.
+        # It's still a slug-set filter rather than a JOIN because audit_events.server_slug is a
+        # bare TEXT column with no FK to servers.id (0001_init.sql — audit rows must survive a
+        # server being renamed or deleted, so there's nothing to join against), so project
+        # scoping resolves the project's server slugs first and passes them as server_slug_in
+        # (see AuditRepo.query's own docstring).
         @router.get("/audit", response_model=list[AuditEventResponse], dependencies=[Depends(require_role("viewer"))])
         async def query_audit(
             server_slug: Optional[str] = None, decision: Optional[str] = None,
@@ -1319,10 +1328,13 @@ def build_control_plane_router(
                 return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     if usage_repo is not None:
-        @router.get("/usage", response_model=UsageResponse, dependencies=[Depends(require_role("viewer"))])
+        @router.get("/usage", response_model=UsageResponse)
         async def get_usage(
             api_key_id: Optional[int] = None, server_slug: Optional[str] = None,
             tool: Optional[str] = None, period: str = "day", project_id: Optional[int] = None,
+            # The gate is this parameter, not a separate `dependencies=[...]` entry (redundant
+            # with this — see api.py's other routes that need `principal` in the handler body,
+            # e.g. list_proposals/list_keys, which use the same single-declaration shape).
             principal: Principal = Depends(require_role("viewer")),
         ):
             """Enterprise #11. viewer+ (read-only, consistent with how /audit is already scoped
@@ -1348,9 +1360,10 @@ def build_control_plane_router(
             still be queried here.
 
             `project_id` (enterprise #4, optional) filters to one project's rollups directly on
-            usage_rollups.project_id — unlike /audit, this table lives in gateway.db alongside
-            servers/projects, so no slug-set indirection is needed. Same instance-wide-by-default
-            shape as /stats and /audit above.
+            usage_rollups.project_id — unlike /audit's server_slug (a bare TEXT column with no
+            FK), usage_rollups carries its OWN project_id column (populated at write time and
+            backfilled by 0010_projects.sql), so no slug-set indirection is needed here. Same
+            instance-wide-by-default shape as /stats and /audit above.
             """
             if period not in ("day", "month", "all"):
                 raise HTTPException(status_code=400, detail="period must be 'day', 'month', or 'all'")

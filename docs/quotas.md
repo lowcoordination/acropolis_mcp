@@ -213,12 +213,13 @@ layer.
 
 `quota_calls` is capped at 1,000,000,000 by `archon/schemas.py`'s validator — generously above
 any real quota an operator would configure, but a real bound. This closed a self-security-scan
-finding: Pydantic's bare `int` type has no upper bound, while SQLite's `INTEGER` column is a
-64-bit signed value, so an arbitrary-precision `quota_calls` used to pass request validation
-and then raise an unhandled `OverflowError` at the database layer — caught by the app's global
-exception handler (so never a crash or an information leak, just an unnecessary 500 where a
-clean 422 belongs). Fixed at the Pydantic layer, on both `POST /api/v1/keys` and
-`PATCH /api/v1/keys/{id}/quota`.
+finding: Pydantic's bare `int` type has no upper bound, while `api_keys.quota_calls` is a
+Postgres `INTEGER` column — 32-bit signed, max 2,147,483,647 — so an arbitrary-precision
+`quota_calls` used to pass request validation and then raise an unhandled error at the database
+layer — caught by the app's global exception handler (so never a crash or an information leak,
+just an unnecessary 500 where a clean 422 belongs). The 1,000,000,000 cap sits comfortably under
+that column's own ceiling, so it stays valid without needing to change if the column type ever
+does. Fixed at the Pydantic layer, on both `POST /api/v1/keys` and `PATCH /api/v1/keys/{id}/quota`.
 
 ## What this deliberately does not do
 
