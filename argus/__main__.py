@@ -11,6 +11,7 @@ from archon.config_io import export_config, plan_import
 from archon.importer import apply_import, parse_guard_config
 from archon.settings import Settings
 from argus.app import create_app
+from argus.reencrypt import reencrypt_credentials
 from db.database import Database
 from db.repo import ServerRepo, SettingsRepo
 
@@ -170,6 +171,59 @@ async def _run_check(path: str) -> int:
         await db.close()
 
 
+async def _run_reencrypt(apply: bool) -> int:
+    """R2 (issue #29): re-encrypt stored encrypted-tier credentials under the active key.
+
+    Rotation sequence this command completes: deploy the new key FIRST in the ring
+    (ACROPOLIS_SECRET_KEYS="<new>,<old>") → run `argus reencrypt --apply` → deploy with only
+    the new key. The provider is built directly from the environment's key ring — the command
+    is only meaningful for the `encrypted` tier, so it does not go through the tier-selecting
+    build_secret_provider(); if no key material is configured, EncryptedProviderConfigError
+    fails loudly at construction instead of silently doing nothing.
+
+    Exit code: 0 = all enc:v1: credentials re-encrypted (or none existed), 1 = at least one
+    credential could not be decrypted (its key is no longer in the ring, or its ciphertext is
+    corrupted) — the walk reports each failure and leaves those rows untouched.
+    """
+    settings = Settings()
+    db = _make_db(settings)
+    await db.connect()
+    try:
+        from archon.secrets.encrypted import EncryptedProviderConfigError, EncryptedSecretProvider
+
+        try:
+            provider = EncryptedSecretProvider()
+        except EncryptedProviderConfigError as e:
+            print(f"error: {e}", file=sys.stderr)
+            print(
+                "reencrypt requires the encrypted secret provider's key material "
+                "(ACROPOLIS_SECRET_KEYS or ACROPOLIS_SECRET_KEY[_FILE])",
+                file=sys.stderr,
+            )
+            return 1
+
+        result = await reencrypt_credentials(
+            provider, ServerRepo(db), dry_run=not apply
+        )
+        if apply:
+            print(f"scanned {result.scanned} server(s); re-encrypted "
+                  f"{result.reencrypted} enc:v1: credential(s) under the active key")
+        else:
+            print(f"scanned {result.scanned} server(s); {result.reencrypted} enc:v1: "
+                  f"credential(s) would be re-encrypted (dry run — re-run with --apply)")
+        print(f"  skipped {result.skipped} (literal/vault/no credential)")
+        for slug, reason in result.failed:
+            print(f"  FAILED {slug}: {reason}", file=sys.stderr)
+        if result.failed:
+            print("\nre-encryption incomplete: the failed rows above were left untouched "
+                  "(their keys are not in the ring, or their ciphertext is corrupted)",
+                  file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        await db.close()
+
+
 def cli() -> None:
     parser = argparse.ArgumentParser(prog="argus")
     subparsers = parser.add_subparsers(dest="command")
@@ -203,6 +257,14 @@ def cli() -> None:
     )
     check_parser.add_argument("path", help="Path to an exported YAML file")
 
+    reencrypt_parser = subparsers.add_parser(
+        "reencrypt", help="Re-encrypt stored encrypted-tier credentials under the active key "
+        "(R2, issue #29 — run after deploying a new ACROPOLIS_SECRET_KEYS ring)"
+    )
+    reencrypt_parser.add_argument(
+        "--apply", action="store_true", help="Actually rewrite the credentials (default: dry run)"
+    )
+
     args = parser.parse_args()
 
     if args.command == "import":
@@ -214,6 +276,8 @@ def cli() -> None:
     elif args.command == "check":
         exit_code = asyncio.run(_run_check(args.path))
         raise SystemExit(exit_code)
+    elif args.command == "reencrypt":
+        raise SystemExit(asyncio.run(_run_reencrypt(args.apply)))
     else:
         _run_server()
 

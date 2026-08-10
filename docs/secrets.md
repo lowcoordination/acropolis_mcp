@@ -29,10 +29,16 @@ A literal typed into the server form is encrypted at write time and stored as
 `enc:v1:<base64(nonce || ciphertext || tag)>`. Resolved back to plaintext at call time using a
 32-byte data key from:
 
-1. `ACROPOLIS_SECRET_KEY` — the key itself, as 64 hex characters or standard base64.
-2. `ACROPOLIS_SECRET_KEY_FILE` — a path to a file containing the same.
+1. `ACROPOLIS_SECRET_KEYS` — a key **ring**: comma-separated key materials (each 64 hex chars
+   or standard base64). The **first** key is the *active* key, used for all new encryptions;
+   the remaining keys are decryption-only. This is the rotation form.
+2. `ACROPOLIS_SECRET_KEYS_FILE` — a file containing the same ring, one key material per line
+   (blank lines ignored); the first non-blank line is the active key.
+3. `ACROPOLIS_SECRET_KEY` — the original single key, unchanged: equivalent to a one-key ring.
+4. `ACROPOLIS_SECRET_KEY_FILE` — the original single-key file, unchanged.
 
-One of these is required when `encrypted` is selected; there is no default key. Generate one with:
+Setting both a plural and a singular form is a configuration error (ambiguous intent). One of
+the four is required when `encrypted` is selected; there is no default key. Generate keys with:
 
 ```bash
 openssl rand -hex 32
@@ -44,19 +50,20 @@ future provider version dispatches on the prefix and can still decrypt old data.
 
 > [!WARNING] Threat model — read this before trusting this tier for anything
 >
-> **This defends backup and snapshot leakage**: a stolen `gateway.db` file, a leaked
-> `sqlite3 .backup` copy (see [backup-and-upgrades.md](backup-and-upgrades.md)), a volume
-> snapshot that ends up somewhere it shouldn't. Without the key — which is never itself stored in
-> the database — the ciphertext in `upstream_auth_header` is useless.
+> **This defends backup and snapshot leakage**: a stolen copy of the database, a leaked
+> `pg_dump` / volume snapshot that ends up somewhere it shouldn't. Without the key — which is
+> never itself stored in the database — the ciphertext in `upstream_auth_header` is useless.
 >
 > **This does NOT defend a live host compromise.** If an attacker has code execution on the
-> running Acropolis process, or read access to wherever `ACROPOLIS_SECRET_KEY` /
-> `ACROPOLIS_SECRET_KEY_FILE` is configured (an env var, a mounted file, a compose/k8s secret),
-> they can decrypt everything the application can decrypt — the same way the application itself
-> does on every call. That is not a bug to fix later; it's what "the app needs the plaintext to
-> authenticate outbound calls" necessarily means for any software running as one process.
+> running Acropolis process, or read access to wherever `ACROPOLIS_SECRET_KEY[_FILE]` /
+> `ACROPOLIS_SECRET_KEYS[_FILE]` is configured (an env var, a mounted file, a compose/k8s
+> secret), they can decrypt everything the application can decrypt — the same way the
+> application itself does on every call. That is not a bug to fix later; it's what "the app
+> needs the plaintext to authenticate outbound calls" necessarily means for any software
+> running as one process. The key ring does not change this boundary: every key in the ring is
+> exactly as powerful as every other, and stays fully live until removed after re-encryption.
 >
-> **A key file sitting in the same volume as `gateway.db` provides zero real protection.** It
+> **A key file sitting in the same volume as the database provides zero real protection.** It
 > defeats the entire point of this tier: an attacker (or a backup) that gets the database gets
 > the key sitting right next to it. Put the key somewhere the database backup doesn't reach — a
 > separate secret store, a different volume, an env var injected only into the running
@@ -65,6 +72,48 @@ future provider version dispatches on the prefix and can still decrypt old data.
 > Overclaiming what `encrypted` buys you is worse than not building it. State the boundary
 > plainly: this is AES-GCM-with-an-external-key, defending the realistic homelab threat of a
 > leaked backup — not a substitute for host security.
+
+### Rotating the key
+
+Rotation is the key ring's reason to exist. The whole sequence, in order:
+
+```bash
+# 1. Generate the new key (keep the old one — you still need it for this step)
+NEW=$(openssl rand -hex 32)
+
+# 2. Deploy with BOTH keys: new key FIRST (active), old key second (decryption-only).
+#    Example compose/k8s env:
+#      ACROPOLIS_SECRET_KEYS="$NEW,$OLD"
+#    The app keeps working the entire time: existing enc:v1: ciphertext still resolves
+#    (old key is in the ring), new writes go under the new key.
+#    (If you use ACROPOLIS_SECRET_KEYS_FILE instead: new key on the first line, old key
+#    on the second.)
+
+# 3. Re-encrypt every stored credential under the new active key (dry run first):
+argus reencrypt                 # preview: what WOULD be re-encrypted
+argus reencrypt --apply         # actually rewrite, exit 0 = all succeeded
+
+# 4. Deploy with ONLY the new key:
+#      ACROPOLIS_SECRET_KEYS="$NEW"
+#    (or ACROPOLIS_SECRET_KEY="$NEW"). The old key is now gone from the process.
+
+# 5. Confirm rotation is complete — every enc:v1: credential must resolve under the new key
+#    alone. `argus reencrypt --apply` failing with a nonzero exit in step 3 already tells you
+#    which server(s) still hold ciphertext the ring can't decrypt.
+```
+
+What each step guards against:
+
+- **Deploying the new key alone first (skipping step 2) would brick every stored credential** —
+  construction only validates key *length*, so the app starts fine and fails later, per-server,
+  at the next outbound call. The ring exists so rotation has no downtime window where
+  credentials are undecryptable.
+- **Skipping step 3 (re-encryption) means the old key stays live forever** — the ring does not
+  shrink a key's power; it only lets old ciphertext keep resolving during rotation. Drop the
+  old key only after re-encryption reports every credential rewritten.
+- **`argus reencrypt` requires the encrypted tier's key material** (any of the four env forms);
+  without it the command fails at construction with a clear error rather than doing nothing.
+  Literal credentials and `vault://` references are skipped — they are not this tier's format.
 
 ### `openbao` — a generic HashiCorp Vault KV v2 client
 

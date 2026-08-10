@@ -22,12 +22,29 @@ Format: `enc:v1:<base64(nonce || ciphertext || tag)>`. The `v1` version tag mean
 evolve later (a new KDF, a new AEAD, a wrapped-DEK/KMS scheme) without breaking already-encrypted
 data — a future v2 provider can still decrypt v1 ciphertext by dispatching on the prefix.
 
-Key sourcing (first match wins, checked at provider construction):
-1. `ACROPOLIS_SECRET_KEY` — a 32-byte key, given as 64 hex chars or standard base64.
-2. `ACROPOLIS_SECRET_KEY_FILE` — a path to a file containing the same.
-3. Neither set: the provider fails to construct (see EncryptedProviderConfigError) rather than
-   silently falling back to no encryption or a fixed/derived key baked into the binary — a
-   missing key is a configuration error, not a default to paper over.
+Key sourcing (checked at provider construction):
+
+1. `ACROPOLIS_SECRET_KEYS` — a key RING: comma-separated key materials, each 32 bytes given
+   as 64 hex chars or standard base64. The FIRST key is the ACTIVE key (used for all new
+   encryptions); the remaining keys are decryption-only. This is the rotation form.
+2. `ACROPOLIS_SECRET_KEYS_FILE` — a file containing the same ring, one key material per line
+   (blank lines ignored); the first non-blank line is the ACTIVE key.
+3. `ACROPOLIS_SECRET_KEY` / `ACROPOLIS_SECRET_KEY_FILE` — the original SINGULAR forms,
+   unchanged: equivalent to a one-key ring (that key is active AND the only decryption key).
+   A key ring of length one is exactly the pre-rotation behaviour.
+4. Setting BOTH a plural and a singular form is a configuration error (ambiguous intent —
+   there is no sensible precedence between "the ring" and "the single key"), raised at
+   construction like any other key-material error.
+5. None of the above set: the provider fails to construct (see EncryptedProviderConfigError)
+   rather than silently falling back to no encryption or a fixed/derived key baked into the
+   binary — a missing key is a configuration error, not a default to paper over.
+
+Rotation is the ring's only reason to exist: deploy the new key FIRST in the ring (old keys
+behind it) → run the `reencrypt` CLI command to rewrite every stored credential under the new
+active key → deploy with only the new key. Until re-encryption, every key in the ring remains
+fully live — the ring does not shrink a key's power, it just allows ciphertext written under
+older keys to keep resolving while rotation is in flight. See docs/secrets.md's rotation
+runbook.
 
 A real external KMS (calling out to AWS KMS / GCP KMS / age / etc. to unwrap a per-install data
 key rather than reading it directly from an env var) is a documented future extension point —
@@ -138,18 +155,127 @@ def build_key_source() -> KeySource:
     )
 
 
+class KeyRing:
+    """An ordered set of 32-byte keys with exactly one ACTIVE key (the first) for writes.
+
+    `keys[0]` is the active key: `store()` always encrypts under it. `resolve()` tries the
+    active key first, then each remaining key in order, and only fails when ALL of them fail —
+    which is what lets ciphertext written under a pre-rotation key keep resolving while the
+    new key is already active for new writes (the rotation window).
+
+    The ring deliberately does not change the threat model of this tier: every key in the ring
+    is exactly as powerful as every other (all of them decrypt everything), and keys stay
+    fully live until the operator REMOVES them from the ring after re-encrypting. Rotation is
+    "deploy new active → re-encrypt → drop old", not "add a key and forget it".
+    """
+
+    def __init__(self, keys: list[bytes]):
+        if not keys:
+            raise EncryptedProviderConfigError("key ring is empty — at least one key is required")
+        for key in keys:
+            if len(key) != _KEY_LENGTH_BYTES:
+                raise EncryptedProviderConfigError(
+                    f"key ring contains a key of {len(key)} bytes; AES-256-GCM requires exactly "
+                    f"{_KEY_LENGTH_BYTES}"
+                )
+        self._keys = list(keys)
+
+    @property
+    def active(self) -> bytes:
+        """The key new ciphertext is written under (always the FIRST key in the ring)."""
+        return self._keys[0]
+
+    @property
+    def candidates(self) -> list[bytes]:
+        """All decryption keys, active first — resolve() iterates these in order."""
+        return list(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+
+class EnvKeyRingSource:
+    """`ACROPOLIS_SECRET_KEYS`: comma-separated key materials. Safe to split on commas because
+    neither hex nor standard base64 contains one. First entry = ACTIVE."""
+
+    def __init__(self, env_var: str = "ACROPOLIS_SECRET_KEYS"):
+        raw = os.environ.get(env_var)
+        if not raw:
+            raise EncryptedProviderConfigError(f"{env_var} is not set")
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if not parts:
+            raise EncryptedProviderConfigError(f"{env_var} is set but contains no key material")
+        self._keys = [_parse_key_material(p) for p in parts]
+
+    def keys(self) -> list[bytes]:
+        return self._keys
+
+
+class FileKeyRingSource:
+    """`ACROPOLIS_SECRET_KEYS_FILE`: one key material per line, blank lines ignored. First
+    non-blank line = ACTIVE."""
+
+    def __init__(self, path: str):
+        try:
+            text = Path(path).read_text()
+        except OSError as e:
+            raise EncryptedProviderConfigError(f"could not read key file {path!r}: {e}") from e
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            raise EncryptedProviderConfigError(f"key file {path!r} contains no key material")
+        self._keys = [_parse_key_material(l) for l in lines]
+
+    def keys(self) -> list[bytes]:
+        return self._keys
+
+
+def build_key_ring() -> KeyRing:
+    """Resolve a key ring from the environment, per the module docstring's precedence:
+    plural env → plural file → singular (as a one-key ring). Both plural AND singular set is
+    an ambiguous-configuration error rather than a silently-chosen precedence."""
+    plural_env = os.environ.get("ACROPOLIS_SECRET_KEYS")
+    plural_file = os.environ.get("ACROPOLIS_SECRET_KEYS_FILE")
+    singular_env = os.environ.get("ACROPOLIS_SECRET_KEY")
+    singular_file = os.environ.get("ACROPOLIS_SECRET_KEY_FILE")
+
+    if (plural_env or plural_file) and (singular_env or singular_file):
+        raise EncryptedProviderConfigError(
+            "both the plural (ACROPOLIS_SECRET_KEYS[_FILE]) and singular "
+            "(ACROPOLIS_SECRET_KEY[_FILE]) key variables are set — use the plural form for a "
+            "key ring, or the singular form for a single key, not both"
+        )
+    if plural_env:
+        return KeyRing(EnvKeyRingSource().keys())
+    if plural_file:
+        return KeyRing(FileKeyRingSource(plural_file).keys())
+    return KeyRing([build_key_source().get_key()])
+
+
 class EncryptedSecretProvider:
-    def __init__(self, key_source: Optional[KeySource] = None):
-        self._key_source = key_source or build_key_source()
+    def __init__(self, key_source: Optional[KeySource] = None, key_ring: Optional[KeyRing] = None):
+        """Accepts EITHER a key_ring (the rotation-aware form) OR a legacy single key_source
+        (wrapped as a one-key ring for backwards compatibility), OR neither (resolve the ring
+        from the environment via build_key_ring). Passing both is a programming error — the
+        caller is telling us two different things about which key to write with."""
+        if key_source is not None and key_ring is not None:
+            raise ValueError("pass either key_source or key_ring, not both")
+        if key_ring is not None:
+            self._ring = key_ring
+        elif key_source is not None:
+            self._ring = KeyRing([key_source.get_key()])
+        else:
+            self._ring = build_key_ring()
         # Fail fast at construction, not on the first resolve() — a misconfigured key should
         # surface at app startup (or at test-fixture construction), not as a mysterious 500 on
-        # the first real tool call.
-        key = self._key_source.get_key()
+        # the first real tool call. Construction validates the ACTIVE key's length (ring
+        # construction validates every key, but keep the explicit check for the key_source path).
+        key = self._ring.active
         if len(key) != _KEY_LENGTH_BYTES:
             raise EncryptedProviderConfigError(
                 f"key must be exactly {_KEY_LENGTH_BYTES} bytes, got {len(key)}"
             )
-        self._aesgcm = AESGCM(key)
+        self._aesgcm = AESGCM(self._ring.active)
+        self._aesgcms = [AESGCM(k) for k in self._ring.candidates]
 
     async def resolve(self, ref: str) -> str:
         if not ref.startswith(PREFIX):
@@ -164,18 +290,22 @@ class EncryptedSecretProvider:
         if len(blob) < _NONCE_LENGTH_BYTES:
             raise SecretResolutionError(ref, "ciphertext too short to contain a nonce")
         nonce, ciphertext = blob[:_NONCE_LENGTH_BYTES], blob[_NONCE_LENGTH_BYTES:]
-        try:
-            plaintext = self._aesgcm.decrypt(nonce, ciphertext, None)
-        except InvalidTag as e:
-            # Wrong key or corrupted/tampered ciphertext — GCM's authentication tag check failed.
-            # This must NEVER return a garbage/partial plaintext; decrypt() either returns the
-            # exact original bytes or raises. Deliberately does not distinguish "wrong key" from
-            # "corrupted data" in the message — that distinction isn't recoverable from the
-            # ciphertext alone, and speculating in either direction would just be guessing.
-            raise SecretResolutionError(
-                ref, "decryption failed (wrong key or corrupted ciphertext)"
-            ) from e
-        return plaintext.decode("utf-8")
+        # Try the active key first, then each remaining ring key in order (the rotation
+        # window: pre-rotation ciphertext resolves via an older key until re-encryption).
+        # GCM's tag check makes each attempt safe — a wrong key simply fails the tag, it can
+        # never return garbage — so trying more keys cannot weaken the fail-closed guarantee;
+        # it only widens WHO counts as "having the key".
+        for aesgcm in self._aesgcms:
+            try:
+                plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+                return plaintext.decode("utf-8")
+            except InvalidTag:
+                continue
+        # Every ring key failed — wrong keys or corrupted/tampered ciphertext (indistinguishable,
+        # and deliberately kept indistinguishable for the same reason as before: the distinction
+        # isn't recoverable from the ciphertext alone, and speculating is just guessing). The
+        # message is UNCHANGED from the single-key era so log/alert greps keep working.
+        raise SecretResolutionError(ref, "decryption failed (wrong key or corrupted ciphertext)")
 
     async def store(self, ref: str, value: str) -> str:
         nonce = os.urandom(_NONCE_LENGTH_BYTES)
