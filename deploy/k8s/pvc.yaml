@@ -8,8 +8,11 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      # SQLite (config + audit log). 1Gi is generous for a homelab-scale deployment; raise
-      # this if you expect a large audit log and a long retention window.
+      # Postgres is now where config + audit log live (enterprise #7, issue #8) — this volume is
+      # no longer database storage. It's kept only because ACROPOLIS_DATA_DIR is still the
+      # documented location for non-database on-disk state (e.g. ACROPOLIS_SECRET_KEY_FILE's
+      # default neighbourhood, see docs/secrets.md) and removing it would break existing
+      # deployments' mounts for no benefit. 1Gi is generous for that much smaller footprint;
+      # shrink it if you're provisioning fresh.
       storage: 1Gi
-  # No storageClassName set — uses your cluster's default. Set one explicitly if you need a
-  # specific class (e.g. a fast SSD-backed class, since SQLite is latency-sensitive on writes).
+  # No storageClassName set — uses your cluster's default.

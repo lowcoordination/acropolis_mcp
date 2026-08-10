@@ -6,9 +6,18 @@ metadata:
   labels:
     app: acropolis
 spec:
-  replicas: 1  # SQLite-backed; don't scale beyond 1 replica without moving to a shared DB first
-  strategy:
-    type: Recreate  # avoids two pods writing the same SQLite files at once during a rollout
+  # Postgres (enterprise #7, issue #8) removed the single-writer constraint SQLite had — there's
+  # no longer a correctness reason to cap this at 1. Left at 1 here because nothing else in this
+  # manifest set (no HPA, no session affinity considerations documented) has been worked through
+  # for a multi-replica deployment yet; raise it once you have, and size Postgres's own
+  # max_connections and this app's ACROPOLIS_DB_WRITER_POOL_MAX/ACROPOLIS_DB_READER_POOL_MAX
+  # (docs/postgres.md) for the total replica count you land on.
+  replicas: 1
+  # No `strategy:` override — RollingUpdate (the Deployment default) is safe now. Pre-cutover
+  # this was pinned to `Recreate` because SQLite's single-writer model meant two pods briefly
+  # running side by side during a rollout would mean two processes fighting over the same
+  # on-disk files. Postgres, not a per-process lock, now serializes concurrent writers, so that
+  # constraint is gone.
   selector:
     matchLabels:
       app: acropolis
@@ -47,6 +56,20 @@ spec:
           env:
             - name: ACROPOLIS_DATA_DIR
               value: /data
+            # Postgres is a hard boot requirement (enterprise #7, issue #8) — see
+            # db/database.py's DatabaseNotConfiguredError and docs/postgres.md. This manifest
+            # set deliberately does NOT bundle a Postgres StatefulSet: it treats the database the
+            # same way it already treats ACROPOLIS_ADMIN_TOKEN below — an operator-supplied
+            # external dependency, wired through a Secret this repo doesn't create for you.
+            # Point it at a managed instance (RDS, Cloud SQL, ...) or a Postgres you run
+            # elsewhere in-cluster; create the Secret yourself, e.g.:
+            #   kubectl -n acropolis create secret generic acropolis-db \
+            #     --from-literal=url='postgresql://user:pass@host:5432/acropolis'
+            - name: ACROPOLIS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: acropolis-db
+                  key: url
             # Optional: a bearer-token override for the /api/v1 control plane (CI/automation
             # only — normal use goes through the browser login flow instead). Uncomment and
             # point at a real Secret if you want this.
