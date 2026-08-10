@@ -29,7 +29,7 @@ dev = [
     # Pinned to 1.29.0 (protocol 2025-06-18) to match the real upstream fleet's generation —
     # the mcp package's own 2.0.0 already speaks the 2026-07-28 stateless spec, which is the
     # generation Argus needs to BRIDGE to, not the one its test fixtures should emulate as upstream.
-    "mcp==1.29.0",
+    "mcp>=1.29.0,<2.0.0",
 ]
 # Enterprise #9: OpenTelemetry tracing. Deliberately a SEPARATE optional-dependencies group from
 # `dev`, not folded into it — `dev` is "what CI and contributors need to run the test suite",

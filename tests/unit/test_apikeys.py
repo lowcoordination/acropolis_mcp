@@ -86,3 +86,10 @@ async def test_two_keys_have_different_hashes(service):
     assert a.plaintext != b.plaintext
     # verifying one must not match the other
     assert (await service.verify(a.plaintext)).id != (await service.verify(b.plaintext)).id
+
+
+async def test_get_missing_key_returns_none_without_raising(service):
+    """Verify that ApiKeyService.get for a non-existent key ID returns None without raising NameError."""
+    result = await service.get(999999)
+    assert result is None
+

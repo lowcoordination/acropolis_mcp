@@ -121,9 +121,11 @@ class FileKeySource:
 def build_key_source() -> KeySource:
     """Resolve a KeySource from the environment, per the module docstring's precedence order."""
     if os.environ.get("ACROPOLIS_SECRET_KEY"):
+        logger.info("Initializing EncryptedSecretProvider from ACROPOLIS_SECRET_KEY environment variable")
         return EnvKeySource()
     key_file = os.environ.get("ACROPOLIS_SECRET_KEY_FILE")
     if key_file:
+        logger.info("Initializing EncryptedSecretProvider from key file: %s", key_file)
         return FileKeySource(key_file)
     raise EncryptedProviderConfigError(
         "encrypted secret provider selected but neither ACROPOLIS_SECRET_KEY nor "
