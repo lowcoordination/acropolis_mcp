@@ -360,6 +360,11 @@ class SettingsResponse(BaseModel):
     # settings, not editable through this API), surfaced purely so the server form can hint
     # which shape of value ("a literal" vs "a vault://... reference") is expected right now.
     secret_provider: str
+    # Enterprise #9: approval workflows. approvals_enabled defaults to false (off by default —
+    # disabled is byte-identical to pre-feature behaviour); approvals_ttl_days is how long a
+    # pending proposal lives before the expiry sweep marks it expired (default 7).
+    approvals_enabled: bool
+    approvals_ttl_days: int
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -379,6 +384,11 @@ class SettingsUpdateRequest(BaseModel):
     webhook_enabled: Optional[bool] = None
     webhook_events: Optional[list[str]] = None
     webhook_allow_private: Optional[bool] = None
+    # Enterprise #9: approval workflows. approvals_ttl_days is validated > 0 in the route
+    # handler (same place audit_retention_days' range check lives) so the 400 can name the bad
+    # value; <= 0 at expiry time means "keep forever", matching audit_retention_days' opt-out.
+    approvals_enabled: Optional[bool] = None
+    approvals_ttl_days: Optional[int] = None
 
     @model_validator(mode="after")
     def _check_webhook_url(self) -> "SettingsUpdateRequest":
@@ -493,6 +503,47 @@ class ConfigImportResponse(BaseModel):
     actions: list[ConfigImportAction]
     warnings: list[str] = []
     errors: list[str] = []
+
+
+class ProposalPendingResponse(BaseModel):
+    """Body of the 202 a write path returns when approvals are enabled and the change was
+    queued instead of applied — the shape PUT /servers/{slug}/policy and POST /config/import
+    take on instead of their normal 200 bodies. Deliberately tiny: just the proposal id and
+    state; everything else lives under /proposals/{id}."""
+    proposal_id: int
+    state: str = "pending"
+    message: str = "change queued for approval"
+
+
+class ProposalResponse(BaseModel):
+    """One proposal row as surfaced by GET /proposals. Identity fields only — the payload
+    (policy/YAML intent) is deliberately NOT in the list view; GET /proposals/{id} is where the
+    recomputed preview lives, admin-gated like everything here."""
+    id: int
+    target_type: str  # 'server_policy' | 'config_import'
+    target_id: str
+    proposer: str
+    state: str  # pending | approved | rejected | expired
+    created_at: str
+    resolved_at: Optional[str] = None
+    resolver: Optional[str] = None
+    resolution_reason: Optional[str] = None
+
+
+class ProposalDetailResponse(ProposalResponse):
+    """GET /proposals/{id}: the proposal plus its RECOMPUTED preview (never a stored stale
+    diff — see archon/approvals.py's preview()). `stale` tells the approver up front whether
+    approve() will refuse with "state changed, re-review"."""
+    preview: list[str]
+    stale: bool
+
+
+class ProposalApproveRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+class ProposalRejectRequest(BaseModel):
+    reason: Optional[str] = None
 
 
 class SetupStatusResponse(BaseModel):

@@ -130,6 +130,10 @@ class ProjectSlugConflictError(Exception):
     pass
 
 
+class ProposalNotFoundError(Exception):
+    pass
+
+
 def _row_to_server(row: asyncpg.Record) -> ServerRecord:
     # The `if "x" in row.keys()` guards the SQLite version carried on health_reason/project_id
     # are gone: they defended against reading a row from a database where a later ALTER TABLE
@@ -1603,3 +1607,153 @@ class ProjectMemberRepo(_PoolAccess):
                 "DELETE FROM project_members WHERE user_id = $1 AND project_id = $2",
                 user_id, project_id,
             )
+
+
+class ProposalRecord(BaseModel):
+    """One approval-workflow proposal (enterprise #9, issue #10).
+
+    `payload` is the stored INTENT — a JSON string of {"request": ..., "baseline": ...} (see
+    0011_proposals.sql's header for why intent, not a frozen diff). Exposed as Optional-free str
+    (NOT NULL in the schema) with parse_payload() for the same reason AdminEventRecord exposes
+    before/after as raw strings with parse helpers: the identity JSON codec in db/database.py
+    round-trips JSONB as str, and callers parse on demand.
+    """
+
+    id: int
+    target_type: str  # 'server_policy' | 'config_import'
+    target_id: str  # server slug, or 'config' for imports
+    payload: str  # JSON: {"request": ..., "baseline": ...}
+    proposer_user_id: Optional[int] = None
+    proposer: str  # Principal.actor
+    state: str  # pending | approved | rejected | expired
+    created_at: str
+    resolved_at: Optional[str] = None
+    resolver_user_id: Optional[int] = None
+    resolver: Optional[str] = None
+    resolution_reason: Optional[str] = None
+
+    def parse_payload(self) -> dict:
+        import json
+
+        return json.loads(self.payload)
+
+
+def _row_to_proposal(row: asyncpg.Record) -> ProposalRecord:
+    return ProposalRecord(
+        id=row["id"],
+        target_type=row["target_type"],
+        target_id=row["target_id"],
+        payload=row["payload"],
+        proposer_user_id=row["proposer_user_id"],
+        proposer=row["proposer"],
+        state=row["state"],
+        created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
+        resolver_user_id=row["resolver_user_id"],
+        resolver=row["resolver"],
+        resolution_reason=row["resolution_reason"],
+    )
+
+
+class ProposalRepo(_PoolAccess):
+    """Approval-workflow proposals (enterprise #9, issue #10).
+
+    The state transition out of 'pending' is the one place this class needs real care: resolve()
+    is a compare-and-swap (UPDATE ... WHERE state = 'pending' ... RETURNING) so that two
+    concurrent approvers cannot both resolve the same proposal — the first commit wins, the
+    second's UPDATE matches zero rows and it sees None. Everything else is a single statement.
+
+    No rows are ever written through the disabled path: the API layer checks the
+    `approvals_enabled` setting before calling create(), so a gateway with approvals off has an
+    empty table forever (the feature's byte-identical-when-disabled guarantee, per the plan).
+    """
+
+    async def create(
+        self,
+        *,
+        target_type: str,
+        target_id: str,
+        payload: str,
+        proposer_user_id: Optional[int],
+        proposer: str,
+    ) -> ProposalRecord:
+        """Insert one pending proposal. `payload` must already be a JSON string."""
+        # [SINGLE-STATEMENT] replaces gateway_write_lock. One INSERT; RETURNING id replaces
+        # lastrowid exactly as AdminEventRepo.insert does.
+        async with self._write() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO proposals
+                   (target_type, target_id, payload, proposer_user_id, proposer, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   RETURNING *""",
+                target_type, target_id, payload, proposer_user_id, proposer, utcnow(),
+            )
+        return _row_to_proposal(row)
+
+    async def get(self, proposal_id: int) -> ProposalRecord:
+        async with self._read() as conn:
+            row = await conn.fetchrow("SELECT * FROM proposals WHERE id = $1", proposal_id)
+        if row is None:
+            raise ProposalNotFoundError(str(proposal_id))
+        return _row_to_proposal(row)
+
+    async def list(
+        self, *, state: Optional[str] = None, limit: int = 200
+    ) -> list[ProposalRecord]:
+        """List proposals, newest first. `state` filters to a single state (None = all)."""
+        async with self._read() as conn:
+            if state is not None:
+                rows = await conn.fetch(
+                    "SELECT * FROM proposals WHERE state = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
+                    state, limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM proposals ORDER BY created_at DESC, id DESC LIMIT $1", limit
+                )
+        return [_row_to_proposal(r) for r in rows]
+
+    async def resolve(
+        self,
+        proposal_id: int,
+        *,
+        state: str,  # 'approved' | 'rejected' | 'expired'
+        resolver_user_id: Optional[int],
+        resolver: Optional[str],
+        resolution_reason: Optional[str],
+    ) -> Optional[ProposalRecord]:
+        """Transition a proposal out of 'pending'. Returns the updated row, or None if the
+        proposal was already resolved (or never existed) — the compare-and-swap makes this safe
+        under concurrency: exactly one caller can win the transition, matching the "two admins
+        both click approve" case the plan names. Callers raise a clear error on None.
+
+        `resolver` is Optional only for the expiry sweep (no human actor — it passes
+        resolver='expiry-sweep', resolver_user_id=None and a NULL reason).
+        """
+        # [SINGLE-STATEMENT] replaces gateway_write_lock — the WHERE state = 'pending' clause IS
+        # the concurrency control, an atomic compare-and-swap the old process-wide lock existed
+        # to emulate for SQLite's single-writer model.
+        async with self._write() as conn:
+            row = await conn.fetchrow(
+                """UPDATE proposals SET state = $2, resolved_at = $3,
+                       resolver_user_id = $4, resolver = $5, resolution_reason = $6
+                   WHERE id = $1 AND state = 'pending'
+                   RETURNING *""",
+                proposal_id, state, utcnow(), resolver_user_id, resolver, resolution_reason,
+            )
+        return _row_to_proposal(row) if row is not None else None
+
+    async def expire_due(self, cutoff_iso: str) -> int:
+        """Expire every pending proposal created before `cutoff_iso` (the TTL sweep). Returns
+        how many were expired. `resolver` labels the sweep as the resolver so the transition is
+        still attributable in the audit trail, same shape as AuditRetentionJob's pruning."""
+        # [SINGLE-STATEMENT] replaces gateway_write_lock.
+        async with self._write() as conn:
+            rows = await conn.fetch(
+                """UPDATE proposals SET state = 'expired', resolved_at = $1,
+                       resolver = 'expiry-sweep'
+                   WHERE state = 'pending' AND created_at < $2
+                   RETURNING id""",
+                utcnow(), cutoff_iso,
+            )
+        return len(rows)

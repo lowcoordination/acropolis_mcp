@@ -28,6 +28,7 @@ MIGRATIONS = [
     "0008_server_health_reason.sql",
     "0009_usage_rollups.sql",
     "0010_projects.sql",
+    "0011_proposals.sql",
 ]
 
 
