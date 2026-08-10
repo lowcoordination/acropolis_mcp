@@ -103,6 +103,35 @@ def _row_to_server(row: aiosqlite.Row) -> ServerRecord:
     )
 
 
+async def _default_project_id(conn: aiosqlite.Connection) -> Optional[int]:
+    """Enterprise #4: resolves the backfilled 'default' project's id, used by ServerRepo.create/
+    ApiKeyRepo.create as the fallback when a caller passes project_id=None (or omits it) —
+    NOT left as a literal NULL row. Every server/key created through the real control-plane API
+    already resolves an explicit project_id before calling these methods (archon/api.py's
+    _resolve_project_id, defaulting to "default" via ServerCreateRequest/KeyCreateRequest's own
+    project_slug default) — this fallback exists for every OTHER caller (the CLI import path,
+    direct repo access in tests that predate projects, any future internal caller) so a resource
+    created without an explicit project_id still lands somewhere real rather than in a NULL-
+    project limbo that every project-scoping filter (and the pipeline's key/server agreement
+    check) would then treat as "belongs to no project" and silently exclude/refuse.
+
+    Returns None only if 'default' itself doesn't exist yet (unreachable post-migration on any
+    real database — 0011_projects.sql always creates it — but reachable in a throwaway
+    connection built directly against a fresh, unmigrated schema, e.g. some unit tests that
+    construct a bare aiosqlite connection without going through Database.connect()); callers
+    treat that None exactly like an explicitly-passed None, i.e. the row's project_id stays NULL,
+    consistent with this migration's own fail-closed discipline rather than raising.
+    """
+    try:
+        cur = await conn.execute("SELECT id FROM projects WHERE slug = 'default'")
+        row = await cur.fetchone()
+    except aiosqlite.OperationalError:
+        # `projects` table doesn't exist at all yet (pre-0011 schema) — same "no default to fall
+        # back to" outcome as the row-not-found case above.
+        return None
+    return row[0] if row else None
+
+
 class ServerRepo:
     """CRUD for `servers` + their attached `server_policies` / `tool_policies` / `param_rules`.
 
@@ -187,6 +216,12 @@ class ServerRepo:
             existing = await self._write.execute("SELECT 1 FROM servers WHERE slug = ?", (slug,))
             if await existing.fetchone() is not None:
                 raise SlugConflictError(slug)
+
+            # Enterprise #4: project_id=None (the default, and every pre-projects caller's
+            # implicit choice) resolves to the 'default' project rather than staying NULL — see
+            # _default_project_id's docstring for why this must not be a literal NULL row.
+            if project_id is None:
+                project_id = await _default_project_id(self._write)
 
             await self._write.execute("BEGIN IMMEDIATE")
             try:
@@ -463,6 +498,10 @@ class ApiKeyRepo:
                       project_id: Optional[int] = None) -> ApiKeyRecord:
         now = utcnow()
         async with self._db.gateway_write_lock:
+            # Enterprise #4: same 'default'-project fallback as ServerRepo.create — see
+            # _default_project_id's docstring.
+            if project_id is None:
+                project_id = await _default_project_id(self._write)
             cur = await self._write.execute(
                 """INSERT INTO api_keys
                    (name, key_hash, key_prefix, server_scopes, created_at, quota_calls, quota_period,
