@@ -9,11 +9,10 @@ deployment around it: this is visibility scoping, not tenant isolation.
 Two ways to run several teams/environments through Acropolis:
 
 - **Option A — one Acropolis instance per team.** Zero code, deployment pattern only: stand up a
-  separate container/pod per team, each with its own data directory, admin, and servers. This
-  gives you real isolation (separate SQLite files, separate process, a compromise of one
-  instance's admin credentials doesn't touch another's) and is still the right answer for small
-  deployments or when teams genuinely should not share fate with each other's config or audit
-  log.
+  separate container/pod per team, each with its own Postgres database, admin, and servers. This
+  gives you real isolation (separate database, separate process, a compromise of one instance's
+  admin credentials doesn't touch another's) and is still the right answer for small deployments
+  or when teams genuinely should not share fate with each other's config or audit log.
 - **Option B — one instance, multiple projects (this feature).** Selected for Acropolis when a
   single control plane, single set of instance-wide settings (auth mode, webhook config, GitOps
   source), and cross-project visibility for instance admins is worth more than the isolation
@@ -32,8 +31,8 @@ behaves byte-identically to a build that never had this feature.
 - No per-project settings overrides — `auth_mode`, webhook configuration, GitOps source, audit
   retention, and every other instance-wide setting apply identically across all projects.
 - No noisy-neighbor QoS — rate limits and quotas are per-server/per-key, same as before; a
-  heavily-used project can affect shared resources (the process, the SQLite write lock) the same
-  way any heavy project-less usage always could.
+  heavily-used project can affect shared resources (the process, the Postgres connection pool —
+  see [docs/postgres.md](postgres.md)) the same way any heavy project-less usage always could.
 - No data-plane network isolation — every project's servers are proxied through the same
   Acropolis process and the same outbound HTTP client.
 
@@ -177,6 +176,7 @@ import has always been a global-admin-only, instance-wide action.
 - `project_members` (user_id, project_id, role) — composite primary key, one row per membership
 - `servers.project_id`, `api_keys.project_id` — the resource's owning project
 - `usage_rollups.project_id` — populated at write time and backfilled by the migration; audit
-  events (`audit.db`, a separate SQLite file from `gateway.db` where projects live) are scoped by
-  resolving the calling project's server slugs and filtering on `server_slug IN (...)`, since
-  there is no cross-database JOIN available.
+  events are scoped by resolving the calling project's server slugs and filtering on
+  `server_slug IN (...)`, since `audit_events.server_slug` is a bare TEXT column with no FK to
+  `servers.id` (audit rows must survive a server being renamed or deleted), not because of any
+  cross-database limitation — audit events and projects live in the same Postgres database.

@@ -21,7 +21,14 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const { data: projects } = useProjects()
   const [activeProjectId, setActiveProjectIdState] = useState<number | null>(() => {
     const stored = window.localStorage.getItem(STORAGE_KEY)
-    return stored ? Number(stored) : null
+    if (!stored) return null
+    // Fix (review 2026-08-10): a corrupted/hand-edited stored value (e.g. non-numeric text)
+    // used to become NaN here — briefly a real (invalid) state value, sent as project_id=NaN
+    // on the first render's requests, before the "unknown project id" effect below caught up
+    // and reset it a render later. Validate at read time instead, so an invalid stored value
+    // never becomes state at all.
+    const parsed = Number(stored)
+    return Number.isInteger(parsed) ? parsed : null
   })
 
   // If the persisted project id no longer exists (deleted, or this browser's storage predates
