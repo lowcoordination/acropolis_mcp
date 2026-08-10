@@ -8,6 +8,13 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # No job-level timeout previously — a hung step (see the "Run pytest" step-level timeout
+    # below for the specific incident this guards against) ran until GitHub Actions' 6h default
+    # instead of failing loud within minutes. 20 minutes is real headroom above every observed
+    # healthy run (dependency install ~15-20s, full suite ~5-9 min against the CI-provisioned
+    # Postgres container) without being so tight that ordinary day-to-day variance in shared
+    # runner load starts producing false-positive timeouts.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -18,11 +25,25 @@ jobs:
       - name: Install package + dev dependencies
         run: python -m pip install --no-cache-dir '.[dev]'
 
+      # Step-level timeout narrower than the job's own, so a hang here specifically produces a
+      # clear "Run pytest" timeout rather than a generic job-level one — easier to diagnose from
+      # the Actions UI alone, without needing to pull the full log the way this incident required.
+      # 15 min covers the full local suite (~5-9 min healthy) plus
+      # tests/integration/test_no_otel_installed.py's no_otel_venv fixture, which builds a
+      # SECOND from-scratch venv and pip-installs into it mid-suite (a real, deliberate design —
+      # proving OTel is genuinely uninstallable rather than mocking the ImportError — not
+      # something to remove). That fixture is now hardened against the specific failure this
+      # incident hit (see its own _run_with_hard_timeout — a plain subprocess.run's timeout
+      # doesn't reliably reap pip's own grandchild processes under degraded runner network
+      # conditions); this step timeout is the outer backstop in case a future hang isn't one
+      # that fix covers, not a substitute for it.
       - name: Run pytest
+        timeout-minutes: 15
         run: python -m pytest -q
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: web
