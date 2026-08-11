@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -68,11 +69,26 @@ class PoolExhaustedError(Exception):
 
 @contextlib.asynccontextmanager
 async def acquire_with_timeout(pool: asyncpg.Pool, timeout: float) -> AsyncIterator[asyncpg.Connection]:
+    """Acquire a pooled connection, converting acquisition timeout into PoolExhaustedError.
+
+    The try/except deliberately wraps ONLY the acquisition, not the caller's body. An earlier
+    shape wrapped the `yield` too, which meant an asyncio.TimeoutError raised for any unrelated
+    reason INSIDE the caller's `async with` block (a wait_for around a slow query, a cancelled
+    upstream call) came back out as "pool exhausted, check for a connection leak" — sending
+    whoever debugs it at entirely the wrong subsystem. Only a timeout from pool.acquire() itself
+    is evidence of exhaustion.
+    """
+    acquisition = pool.acquire(timeout=timeout)
     try:
-        async with pool.acquire(timeout=timeout) as conn:
-            yield conn
-    except asyncio.TimeoutError:
-        raise PoolExhaustedError(f"pool exhausted after {timeout}s, check for a connection leak")
+        conn = await acquisition.__aenter__()
+    except asyncio.TimeoutError as e:
+        raise PoolExhaustedError(
+            f"pool exhausted after {timeout}s, check for a connection leak"
+        ) from e
+    try:
+        yield conn
+    finally:
+        await acquisition.__aexit__(*sys.exc_info())
 
 
 def _version_from_filename(filename: str) -> int:

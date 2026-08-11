@@ -327,7 +327,7 @@ async def app_env(tmp_path, request):
     db = Database(tmp_path)
     await db.connect()
     try:
-        app = create_app(settings, db, enable_health_probing=probe_on_create)
+        app = create_app(settings, db, probe_on_create=probe_on_create)
         transport = httpx.ASGITransport(app=app)
         async with app.router.lifespan_context(app):
             yield AppEnv(app=app, transport=transport, db=db, settings=settings)

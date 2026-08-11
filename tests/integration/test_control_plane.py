@@ -226,7 +226,7 @@ async def admin_app_env(tmp_path: Path):
     settings = Settings(data_dir=str(tmp_path), auth_mode="open", admin_token="secret123", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
-    app = create_app(settings, db, enable_health_probing=False)
+    app = create_app(settings, db, probe_on_create=False)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         yield AppEnv(app=app, transport=transport, db=db, settings=settings)
