@@ -274,9 +274,11 @@ def _patch_database(request, postgres_admin_dsn, monkeypatch):
         return real_init(self, dsn, **kwargs)
 
     monkeypatch.setattr(db_database.Database, "__init__", patched_init)
-    yield
-    for dsn in created:
-        _drop_database(postgres_admin_dsn, dsn)
+    try:
+        yield
+    finally:
+        for dsn in created:
+            _drop_database(postgres_admin_dsn, dsn)
 
 
 @pytest.fixture
@@ -288,5 +290,70 @@ def pg_dsn(postgres_admin_dsn):
     outside the repo layer.
     """
     dsn = _create_database(postgres_admin_dsn)
-    yield dsn
-    _drop_database(postgres_admin_dsn, dsn)
+    try:
+        yield dsn
+    finally:
+        _drop_database(postgres_admin_dsn, dsn)
+
+import httpx
+from dataclasses import dataclass
+from fastapi import FastAPI
+from archon.settings import Settings
+from argus.app import create_app
+from db.database import Database
+import pytest
+
+@dataclass
+class AppEnv:
+    app: FastAPI
+    transport: httpx.ASGITransport
+    db: Database
+    settings: Settings
+
+    def client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=self.transport, base_url="http://argus.test")
+
+@pytest.fixture
+async def app_env(tmp_path, request):
+    overrides = getattr(request, "param", {})
+    probe_on_create = overrides.pop("probe_on_create", True)
+    settings = Settings(
+        data_dir=str(tmp_path),
+        auth_mode=overrides.pop("auth_mode", "open"),
+        health_poll_enabled=overrides.pop("health_poll_enabled", False),
+        audit_retention_enabled=overrides.pop("audit_retention_enabled", False),
+        **overrides,
+    )
+    db = Database(tmp_path)
+    await db.connect()
+    try:
+        app = create_app(settings, db, enable_health_probing=probe_on_create)
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            yield AppEnv(app=app, transport=transport, db=db, settings=settings)
+    finally:
+        await db.close()
+
+@pytest.fixture
+async def api_client(app_env):
+    async with app_env.client() as client:
+        yield client
+
+@pytest.fixture
+async def admin_client(app_env):
+    async with app_env.client() as client:
+        resp = await client.post(
+            "/api/v1/setup", json={"admin_password": "test-admin-password-1"}
+        )
+        assert resp.status_code == 200, f"setup failed in admin_client fixture: {resp.text}"
+        yield client
+
+async def login_as(app_env: AppEnv, username: str, password: str) -> httpx.AsyncClient:
+    client = app_env.client()
+    resp = await client.post(
+        "/api/v1/login", json={"username": username, "admin_password": password}
+    )
+    if resp.status_code != 200:
+        await client.aclose()
+        raise AssertionError(f"login failed for {username!r}: {resp.status_code} {resp.text}")
+    return client

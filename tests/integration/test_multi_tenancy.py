@@ -38,25 +38,11 @@ from db.database import Database
 from db.repo import ProjectMemberRepo, ProjectRepo, SettingsRepo, UserRepo
 
 
-@pytest.fixture
-async def mt_app(tmp_path: Path):
-    settings = Settings(
-        data_dir=str(tmp_path), auth_mode="keyed",
-        health_poll_enabled=False, audit_retention_enabled=False,
-    )
-    db = Database(tmp_path)
-    await db.connect()
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as setup_client:
-            await setup_client.post("/api/v1/setup", json={"admin_password": "admin-password-1"})
-        yield app, transport
-    await db.close()
+pytestmark = pytest.mark.parametrize("app_env", [{"auth_mode": "keyed", "probe_on_create": False}], indirect=True)
 
 
-async def _login_as(transport: httpx.ASGITransport, username: str, password: str) -> httpx.AsyncClient:
-    client = httpx.AsyncClient(transport=transport, base_url="http://argus.test")
+async def _login_as(app_env: AppEnv, username: str, password: str) -> httpx.AsyncClient:
+    client = httpx.AsyncClient(transport=app_env.transport, base_url="http://argus.test")
     resp = await client.post("/api/v1/login", json={"username": username, "admin_password": password})
     if resp.status_code != 200:
         raise AssertionError(f"login failed for {username}: {resp.status_code} {resp.text}")
@@ -64,27 +50,27 @@ async def _login_as(transport: httpx.ASGITransport, username: str, password: str
 
 
 async def _create_user_and_login(
-    transport: httpx.ASGITransport, admin_client: httpx.AsyncClient,
+    app_env, admin_client: httpx.AsyncClient,
     username: str, global_role: str, password: str = "password-12345",
 ) -> httpx.AsyncClient:
     resp = await admin_client.post(
         "/api/v1/users", json={"username": username, "password": password, "role": global_role}
     )
     assert resp.status_code == 201, resp.text
-    return await _login_as(transport, username, password)
+    return await _login_as(app_env, username, password)
 
 
 @pytest.fixture
-async def two_projects(mt_app):
+async def two_projects(app_env, admin_client):
     """Project 'alpha' and 'beta', both created by the global admin (project CRUD is
     global-admin-only)."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
     for slug in ("alpha", "beta"):
         resp = await admin_client.post("/api/v1/projects", json={"slug": slug, "name": slug.title()})
         assert resp.status_code == 201, resp.text
     yield
-    await admin_client.aclose()
+    
 
 
 # ---------------------------------------------------------------------------------------------
@@ -171,7 +157,7 @@ async def test_migration_backfills_default_project_and_admin_memberships(pg_dsn)
         await db.close()
 
 
-async def test_setup_wizard_admin_has_no_membership_but_still_administers(mt_app):
+async def test_setup_wizard_admin_has_no_membership_but_still_administers(app_env, admin_client):
     """Contrast case for the migration test above: a user created AFTER migration time (e.g. the
     setup wizard's admin on a brand-new instance, or any user created via POST /users later) gets
     NO automatic project membership row — fail-closed is the correct default for a genuinely NEW
@@ -180,8 +166,8 @@ async def test_setup_wizard_admin_has_no_membership_but_still_administers(mt_app
     test_global_admin_with_zero_memberships_administers_every_project, restated for the
     single-project ('default') case specifically, since that's the byte-identical-on-upgrade
     scenario every prior enterprise item's regression guard cares about most."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
 
     project_repo = ProjectRepo(app.state.db)
     member_repo = ProjectMemberRepo(app.state.db)
@@ -199,11 +185,11 @@ async def test_setup_wizard_admin_has_no_membership_but_still_administers(mt_app
     assert resp.json()["project_slug"] == "default"
 
 
-async def test_single_project_instance_servers_keys_default_project(mt_app):
+async def test_single_project_instance_servers_keys_default_project(app_env, admin_client):
     """A fresh (single-project) instance: every server/key created with no explicit
     project_slug lands in 'default' — the byte-identical-on-upgrade guarantee."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
 
     resp = await admin_client.post(
         "/api/v1/servers", json={"slug": "s1", "name": "S1", "upstream_url": "http://localhost:1/mcp"}
@@ -225,12 +211,12 @@ async def test_single_project_instance_servers_keys_default_project(mt_app):
 # 2. Global-admin superset
 # ---------------------------------------------------------------------------------------------
 
-async def test_global_admin_with_zero_memberships_administers_every_project(mt_app, two_projects):
+async def test_global_admin_with_zero_memberships_administers_every_project(app_env, admin_client, two_projects):
     """The core superset proof: a global admin with LITERALLY ZERO rows in project_members can
     still fully administer every project — verified directly (create a server, edit its policy,
     mint a key, all in a project this admin has no explicit membership row for), not inferred."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
 
     member_repo = ProjectMemberRepo(app.state.db)
     project_repo = ProjectRepo(app.state.db)
@@ -286,17 +272,17 @@ async def test_global_admin_with_zero_memberships_administers_every_project(mt_a
 # 3. Independence: project role is not a filter on global role
 # ---------------------------------------------------------------------------------------------
 
-async def test_global_viewer_project_admin_fully_administers_their_project(mt_app, two_projects):
+async def test_global_viewer_project_admin_fully_administers_their_project(app_env, admin_client, two_projects):
     """A user who is global VIEWER but project-ADMIN in alpha can fully administer alpha
     (create servers, edit policy, manage keys) — their LOW global role does not cap their HIGH
     project role. The same user has NO membership in beta and gets 403 on every beta-scoped
     route."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
     project_repo = ProjectRepo(app.state.db)
     user_repo: UserRepo = app.state.user_repo
 
-    client = await _create_user_and_login(transport, admin_client, "alpha-admin-global-viewer", "viewer")
+    client = await _create_user_and_login(app_env, admin_client, "alpha-admin-global-viewer", "viewer")
     user = await user_repo.get_by_username("alpha-admin-global-viewer")
     alpha = await project_repo.get("alpha")
     beta = await project_repo.get("beta")
@@ -335,18 +321,18 @@ async def test_global_viewer_project_admin_fully_administers_their_project(mt_ap
     assert resp.status_code == 403
 
 
-async def test_global_operator_project_viewer_held_to_viewer_ceiling(mt_app, two_projects):
+async def test_global_operator_project_viewer_held_to_viewer_ceiling(app_env, admin_client, two_projects):
     """A user who is global OPERATOR but project-VIEWER in alpha is capped at viewer's ceiling
     in alpha — their HIGHER global role must NOT leak extra project authority. Global operator
     normally could edit policy directly (see test_rbac.py's
     test_operator_can_edit_policy_directly) — that must NOT carry over to a project where their
     PROJECT role is only viewer."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
     project_repo = ProjectRepo(app.state.db)
     user_repo: UserRepo = app.state.user_repo
 
-    client = await _create_user_and_login(transport, admin_client, "alpha-viewer-global-operator", "operator")
+    client = await _create_user_and_login(app_env, admin_client, "alpha-viewer-global-operator", "operator")
     user = await user_repo.get_by_username("alpha-viewer-global-operator")
     alpha = await project_repo.get("alpha")
 
@@ -401,9 +387,9 @@ PROJECT_ROUTE_MATRIX: list[tuple[str, str, str, Optional[dict]]] = [
 
 
 @pytest.mark.parametrize("method,path,minimum_role,body", PROJECT_ROUTE_MATRIX)
-async def test_project_route_role_matrix(mt_app, two_projects, method, path, minimum_role, body):
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+async def test_project_route_role_matrix(app_env, admin_client, two_projects, method, path, minimum_role, body):
+    app = app_env.app
+    
     project_repo = ProjectRepo(app.state.db)
     user_repo: UserRepo = app.state.user_repo
     alpha = await project_repo.get("alpha")
@@ -421,7 +407,7 @@ async def test_project_route_role_matrix(mt_app, two_projects, method, path, min
     clients: dict[str, httpx.AsyncClient] = {}
     for i, project_role in enumerate(("viewer", "poweruser", "admin")):
         username = f"matrix-user-{project_role}-{path.replace('/', '_')}"
-        client = await _create_user_and_login(transport, admin_client, username, "viewer")
+        client = await _create_user_and_login(app_env, admin_client, username, "viewer")
         user = await user_repo.get_by_username(username)
         resp = await admin_client.put(
             f"/api/v1/projects/{alpha.id}/members", json={"user_id": user.id, "role": project_role}
@@ -453,17 +439,17 @@ async def test_project_route_role_matrix(mt_app, two_projects, method, path, min
 # 4. Fail-closed on garbage project role
 # ---------------------------------------------------------------------------------------------
 
-async def test_garbage_project_role_denied_everywhere(mt_app, two_projects):
+async def test_garbage_project_role_denied_everywhere(app_env, admin_client, two_projects):
     """Same discipline as test_rbac.py's test_unknown_role_denied_everywhere, at the project
     level: a hand-edited project_members.role value must resolve to NO ACCESS, never a
     permissive default."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
     project_repo = ProjectRepo(app.state.db)
     user_repo: UserRepo = app.state.user_repo
     alpha = await project_repo.get("alpha")
 
-    client = await _create_user_and_login(transport, admin_client, "garbage-project-role-user", "viewer")
+    client = await _create_user_and_login(app_env, admin_client, "garbage-project-role-user", "viewer")
     user = await user_repo.get_by_username("garbage-project-role-user")
 
     resp = await admin_client.put(
@@ -497,14 +483,14 @@ async def test_garbage_project_role_denied_everywhere(mt_app, two_projects):
 # 5. Cross-project data-plane isolation
 # ---------------------------------------------------------------------------------------------
 
-async def test_key_from_project_a_refused_on_project_b_server(mt_app, two_projects):
+async def test_key_from_project_a_refused_on_project_b_server(app_env, admin_client, two_projects):
     """A key minted in alpha calling a server in beta must be refused BEFORE the upstream is
     ever reached, and audited. Uses a fixture upstream call-counter (via the health-poll-disabled
     fixture app's httpx client is real, but the server URL points nowhere real — a 403 proves
     the call never got dispatched, since a real dispatch attempt against an unreachable upstream
     would surface as a 502/timeout, not a clean 403)."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
 
     resp = await admin_client.post(
         "/api/v1/servers",
@@ -537,12 +523,12 @@ async def test_key_from_project_a_refused_on_project_b_server(mt_app, two_projec
     assert any(e["status_code"] == 403 for e in events), "cross-project refusal must be audited"
 
 
-async def test_key_can_call_server_in_its_own_project(mt_app, two_projects):
+async def test_key_can_call_server_in_its_own_project(app_env, admin_client, two_projects):
     """Contrast case: a key minted in alpha calling a server ALSO in alpha proceeds past the
     project-agreement check (it may still fail for other reasons — unreachable upstream — but
     must NOT be a 403 project-scoping refusal)."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
 
     await admin_client.post(
         "/api/v1/servers",
@@ -566,12 +552,12 @@ async def test_key_can_call_server_in_its_own_project(mt_app, two_projects):
 # 6. Aggregate tools/list scoped to the key's project
 # ---------------------------------------------------------------------------------------------
 
-async def test_aggregate_tools_list_scoped_to_key_project(mt_app, two_projects):
+async def test_aggregate_tools_list_scoped_to_key_project(app_env, admin_client, two_projects):
     """A real behavior change from pre-feature instance-wide aggregate (documented in
     docs/projects.md) — a key's aggregate tools/list view must contain ONLY its own project's
     servers, raw response assertion (not inferred from server count)."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
 
     await admin_client.post(
         "/api/v1/servers",
@@ -620,9 +606,9 @@ async def test_aggregate_tools_list_scoped_to_key_project(mt_app, two_projects):
 # 7. Export/import round-trip + GitOps unaffected by project role
 # ---------------------------------------------------------------------------------------------
 
-async def test_export_import_round_trips_project_assignment(mt_app, two_projects):
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+async def test_export_import_round_trips_project_assignment(app_env, admin_client, two_projects):
+    app = app_env.app
+    
 
     await admin_client.post(
         "/api/v1/servers",
@@ -645,16 +631,16 @@ async def test_export_import_round_trips_project_assignment(mt_app, two_projects
     assert resp.json()["project_slug"] == "beta"
 
 
-async def test_gitops_reconcile_stays_global_admin_only_unaffected_by_project_role(mt_app, two_projects):
+async def test_gitops_reconcile_stays_global_admin_only_unaffected_by_project_role(app_env, admin_client, two_projects):
     """A project admin with no global role above viewer gets 403 on GitOps reconcile/drift —
     project admin does NOT imply GitOps authority."""
-    app, transport = mt_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
+    
     project_repo = ProjectRepo(app.state.db)
     user_repo: UserRepo = app.state.user_repo
     alpha = await project_repo.get("alpha")
 
-    client = await _create_user_and_login(transport, admin_client, "alpha-admin-not-gitops", "viewer")
+    client = await _create_user_and_login(app_env, admin_client, "alpha-admin-not-gitops", "viewer")
     user = await user_repo.get_by_username("alpha-admin-not-gitops")
     resp = await admin_client.put(
         f"/api/v1/projects/{alpha.id}/members", json={"user_id": user.id, "role": "admin"}
@@ -668,3 +654,8 @@ async def test_gitops_reconcile_stays_global_admin_only_unaffected_by_project_ro
     assert resp.status_code == 403, (
         f"project-admin-but-global-viewer must be denied GitOps reconcile, got {resp.status_code}"
     )
+
+@pytest.fixture(autouse=True)
+def _require_setup(admin_client):
+    pass
+

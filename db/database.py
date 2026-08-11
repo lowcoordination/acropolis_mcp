@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import asyncpg
 
@@ -58,6 +60,19 @@ class DatabaseNotConfiguredError(Exception):
     embedded/default backend to silently degrade to. Failing loudly at boot matches the posture
     archon/settings.py already takes for a misconfigured secret provider or webhook URL: a
     misconfigured data store must not present as an empty-but-working gateway."""
+
+
+class PoolExhaustedError(Exception):
+    """Raised when a connection pool is exhausted and a connection cannot be acquired within the timeout."""
+
+
+@contextlib.asynccontextmanager
+async def acquire_with_timeout(pool: asyncpg.Pool, timeout: float) -> AsyncIterator[asyncpg.Connection]:
+    try:
+        async with pool.acquire(timeout=timeout) as conn:
+            yield conn
+    except asyncio.TimeoutError:
+        raise PoolExhaustedError(f"pool exhausted after {timeout}s, check for a connection leak")
 
 
 def _version_from_filename(filename: str) -> int:
@@ -212,6 +227,8 @@ class Database:
     DEFAULT_WRITER_POOL_MAX = 5
     DEFAULT_READER_POOL_MIN = 1
     DEFAULT_READER_POOL_MAX = 10
+    
+    POOL_ACQUIRE_TIMEOUT = 10.0  # seconds
 
     def __init__(
         self,
@@ -248,7 +265,7 @@ class Database:
         )
         # Migrations run on the writer pool, under the advisory lock in _apply_migrations, so
         # concurrently-starting instances cannot race to apply the same file.
-        async with self.writer.acquire() as conn:
+        async with acquire_with_timeout(self.writer, self.POOL_ACQUIRE_TIMEOUT) as conn:
             await _apply_migrations(conn)
 
     async def close(self) -> None:

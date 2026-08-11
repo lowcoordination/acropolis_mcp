@@ -87,7 +87,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> Resp
     return JSONResponse(status_code=500, content={"detail": "internal error"})
 
 
-def create_app(settings: Settings, db: Database) -> FastAPI:
+def create_app(settings: Settings, db: Database, *, enable_health_probing: bool = True) -> FastAPI:
     server_repo = ServerRepo(db)
     api_key_repo = ApiKeyRepo(db)
     audit_repo = AuditRepo(db)
@@ -153,7 +153,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         interval_seconds=settings.health_poll_interval_seconds,
         webhook_dispatcher=webhook_dispatcher,
         secret_provider=secret_provider,
-    )
+    ) if enable_health_probing else None
     retention_job = AuditRetentionJob(
         audit_repo, settings_repo,
         check_interval_seconds=settings.audit_retention_check_interval_seconds,
@@ -207,7 +207,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         tracing.init()
         audit.start()
         webhook_dispatcher.start()
-        if settings.health_poll_enabled:
+        if health_poller is not None:
             health_poller.start()
         if settings.audit_retention_enabled:
             retention_job.start()
@@ -222,7 +222,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
             await config_source.stop()
             await retention_job.stop()
             await proposal_expiry_job.stop()
-            await health_poller.stop()
+            if health_poller is not None:
+                await health_poller.stop()
             # Stop the dispatcher before audit — it unsubscribe()s from the SAME AuditLogger it
             # subscribed to in start(), and that logger must still be alive to accept the call.
             await webhook_dispatcher.stop()

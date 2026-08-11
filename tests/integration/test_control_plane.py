@@ -12,17 +12,7 @@ from argus.app import create_app
 from db.database import Database
 
 
-@pytest.fixture
-async def api_client(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
-    db = Database(tmp_path)
-    await db.connect()
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
-            yield client
-    await db.close()
+pytestmark = pytest.mark.parametrize("app_env", [{"probe_on_create": False}], indirect=True)
 
 
 async def test_health(api_client):
@@ -200,65 +190,62 @@ async def test_delete_key(api_client):
     assert key_id not in remaining_ids
 
 
-async def test_delete_server_unregisters_its_rate_limit_bucket(tmp_path: Path):
+async def test_delete_server_unregisters_its_rate_limit_bucket(app_env):
     """F8 regression: a server's rate-limit bucket is keyed on the SLUG STRING, not the DB row
     id. If deleting a server didn't unregister its bucket, recreating the same slug with a
     different (or no) rate_limit would inherit the old bucket's stale consumed-token state
     instead of starting fresh."""
     from argus.rate_limiter import server_key
 
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
-    db = Database(tmp_path)
-    await db.connect()
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
-            await client.post(
-                "/api/v1/servers",
-                json={"slug": "shell", "name": "Shell", "upstream_url": "http://localhost:8010/mcp"},
-            )
-            await client.put(
-                "/api/v1/servers/shell/policy",
-                json={"mode": "passthrough", "rate_limit": "1/hour", "allowed": [], "denied": [], "param_rules": {}},
-            )
-            rate_limiter = app.state.rate_limiter
-            # Manually register + exhaust the bucket the way a real tools/call would, since
-            # this fixture has no live upstream to route a real tools/call through.
-            rate_limiter.ensure_current(server_key("shell"), "1/hour")
-            assert await rate_limiter.check(server_key("shell")) is True  # consumes the 1 token
-            assert rate_limiter.is_registered(server_key("shell"))
+    async with app_env.client() as client:
+        await client.post(
+            "/api/v1/servers",
+            json={"slug": "shell", "name": "Shell", "upstream_url": "http://localhost:8010/mcp"},
+        )
+        await client.put(
+            "/api/v1/servers/shell/policy",
+            json={"mode": "passthrough", "rate_limit": "1/hour", "allowed": [], "denied": [], "param_rules": {}},
+        )
+        rate_limiter = app_env.app.state.rate_limiter
+        # Manually register + exhaust the bucket the way a real tools/call would, since
+        # this fixture has no live upstream to route a real tools/call through.
+        rate_limiter.ensure_current(server_key("shell"), "1/hour")
+        assert await rate_limiter.check(server_key("shell")) is True  # consumes the 1 token
+        assert rate_limiter.is_registered(server_key("shell"))
 
-            resp = await client.delete("/api/v1/servers/shell")
-            assert resp.status_code == 204
-            assert not rate_limiter.is_registered(server_key("shell")), (
-                "deleting a server did not unregister its rate-limit bucket"
-            )
-    await db.close()
+        resp = await client.delete("/api/v1/servers/shell")
+        assert resp.status_code == 204
+        assert not rate_limiter.is_registered(server_key("shell")), (
+            "deleting a server did not unregister its rate-limit bucket"
+        )
 
 
-async def test_admin_auth_enforced_when_token_set(tmp_path: Path):
+@pytest.fixture
+async def admin_app_env(tmp_path: Path):
+    from tests.conftest import AppEnv
     settings = Settings(data_dir=str(tmp_path), auth_mode="open", admin_token="secret123", health_poll_enabled=False, audit_retention_enabled=False)
     db = Database(tmp_path)
     await db.connect()
-    app = create_app(settings, db)
+    app = create_app(settings, db, enable_health_probing=False)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
-            unauthed = await client.get("/api/v1/servers")
-            assert unauthed.status_code == 401
-
-            wrong = await client.get("/api/v1/servers", headers={"Authorization": "Bearer wrong"})
-            assert wrong.status_code == 401
-
-            authed = await client.get(
-                "/api/v1/servers", headers={"Authorization": "Bearer secret123"}
-            )
-            assert authed.status_code == 200
+        yield AppEnv(app=app, transport=transport, db=db, settings=settings)
     await db.close()
 
+async def test_admin_auth_enforced_when_token_set(admin_app_env, app_env):
+    async with admin_app_env.client() as client:
+        unauthed = await client.get("/api/v1/servers")
+        assert unauthed.status_code == 401
 
-async def test_admin_auth_rejects_non_ascii_bearer_token_without_crashing(tmp_path: Path):
+        wrong = await client.get("/api/v1/servers", headers={"Authorization": "Bearer wrong"})
+        assert wrong.status_code == 401
+
+        authed = await client.get(
+            "/api/v1/servers", headers={"Authorization": "Bearer secret123"}
+        )
+        assert authed.status_code == 200
+
+async def test_admin_auth_rejects_non_ascii_bearer_token_without_crashing(admin_app_env, app_env):
     """§26 fix (review 2026-08-04): hmac.compare_digest raises TypeError on a str containing
     non-ASCII characters. The presented token is attacker-controlled (straight off the
     Authorization header), so a non-ASCII token must fail auth cleanly (401), not 500.
@@ -269,16 +256,9 @@ async def test_admin_auth_rejects_non_ascii_bearer_token_without_crashing(tmp_pa
     into a str, so a client sending UTF-8-encoded non-ASCII bytes on the wire is exactly what
     reaches require_admin as a non-ASCII str. httpx passes bytes headers through unvalidated,
     reproducing that path."""
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", admin_token="secret123", health_poll_enabled=False, audit_retention_enabled=False)
-    db = Database(tmp_path)
-    await db.connect()
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
-            resp = await client.get(
-                "/api/v1/servers",
-                headers={"Authorization": "Bearer évil-token".encode("utf-8")},
-            )
-            assert resp.status_code == 401
-    await db.close()
+    async with admin_app_env.client() as client:
+        resp = await client.get(
+            "/api/v1/servers",
+            headers={"Authorization": "Bearer évil-token".encode("utf-8")},
+        )
+        assert resp.status_code == 401

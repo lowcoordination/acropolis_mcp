@@ -9,7 +9,7 @@ from typing import Optional
 import asyncpg
 from pydantic import BaseModel, ValidationError
 
-from .database import Database, utcnow
+from .database import Database, acquire_with_timeout, utcnow
 from .models import (
     ApiKeyRecord,
     DlpCustomPattern,
@@ -204,11 +204,11 @@ class _PoolAccess:
 
     def _read(self):
         assert self._db.reader is not None, "Database.connect() not awaited"
-        return self._db.reader.acquire()
+        return acquire_with_timeout(self._db.reader, self._db.POOL_ACQUIRE_TIMEOUT)
 
     def _write(self):
         assert self._db.writer is not None, "Database.connect() not awaited"
-        return self._db.writer.acquire()
+        return acquire_with_timeout(self._db.writer, self._db.POOL_ACQUIRE_TIMEOUT)
 
 
 class ServerRepo(_PoolAccess):
