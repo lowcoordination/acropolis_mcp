@@ -20,17 +20,12 @@ from db.repo import AuditRepo, ServerRepo
 from .fastmcp_fixture import run_fastmcp_server
 
 
+pytestmark = pytest.mark.parametrize("app_env", [{"probe_on_create": False}], indirect=True)
+
 @pytest.fixture
-async def app_client(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
-    db = Database(tmp_path)
-    await db.connect()
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
-            yield client, db
-    await db.close()
+async def app_client(app_env):
+    async with app_env.client() as client:
+        yield client, app_env.db
 
 
 def _initialize_body(req_id: int = 1) -> dict:
@@ -163,7 +158,7 @@ class _MalformedJSONUpstream:
 
 
 class TestF12HealthPollerIsolation:
-    async def test_non_json_200_response_does_not_crash_probe_server(self):
+    async def test_non_json_200_response_does_not_crash_probe_server(self, tmp_path, app_env):
         """stoa/health.py's json.loads(resp.text) used to be unguarded — a 200 response with a
         non-JSON body (e.g. an auth proxy's HTML login page) raised JSONDecodeError, which
         escaped probe_server entirely (an exception, not a returned health status)."""
@@ -190,7 +185,7 @@ class TestF12HealthPollerIsolation:
         finally:
             await upstream.stop()
 
-    async def test_one_bad_server_does_not_stop_polling_the_rest(self, tmp_path):
+    async def test_one_bad_server_does_not_stop_polling_the_rest(self, tmp_path, app_env):
         """The full regression: poll_once() must isolate each server so one bad one doesn't
         abort the cycle and leave every server after it in slug order with permanently stale
         health — the review's specific "every server after it in slug order" failure mode."""
@@ -198,9 +193,7 @@ class TestF12HealthPollerIsolation:
         from db.database import Database
         from stoa.health import HealthPoller
 
-        db = Database(tmp_path)
-        await db.connect()
-        server_repo = ServerRepo(db)
+        server_repo = ServerRepo(app_env.db)
 
         bad_upstream = _MalformedJSONUpstream()
         await bad_upstream.start()
@@ -226,7 +219,6 @@ class TestF12HealthPollerIsolation:
                 )
         finally:
             await bad_upstream.stop()
-            await db.close()
 
 
 class _HungUpstream:
@@ -287,7 +279,7 @@ class TestF13PerUpstreamTimeoutIsolation:
             f"connect timeout is {timeout.connect}s — too close to the old 120s scalar"
         )
 
-    async def test_hung_upstream_does_not_stall_a_request_to_a_different_upstream(self, tmp_path):
+    async def test_hung_upstream_does_not_stall_a_request_to_a_different_upstream(self, tmp_path, app_env):
         """The actual end-to-end regression: a server that accepts the TCP connection but never
         sends a response must not stall requests to a DIFFERENT, healthy server. This is what
         the old scalar 120s pool timeout allowed — a hung upstream exhausting the connection
@@ -302,44 +294,37 @@ class TestF13PerUpstreamTimeoutIsolation:
         itself hang rather than proving anything about the fix."""
         import time
 
-        settings = Settings(data_dir=str(tmp_path), health_poll_enabled=False, audit_retention_enabled=False)
-        db = Database(tmp_path)
-        await db.connect()
-        app = create_app(settings, db)
-
         hung = _HungUpstream()
         await hung.start()
         try:
-            async with app.router.lifespan_context(app):
-                http_client = app.state.http_client
+            http_client = app_env.app.state.http_client
 
-                async with run_fastmcp_server() as fast_upstream:
-                    hung_task = asyncio.create_task(
-                        http_client.post(hung.url, json=_initialize_body())
-                    )
-                    await asyncio.sleep(0.05)  # let the hung request actually occupy a pool slot
+            async with run_fastmcp_server() as fast_upstream:
+                hung_task = asyncio.create_task(
+                    http_client.post(hung.url, json=_initialize_body())
+                )
+                await asyncio.sleep(0.05)  # let the hung request actually occupy a pool slot
 
-                    start = time.monotonic()
-                    fast_resp = await http_client.post(
-                        f"{fast_upstream.url}/mcp", json=_initialize_body(2),
-                        headers={"Accept": "application/json, text/event-stream"},
-                    )
-                    fast_elapsed = time.monotonic() - start
+                start = time.monotonic()
+                fast_resp = await http_client.post(
+                    f"{fast_upstream.url}/mcp", json=_initialize_body(2),
+                    headers={"Accept": "application/json, text/event-stream"},
+                )
+                fast_elapsed = time.monotonic() - start
 
-                    assert fast_resp.status_code == 200
-                    assert fast_elapsed < 8.0, (
-                        f"request to a healthy, DIFFERENT upstream took {fast_elapsed:.1f}s "
-                        f"while another upstream was hung — connection pool isolation failed"
-                    )
+                assert fast_resp.status_code == 200
+                assert fast_elapsed < 8.0, (
+                    f"request to a healthy, DIFFERENT upstream took {fast_elapsed:.1f}s "
+                    f"while another upstream was hung — connection pool isolation failed"
+                )
 
-                    hung_task.cancel()
-                    try:
-                        await asyncio.wait_for(hung_task, timeout=2.0)
-                    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                        pass
+                hung_task.cancel()
+                try:
+                    await asyncio.wait_for(hung_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
         finally:
             await hung.stop()
-            await db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +384,7 @@ class TestF25SchemaVersionGuard:
     the database has a migration version applied that this binary's own migration list doesn't
     know about — the rollback-after-upgrade scenario the review flagged."""
 
-    async def test_connect_raises_when_db_has_a_newer_migration_than_binary_knows(self, pg_dsn):
+    async def test_connect_raises_when_db_has_a_newer_migration_than_binary_knows(self, pg_dsn, app_env):
         db = Database(pg_dsn)
         await db.connect()
         # Simulate "a newer binary already ran here": stamp a migration version this binary's
@@ -416,7 +401,7 @@ class TestF25SchemaVersionGuard:
             await fresh.connect()
         await fresh.close()
 
-    async def test_connect_succeeds_when_db_is_at_or_behind_known_migrations(self, pg_dsn):
+    async def test_connect_succeeds_when_db_is_at_or_behind_known_migrations(self, pg_dsn, app_env):
         """Regression guard: a totally fresh database, or one already fully migrated by THIS
         binary, must still start normally — the guard should only fire on genuinely unknown
         (higher) versions, never on the normal case."""
@@ -429,7 +414,7 @@ class TestF25SchemaVersionGuard:
         await again.connect()
         await again.close()
 
-    async def test_audit_migrations_apply_in_the_unified_sequence(self, pg_dsn):
+    async def test_audit_migrations_apply_in_the_unified_sequence(self, pg_dsn, app_env):
         """Pre-cutover this test existed because audit.db had its OWN migration list and its own
         schema_migrations table, so the version guard needed proving twice. Post-cutover there is
         one database, one migration sequence, and one schema_migrations table — so the guard is
@@ -492,38 +477,31 @@ class TestF26ProbeEndpointBoundedTimeout:
     had NO timeout of its own and rode the shared http client's 120s default. A hung upstream
     could make this "quick re-probe" endpoint hang the HTTP request for up to ~130s."""
 
-    async def test_probe_endpoint_returns_promptly_against_a_hung_upstream(self, tmp_path):
+    async def test_probe_endpoint_returns_promptly_against_a_hung_upstream(self, tmp_path, app_env):
         import time
 
         import archon.api as api_module
 
-        settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
-        db = Database(tmp_path)
-        await db.connect()
-        server_repo = ServerRepo(db)
+        server_repo = ServerRepo(app_env.db)
 
         hung = _HungUpstream()
         await hung.start()
         try:
             await server_repo.create(slug="hung", name="Hung", upstream_url=hung.url)
 
-            app = create_app(settings, db)
-            transport = httpx.ASGITransport(app=app)
-            async with app.router.lifespan_context(app):
-                async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
-                    start = time.monotonic()
-                    resp = await client.post("/api/v1/servers/hung/probe", timeout=15.0)
-                    elapsed = time.monotonic() - start
+            async with app_env.client() as client:
+                start = time.monotonic()
+                resp = await client.post("/api/v1/servers/hung/probe", timeout=15.0)
+                elapsed = time.monotonic() - start
 
-                    assert resp.status_code == 200
-                    # Generously bounded: PROBE_TIMEOUT_SECONDS (10s) for poll_one() plus
-                    # PROBE_TIMEOUT_SECONDS (10s) for the now-bounded tools refresh, plus
-                    # overhead — but must stay WELL under the old ~130s (10s probe +
-                    # 120s unbounded tools/list) that this fix eliminates.
-                    assert elapsed < 25.0, (
-                        f"probe endpoint took {elapsed:.1f}s against a hung upstream — "
-                        f"the tools/list refresh is not bounded"
-                    )
+                assert resp.status_code == 200
+                # Generously bounded: PROBE_TIMEOUT_SECONDS (10s) for poll_one() plus
+                # PROBE_TIMEOUT_SECONDS (10s) for the now-bounded tools refresh, plus
+                # overhead — but must stay WELL under the old ~130s (10s probe +
+                # 120s unbounded tools/list) that this fix eliminates.
+                assert elapsed < 25.0, (
+                    f"probe endpoint took {elapsed:.1f}s against a hung upstream — "
+                    f"the tools/list refresh is not bounded"
+                )
         finally:
             await hung.stop()
-            await db.close()

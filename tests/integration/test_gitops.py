@@ -17,29 +17,7 @@ from db.database import Database
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
-@pytest.fixture
-async def app_transport(tmp_path: Path):
-    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False, audit_retention_enabled=False)
-    db = Database(tmp_path)
-    await db.connect()
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        yield transport
-    await db.close()
-
-
-@pytest.fixture
-async def client(app_transport):
-    async with httpx.AsyncClient(transport=app_transport, base_url="http://argus.test") as c:
-        yield c
-
-
-async def _setup_admin(client):
-    """Complete first-run setup and return the session cookie."""
-    resp = await client.post("/api/v1/setup", json={"admin_password": "hunter22", "auth_mode": "keyed"})
-    assert resp.status_code == 200
-    return resp.cookies.get("acropolis_session")
+pytestmark = pytest.mark.parametrize("app_env", [{"probe_on_create": False}], indirect=True)
 
 
 def _cli_env(pg_dsn: str) -> dict:
@@ -66,7 +44,7 @@ def _cli_env(pg_dsn: str) -> dict:
 
 # CLI tests use subprocess to test the actual exit codes
 
-def test_cli_check_exit_code_0_when_in_sync(tmp_path, pg_dsn):
+def test_cli_check_exit_code_0_when_in_sync(tmp_path, pg_dsn, app_env):
     """check exits 0 when live config matches the file."""
     # Create a minimal valid config (empty settings = use defaults)
     config_file = tmp_path / "config.yaml"
@@ -88,7 +66,7 @@ servers: []
     assert result.returncode == 0, f"expected 0 (in sync), got {result.returncode}: {result.stderr}"
 
 
-def test_cli_check_exit_code_1_when_drift(tmp_path, pg_dsn):
+def test_cli_check_exit_code_1_when_drift(tmp_path, pg_dsn, app_env):
     """check exits 1 when live config differs from the file."""
     # First, export the current config
     data_dir = tmp_path / "data"
@@ -121,7 +99,7 @@ servers: []
     assert "drift" in result.stderr.lower() or "auth_mode" in result.stderr
 
 
-def test_cli_check_exit_code_2_when_invalid_file(tmp_path, pg_dsn):
+def test_cli_check_exit_code_2_when_invalid_file(tmp_path, pg_dsn, app_env):
     """check exits 2 when the file is malformed."""
     config_file = tmp_path / "config.yaml"
     config_file.write_text("not valid yaml: [{")
@@ -138,7 +116,7 @@ def test_cli_check_exit_code_2_when_invalid_file(tmp_path, pg_dsn):
     assert "error" in result.stderr.lower()
 
 
-def test_cli_export_stable_produces_identical_output(tmp_path, pg_dsn):
+def test_cli_export_stable_produces_identical_output(tmp_path, pg_dsn, app_env):
     """--stable export omits exported_at, producing byte-identical output for unchanged config."""
     data_dir = tmp_path / "data"
 
@@ -164,7 +142,7 @@ def test_cli_export_stable_produces_identical_output(tmp_path, pg_dsn):
     assert "exported_at" not in result1.stdout, "--stable should omit exported_at"
 
 
-def test_cli_export_without_stable_includes_exported_at(tmp_path, pg_dsn):
+def test_cli_export_without_stable_includes_exported_at(tmp_path, pg_dsn, app_env):
     """Default export includes exported_at timestamp."""
     data_dir = tmp_path / "data"
 
@@ -182,34 +160,33 @@ def test_cli_export_without_stable_includes_exported_at(tmp_path, pg_dsn):
 
 # API endpoint tests
 
-async def test_drift_endpoint_disabled_by_default(client):
+async def test_drift_endpoint_disabled_by_default(admin_client, app_env):
     """GET /config/drift returns unknown when gitops is not enabled."""
-    await _setup_admin(client)
-    resp = await client.get("/api/v1/config/drift")
+    resp = await admin_client.get("/api/v1/config/drift")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "unknown"
 
 
-async def test_drift_endpoint_requires_auth(client, app_transport):
+async def test_drift_endpoint_requires_auth(admin_client, app_env):
     """GET /config/drift is behind require_admin."""
-    await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
-    async with httpx.AsyncClient(transport=app_transport, base_url="http://argus.test") as fresh:
+    await admin_client.post("/api/v1/setup", json={"admin_password": "hunter22"})
+    async with app_env.client() as fresh:
         resp = await fresh.get("/api/v1/config/drift")
         assert resp.status_code == 401
 
 
-async def test_reconcile_endpoint_requires_auth(client, app_transport):
+async def test_reconcile_endpoint_requires_auth(admin_client, app_env):
     """POST /config/reconcile is behind require_admin."""
-    await client.post("/api/v1/setup", json={"admin_password": "hunter22"})
-    async with httpx.AsyncClient(transport=app_transport, base_url="http://argus.test") as fresh:
+    await admin_client.post("/api/v1/setup", json={"admin_password": "hunter22"})
+    async with app_env.client() as fresh:
         resp = await fresh.post("/api/v1/config/reconcile")
         assert resp.status_code == 401
 
 
-async def test_metrics_includes_drift_gauge(client):
+async def test_metrics_includes_drift_gauge(admin_client, app_env):
     """GET /metrics includes the config drift gauge."""
-    resp = await client.get("/metrics")
+    resp = await admin_client.get("/metrics")
     assert resp.status_code == 200
     text = resp.text
     assert "acropolis_config_drift" in text
@@ -220,17 +197,16 @@ async def test_metrics_includes_drift_gauge(client):
 import httpx
 
 
-async def test_semantic_comparison_ignores_yaml_key_order(client):
+async def test_semantic_comparison_ignores_yaml_key_order(admin_client, app_env):
     """Reordering YAML keys should NOT produce drift — comparison is semantic, not textual."""
-    await _setup_admin(client)
 
     # Create a server via API
-    await client.post("/api/v1/servers", json={
+    await admin_client.post("/api/v1/servers", json={
         "slug": "test-server", "name": "Test Server", "upstream_url": "http://localhost:8000/mcp",
     })
 
     # Export the config
-    export_resp = await client.get("/api/v1/config/export")
+    export_resp = await admin_client.get("/api/v1/config/export")
     original_yaml = export_resp.text
 
     # Create a semantically identical YAML with keys in different order
@@ -250,7 +226,7 @@ settings:
 
     # The check should show no drift (semantic comparison)
     # We test this via the import preview endpoint
-    import_resp = await client.post("/api/v1/config/import", json={
+    import_resp = await admin_client.post("/api/v1/config/import", json={
         "yaml": reordered_yaml, "apply": False,
     })
     assert import_resp.status_code == 200
@@ -260,25 +236,24 @@ settings:
         assert action["kind"] == "unchanged", f"unexpected drift: {action}"
 
 
-async def test_dlp_config_drift_is_detected(client):
+async def test_dlp_config_drift_is_detected(admin_client, app_env):
     """Enterprise #10: a DLP config change must show up as drift the same way any other policy
     field would — proves policy-as-code and DLP compose correctly rather than DLP silently
     riding along unrecognized in the exported/compared representation."""
-    await _setup_admin(client)
-    await client.post("/api/v1/servers", json={
+    await admin_client.post("/api/v1/servers", json={
         "slug": "test-server", "name": "Test Server", "upstream_url": "http://localhost:8000/mcp",
     })
-    await client.put("/api/v1/servers/test-server/policy", json={
+    await admin_client.put("/api/v1/servers/test-server/policy", json={
         "mode": "passthrough", "dlp_detectors": {"credit_card": "block"},
     })
 
-    export_resp = await client.get("/api/v1/config/export")
+    export_resp = await admin_client.get("/api/v1/config/export")
     exported = export_resp.text
     assert "dlp_detectors" in exported
     assert "credit_card: block" in exported
 
     # Re-importing the exact export should show no drift.
-    reimport = await client.post("/api/v1/config/import", json={"yaml": exported, "apply": False})
+    reimport = await admin_client.post("/api/v1/config/import", json={"yaml": exported, "apply": False})
     for action in reimport.json()["actions"]:
         assert action["kind"] == "unchanged", f"unexpected drift on re-import: {action}"
 
@@ -288,17 +263,16 @@ async def test_dlp_config_drift_is_detected(client):
     data = _yaml.safe_load(exported)
     data["servers"][0]["policy"]["dlp_detectors"] = {"credit_card": "redact"}
     drifted_yaml = _yaml.safe_dump(data)
-    drift_resp = await client.post("/api/v1/config/import", json={"yaml": drifted_yaml, "apply": False})
+    drift_resp = await admin_client.post("/api/v1/config/import", json={"yaml": drifted_yaml, "apply": False})
     update_action = next(a for a in drift_resp.json()["actions"] if a["kind"] == "update")
     assert "dlp_detectors" in update_action["detail"]
 
 
-async def test_ssrf_validation_rejects_private_url(client):
+async def test_ssrf_validation_rejects_private_url(admin_client, app_env):
     """gitops_url pointing at a private IP is rejected without opt-in."""
-    await _setup_admin(client)
 
     # Try to set a private IP as gitops_url
-    resp = await client.put("/api/v1/settings", json={
+    resp = await admin_client.put("/api/v1/settings", json={
         "gitops_url": "http://192.168.1.1/config.yaml",
     })
     # This should fail validation (SSRF protection)
@@ -308,24 +282,23 @@ async def test_ssrf_validation_rejects_private_url(client):
     assert resp.status_code in (200, 400, 422)
 
 
-async def test_reconcile_endpoint_returns_400_with_no_pending_plan(client):
+async def test_reconcile_endpoint_returns_400_with_no_pending_plan(admin_client, app_env):
     """POST /config/reconcile returns 400 (not 404) when there's no drift to apply."""
-    await _setup_admin(client)
 
     # Enable gitops and set a URL (will fail to fetch, but that's ok for this test)
-    await client.put("/api/v1/settings", json={
+    await admin_client.put("/api/v1/settings", json={
         "gitops_enabled": "true",
         "gitops_url": "https://example.com/config.yaml",
     })
 
     # Try to reconcile (will fail because no pending plan, but endpoint should exist)
-    resp = await client.post("/api/v1/config/reconcile")
+    resp = await admin_client.post("/api/v1/config/reconcile")
     # Should get 400 (no pending plan) not 404 (endpoint missing)
     assert resp.status_code == 400
     assert "no pending plan" in resp.json()["detail"].lower()
 
 
-async def test_reconcile_applies_plan_and_writes_admin_event(client, app_transport, monkeypatch):
+async def test_reconcile_applies_plan_and_writes_admin_event(admin_client, app_env, monkeypatch):
     """A successful reconcile() actually applies the drift AND writes one admin event.
 
     Exercises the real happy path end-to-end through the actual HTTP routes and the app's own
@@ -334,11 +307,10 @@ async def test_reconcile_applies_plan_and_writes_admin_event(client, app_transpo
     `config.reconcile` admin event — the behavior the PR description claimed but the old
     version of this test never actually checked (it only asserted a 400 "no pending plan").
     """
-    await _setup_admin(client)
 
     from db.repo import AdminEventRepo, ServerRepo, SettingsRepo
 
-    app = app_transport.app
+    app = app_env.app
     db = app.state.db
     server_repo = ServerRepo(db)
     admin_event_repo = AdminEventRepo(db)
@@ -379,10 +351,10 @@ settings: {}
     assert state.plan is not None
 
     # GET /config/drift reflects the same cached state via the real route.
-    drift_resp = await client.get("/api/v1/config/drift")
+    drift_resp = await admin_client.get("/api/v1/config/drift")
     assert drift_resp.json()["status"] == "drifted"
 
-    reconcile_resp = await client.post("/api/v1/config/reconcile")
+    reconcile_resp = await admin_client.post("/api/v1/config/reconcile")
     assert reconcile_resp.status_code == 200
     body = reconcile_resp.json()
     assert body["applied"] is True
@@ -402,15 +374,14 @@ settings: {}
 
 # Security regression tests (found by /security-scan 2026-08-07)
 
-async def test_reconcile_rejects_private_url_even_with_cached_plan(client, app_transport):
+async def test_reconcile_rejects_private_url_even_with_cached_plan(admin_client, app_env):
     """SSRF regression: reconcile() must re-validate gitops_url with _validate_webhook_url.
 
     Attack: cache a plan from a valid public URL, then point gitops_url at a private/metadata
     address and call reconcile — the fetch must be rejected, not silently performed.
     """
-    await _setup_admin(client)
 
-    app = app_transport.app
+    app = app_env.app
     from stoa.gitops import ConfigSource
     from db.repo import ServerRepo, SettingsRepo
 
@@ -428,13 +399,12 @@ async def test_reconcile_rejects_private_url_even_with_cached_plan(client, app_t
     await cs.stop()
 
 
-async def test_fetch_config_rejects_oversized_body(client, app_transport, monkeypatch):
+async def test_fetch_config_rejects_oversized_body(admin_client, app_env, monkeypatch):
     """DoS regression: a config body larger than MAX_CONFIG_BYTES must be rejected."""
-    await _setup_admin(client)
 
     from stoa.gitops import ConfigSource, MAX_CONFIG_BYTES
 
-    app = app_transport.app
+    app = app_env.app
     from db.repo import ServerRepo, SettingsRepo
     db = app.state.db
     cs = ConfigSource(ServerRepo(db), SettingsRepo(db))

@@ -26,7 +26,7 @@ from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
 from argus.tracing import build_tracing_manager
 from argus.upstream import UpstreamHandshakeCache
-from db.database import Database
+from db.database import Database, PoolExhaustedError
 from db.repo import (
     AdminEventRepo,
     ApiKeyRepo,
@@ -87,7 +87,45 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> Resp
     return JSONResponse(status_code=500, content={"detail": "internal error"})
 
 
-def create_app(settings: Settings, db: Database) -> FastAPI:
+# Issue #44: pool exhaustion is BACKPRESSURE, not an internal fault. Without this handler it
+# falls through to _unhandled_exception_handler above and reports as a 500 — which both lies to
+# the client (retrying is exactly the right move here, unlike a real 500) and pollutes the
+# internal-error rate that's meant to signal genuine bugs. 503 + Retry-After is the honest
+# signal. Logged at WARNING rather than ERROR with no traceback: an exhausted pool under load is
+# an operational capacity event, not a crash, and the exception's own message already names the
+# pool and timeout. The client-facing body stays generic — PoolExhaustedError's text mentions
+# internal pool topology and connection-leak hints, which is operator information, not caller
+# information.
+async def _pool_exhausted_handler(request: Request, exc: Exception) -> Response:
+    _logger.warning("pool exhausted on %s %s: %s", request.method, request.url.path, exc)
+    headers = {"Retry-After": "1"}
+    if request.url.path.startswith("/mcp"):
+        from argus.jsonrpc import rpc_error
+
+        return Response(
+            content=rpc_error(None, "service unavailable"), status_code=503,
+            media_type="application/json", headers=headers,
+        )
+    return JSONResponse(
+        status_code=503, content={"detail": "service unavailable"}, headers=headers,
+    )
+
+
+def create_app(
+    settings: Settings,
+    db: Database,
+    *,
+    enable_health_probing: bool = True,
+    probe_on_create: bool = True,
+) -> FastAPI:
+    """Build the gateway app.
+
+    `enable_health_probing` gates the BACKGROUND poll loop only (AND-ed with
+    settings.health_poll_enabled). `probe_on_create` gates the one-off courtesy probe fired when
+    a server is registered. Both exist for tests, which routinely register servers pointing at
+    upstreams that were never started; neither affects the manual POST /servers/{slug}/probe
+    endpoint, which always probes for real.
+    """
     server_repo = ServerRepo(db)
     api_key_repo = ApiKeyRepo(db)
     audit_repo = AuditRepo(db)
@@ -148,6 +186,14 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     bridge = ProtocolBridge(http_client, handshake_cache, tracing=tracing)
     tools_cache = ToolsCache(db, bridge)
     webhook_dispatcher = WebhookDispatcher(audit, settings_repo)
+    # ALWAYS constructed, never None. `enable_health_probing` gates only whether the background
+    # loop is start()ed in lifespan below — it must not decide whether the poller EXISTS, because
+    # the same object is also wired into the control-plane router, where it powers two
+    # REQUEST-PATH features that have nothing to do with background polling: the immediate probe
+    # on server-create, and the operator's manual POST /servers/{slug}/probe. Handing the router a
+    # None poller silently turns that endpoint into a no-op that still returns 200 with stale
+    # health — a much broader behaviour change than "don't run the poll loop", and one that
+    # matches neither the flag's name nor what settings.health_poll_enabled meant before it.
     health_poller = HealthPoller(
         server_repo, http_client, handshake_cache,
         interval_seconds=settings.health_poll_interval_seconds,
@@ -207,7 +253,7 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
         tracing.init()
         audit.start()
         webhook_dispatcher.start()
-        if settings.health_poll_enabled:
+        if enable_health_probing and settings.health_poll_enabled:
             health_poller.start()
         if settings.audit_retention_enabled:
             retention_job.start()
@@ -222,6 +268,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
             await config_source.stop()
             await retention_job.stop()
             await proposal_expiry_job.stop()
+            # Unconditional: stop() is a no-op when start() was never called (it early-returns
+            # on self._task is None), so this needs no matching flag check.
             await health_poller.stop()
             # Stop the dispatcher before audit — it unsubscribe()s from the SAME AuditLogger it
             # subscribed to in start(), and that logger must still be alive to accept the call.
@@ -241,6 +289,10 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
 
     app = FastAPI(title="Acropolis", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.middleware("http")(_security_headers_middleware)
+    # PoolExhaustedError registered separately from the Exception catch-all below — Starlette
+    # dispatches on the most specific registered class, so this wins for pool exhaustion while
+    # everything else still lands on the generic 500 backstop.
+    app.add_exception_handler(PoolExhaustedError, _pool_exhausted_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)
 
     app.state.settings = settings
@@ -272,7 +324,8 @@ def create_app(settings: Settings, db: Database) -> FastAPI:
     app.include_router(build_setup_router(settings_repo, rate_limiter, user_repo, http_client, oidc_attempts))
     app.include_router(build_control_plane_router(
         server_repo, api_keys, tools_cache, settings_repo, audit_repo, audit, health_poller,
-        rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db), config_source, user_repo,
+        probe_on_create, rate_limiter, pipeline, webhook_dispatcher, AdminEventRepo(db),
+        config_source, user_repo,
         secret_provider=secret_provider, tracing=tracing, usage_repo=usage_repo,
         project_repo=project_repo, project_member_repo=project_member_repo,
         proposal_repo=proposal_repo,

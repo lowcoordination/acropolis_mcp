@@ -24,29 +24,11 @@ from db.repo import ProjectMemberRepo, ProjectRepo, SettingsRepo
 from tests.integration.test_webhooks import _WebhookReceiver
 
 
-@pytest.fixture
-async def app_client(tmp_path: Path):
-    """App with a running lifespan + a setup-complete admin session, plus helper accessors."""
-    settings = Settings(
-        data_dir=str(tmp_path), auth_mode="open",
-        health_poll_enabled=False, audit_retention_enabled=False,
-    )
-    db = Database(tmp_path)
-    await db.connect()
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin:
-            resp = await admin.post(
-                "/api/v1/setup", json={"admin_password": "hunter22", "auth_mode": "open"}
-            )
-            assert resp.status_code == 200
-            yield app, transport, admin
-    await db.close()
+pytestmark = pytest.mark.parametrize("app_env", [{"auth_mode": "open", "probe_on_create": False}], indirect=True)
 
 
-async def _login(transport: httpx.ASGITransport, username: str, password: str) -> httpx.AsyncClient:
-    client = httpx.AsyncClient(transport=transport, base_url="http://argus.test")
+async def _login(app_env, transport, username: str, password: str) -> httpx.AsyncClient:
+    client = httpx.AsyncClient(transport=app_env.transport, base_url="http://argus.test")
     resp = await client.post(
         "/api/v1/login", json={"username": username, "admin_password": password}
     )
@@ -105,8 +87,8 @@ async def _admin_events(client: httpx.AsyncClient, action: str | None = None) ->
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 
 
-async def test_disabled_by_default_policy_write_applies_directly(app_client):
-    _, _, admin = app_client
+async def test_disabled_by_default_policy_write_applies_directly(app_env, admin_client):
+    app = app_env.app; transport = app_env.transport; admin = admin_client
     await _create_server(admin)
 
     resp = await admin.put("/api/v1/servers/test-server/policy", json=_policy_body())
@@ -126,8 +108,8 @@ async def test_disabled_by_default_policy_write_applies_directly(app_client):
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 
 
-async def test_enabled_policy_put_queues_and_applies_nothing(app_client):
-    _, _, admin = app_client
+async def test_enabled_policy_put_queues_and_applies_nothing(app_env, admin_client):
+    app = app_env.app; transport = app_env.transport; admin = admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
 
@@ -159,14 +141,14 @@ async def test_enabled_policy_put_queues_and_applies_nothing(app_client):
     assert events[0]["target_id"] == str(body["proposal_id"])
 
 
-async def test_proposal_approve_reject_require_project_admin(app_client):
+async def test_proposal_approve_reject_require_project_admin(app_env, admin_client):
     """Remediation (review 2026-08-10): approve/reject require PROJECT admin, not global
     admin — a global-viewer/operator who IS project-poweruser (the default membership
     _create_user grants — see its own comment) can still see the proposal (list + detail,
     viewer-level), but cannot approve or reject it (needs project-admin). Superseded
     test_proposals_routes_are_admin_only's "everything 403s for a non-admin" claim, which
     predates project-scoped proposals (0012_proposals_project_scope.sql)."""
-    app, transport, admin = app_client
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     proposal_id = (await admin.put(
@@ -174,7 +156,7 @@ async def test_proposal_approve_reject_require_project_admin(app_client):
     )).json()["proposal_id"]
 
     await _create_user(app, admin, "op-user", "operator")
-    operator = await _login(transport, "op-user", "password-12345")
+    operator = await _login(app_env, transport, "op-user", "password-12345")
 
     # List and detail are viewer-level — op-user is project-poweruser in 'default' (where
     # test-server lives, via _create_user's own default-project grant), which qualifies.
@@ -195,12 +177,12 @@ async def test_proposal_approve_reject_require_project_admin(app_client):
     await operator.aclose()
 
 
-async def test_proposal_project_isolation(app_client):
+async def test_proposal_project_isolation(app_env, admin_client):
     """A project-A admin cannot see or act on a project-B proposal, even though they're a real
     admin — just not in project B. Proves the disclosure half of the finding is fixed (list
     filters by membership, detail/approve/reject 403 for a non-member) without relying on the
     global-admin superset masking the gap, the way single-project fixtures did before."""
-    app, transport, admin = app_client
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     project_repo = ProjectRepo(app.state.db)
     member_repo = ProjectMemberRepo(app.state.db)
     await project_repo.create(slug="project-b", name="Project B")
@@ -227,7 +209,7 @@ async def test_proposal_project_isolation(app_client):
     await member_repo.upsert(
         user_id=create_resp.json()["id"], project_id=default_project.id, role="admin",
     )
-    user_a = await _login(transport, "user-a", "password-12345")
+    user_a = await _login(app_env, transport, "user-a", "password-12345")
 
     # Sees project-a's proposal in the list, not project-b's.
     list_resp = await user_a.get("/api/v1/proposals")
@@ -251,12 +233,12 @@ async def test_proposal_project_isolation(app_client):
     await user_a.aclose()
 
 
-async def test_config_import_proposal_requires_global_admin_even_for_project_admin_everywhere(app_client):
+async def test_config_import_proposal_requires_global_admin_even_for_project_admin_everywhere(app_env, admin_client):
     """A config_import proposal's project_id is NULL by design (it can touch servers across
     every project in one file) — proves the None-branch in require_proposal_project_role
     requires GLOBAL admin explicitly, not a silent permissive fallthrough for a user who
     happens to be project-admin in every project they're a member of."""
-    app, transport, admin = app_client
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _enable_approvals(admin)
 
     yaml_text = (
@@ -278,7 +260,7 @@ async def test_config_import_proposal_requires_global_admin_even_for_project_adm
     await member_repo.upsert(
         user_id=create_resp.json()["id"], project_id=default_project.id, role="admin",
     )
-    user_a = await _login(transport, "user-a", "password-12345")
+    user_a = await _login(app_env, transport, "user-a", "password-12345")
 
     # Project-admin in the only project they're a member of — still not global admin, so the
     # config_import proposal (project_id IS NULL) must stay out of reach.
@@ -289,8 +271,8 @@ async def test_config_import_proposal_requires_global_admin_even_for_project_adm
     await user_a.aclose()
 
 
-async def test_proposals_state_filter_validates(app_client):
-    _, _, admin = app_client
+async def test_proposals_state_filter_validates(app_env, admin_client):
+    app = app_env.app; transport = app_env.transport; admin = admin_client
     resp = await admin.get("/api/v1/proposals", params={"state": "bogus"})
     assert resp.status_code == 400
 
@@ -300,8 +282,8 @@ async def test_proposals_state_filter_validates(app_client):
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 
 
-async def test_self_approval_rejected_with_distinct_message(app_client):
-    app, transport, admin = app_client
+async def test_self_approval_rejected_with_distinct_message(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     proposal_id = (await admin.put(
@@ -319,12 +301,12 @@ async def test_self_approval_rejected_with_distinct_message(app_client):
     assert (await admin.get("/api/v1/proposals")).json()[0]["state"] == "pending"
 
 
-async def test_different_admin_approval_applies_and_records_both_identities(app_client):
-    app, transport, admin = app_client
+async def test_different_admin_approval_applies_and_records_both_identities(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     await _create_user(app, admin, "admin-two", "admin")
-    approver = await _login(transport, "admin-two", "password-12345")
+    approver = await _login(app_env, transport, "admin-two", "password-12345")
 
     proposal_id = (await admin.put(
         "/api/v1/servers/test-server/policy", json=_policy_body()
@@ -362,12 +344,12 @@ async def test_different_admin_approval_applies_and_records_both_identities(app_
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 
 
-async def test_approve_after_out_of_band_change_is_refused_and_applies_nothing(app_client):
-    app, transport, admin = app_client
+async def test_approve_after_out_of_band_change_is_refused_and_applies_nothing(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     await _create_user(app, admin, "admin-two", "admin")
-    approver = await _login(transport, "admin-two", "password-12345")
+    approver = await _login(app_env, transport, "admin-two", "password-12345")
 
     proposal_id = (await admin.put(
         "/api/v1/servers/test-server/policy", json=_policy_body(mode="allowlist")
@@ -390,8 +372,8 @@ async def test_approve_after_out_of_band_change_is_refused_and_applies_nothing(a
     await approver.aclose()
 
 
-async def test_proposal_detail_shows_stale_flag_before_approval(app_client):
-    app, transport, admin = app_client
+async def test_proposal_detail_shows_stale_flag_before_approval(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     proposal_id = (await admin.put(
@@ -416,12 +398,12 @@ async def test_proposal_detail_shows_stale_flag_before_approval(app_client):
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 
 
-async def test_reject_writes_event_and_cannot_be_approved_later(app_client):
-    app, transport, admin = app_client
+async def test_reject_writes_event_and_cannot_be_approved_later(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     await _create_user(app, admin, "admin-two", "admin")
-    approver = await _login(transport, "admin-two", "password-12345")
+    approver = await _login(app_env, transport, "admin-two", "password-12345")
 
     proposal_id = (await admin.put(
         "/api/v1/servers/test-server/policy", json=_policy_body()
@@ -450,12 +432,12 @@ async def test_reject_writes_event_and_cannot_be_approved_later(app_client):
     await approver.aclose()
 
 
-async def test_expiry_sweep_expires_stale_proposals_and_blocks_approval(app_client):
-    app, transport, admin = app_client
+async def test_expiry_sweep_expires_stale_proposals_and_blocks_approval(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     await _create_user(app, admin, "admin-two", "admin")
-    approver = await _login(transport, "admin-two", "password-12345")
+    approver = await _login(app_env, transport, "admin-two", "password-12345")
 
     proposal_id = (await admin.put(
         "/api/v1/servers/test-server/policy", json=_policy_body()
@@ -498,8 +480,8 @@ def _import_yaml(slug: str = "imported-server") -> str:
     )
 
 
-async def test_config_import_apply_is_queued_not_applied(app_client):
-    _, _, admin = app_client
+async def test_config_import_apply_is_queued_not_applied(app_env, admin_client):
+    app = app_env.app; transport = app_env.transport; admin = admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
 
@@ -528,12 +510,12 @@ async def test_config_import_apply_is_queued_not_applied(app_client):
     assert any("would create" in d or "create" in d.lower() for d in detail.json()["preview"])
 
 
-async def test_config_import_approval_applies_recomputed_plan_with_single_event(app_client):
-    app, transport, admin = app_client
+async def test_config_import_approval_applies_recomputed_plan_with_single_event(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     await _create_user(app, admin, "admin-two", "admin")
-    approver = await _login(transport, "admin-two", "password-12345")
+    approver = await _login(app_env, transport, "admin-two", "password-12345")
 
     proposal_id = (await admin.post(
         "/api/v1/config/import", json={"yaml": _import_yaml(), "apply": True}
@@ -553,12 +535,12 @@ async def test_config_import_approval_applies_recomputed_plan_with_single_event(
     await approver.aclose()
 
 
-async def test_config_import_approval_refused_when_config_drifted(app_client):
-    app, transport, admin = app_client
+async def test_config_import_approval_refused_when_config_drifted(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
     await _create_user(app, admin, "admin-two", "admin")
-    approver = await _login(transport, "admin-two", "password-12345")
+    approver = await _login(app_env, transport, "admin-two", "password-12345")
 
     proposal_id = (await admin.post(
         "/api/v1/config/import", json={"yaml": _import_yaml(), "apply": True}
@@ -584,8 +566,8 @@ async def test_config_import_approval_refused_when_config_drifted(app_client):
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 
 
-async def test_approval_pending_webhook_fires_without_diff_contents(app_client):
-    app, transport, admin = app_client
+async def test_approval_pending_webhook_fires_without_diff_contents(app_env, admin_client):
+    app, transport, admin = app_env.app, app_env.transport, admin_client
     await _create_server(admin)
     await _enable_approvals(admin)
 
@@ -626,3 +608,8 @@ async def test_approval_pending_webhook_fires_without_diff_contents(app_client):
         assert "proposal_id" in raw
     finally:
         await receiver.stop()
+
+@pytest.fixture(autouse=True)
+def _require_setup(admin_client):
+    pass
+

@@ -197,6 +197,13 @@ def build_control_plane_router(
     audit_repo: Optional[AuditRepo] = None,
     audit_logger: Optional[AuditLogger] = None,
     health_poller: Optional[HealthPoller] = None,
+    # Issue #44 follow-up: suppresses ONLY the courtesy probe fired when a server is registered
+    # (see create_server below). It deliberately does NOT affect POST /servers/{slug}/probe —
+    # a manual probe is an explicit operator request and must always do real work. Tests that
+    # register servers against upstreams that don't exist set this False to avoid paying a probe
+    # timeout per registration; before this flag they achieved it by passing health_poller=None,
+    # which ALSO silently disabled the manual endpoint.
+    probe_on_create: bool = True,
     rate_limiter: Optional[RateLimiterRegistry] = None,
     pipeline: Optional[Pipeline] = None,
     webhook_dispatcher: Optional[WebhookDispatcher] = None,
@@ -333,7 +340,7 @@ def build_control_plane_router(
                 actor=principal.actor, client_ip=request.client.host if request.client else None,
             )
 
-        if health_poller is not None:
+        if health_poller is not None and probe_on_create:
             # Probe immediately rather than leaving the server at "unknown" for up to a full
             # poll interval (60s default) — a first-time user's very first action shouldn't
             # feel broken while they wait. A failed probe still returns 201 for the server

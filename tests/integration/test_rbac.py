@@ -18,30 +18,16 @@ from db.database import Database
 from db.repo import ProjectMemberRepo, ProjectRepo, SettingsRepo, UserRepo
 
 
-@pytest.fixture
-async def rbac_app(tmp_path: Path):
-    settings = Settings(
-        data_dir=str(tmp_path), auth_mode="keyed",
-        health_poll_enabled=False, audit_retention_enabled=False,
-    )
-    db = Database(tmp_path)
-    await db.connect()
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as setup_client:
-            await setup_client.post("/api/v1/setup", json={"admin_password": "admin-password-1"})
-        yield app, transport
-    await db.close()
+pytestmark = pytest.mark.parametrize("app_env", [{"auth_mode": "keyed", "probe_on_create": False}], indirect=True)
 
 
-async def _login_as(transport: httpx.ASGITransport, username: str, password: str) -> httpx.AsyncClient:
+async def _login_as(app_env, username: str, password: str) -> httpx.AsyncClient:
     # Bug fix (coordinator review of PR #16, 2026-08-07): POST /api/v1/login now takes a real
     # `username` field (see archon/schemas.py's LoginRequest and the fix in archon/setup.py) —
     # this goes through the ACTUAL login route for every role, not just "admin". Previously this
     # helper's docstring said only admin could reach /login at all, and non-admin test clients
     # were built by forging a session cookie directly; that was true, and it was the bug.
-    client = httpx.AsyncClient(transport=transport, base_url="http://argus.test")
+    client = httpx.AsyncClient(transport=app_env.transport, base_url="http://argus.test")
     resp = await client.post("/api/v1/login", json={"username": username, "admin_password": password})
     if resp.status_code != 200:
         raise AssertionError(f"login failed for {username}: {resp.status_code} {resp.text}")
@@ -49,7 +35,7 @@ async def _login_as(transport: httpx.ASGITransport, username: str, password: str
 
 
 async def _create_user_and_login(
-    app, transport: httpx.ASGITransport, admin_client: httpx.AsyncClient,
+    app_env, admin_client: httpx.AsyncClient,
     username: str, role: str, password: str = "password-12345",
 ) -> httpx.AsyncClient:
     """Creates a user via the real admin API, then authenticates as them through the real
@@ -72,6 +58,7 @@ async def _create_user_and_login(
     )
     assert resp.status_code == 201, resp.text
     user_id = resp.json()["id"]
+    app = app_env.app
 
     project_repo = ProjectRepo(app.state.db)
     member_repo = ProjectMemberRepo(app.state.db)
@@ -84,7 +71,7 @@ async def _create_user_and_login(
     project_role = {"viewer": "viewer", "operator": "poweruser", "admin": "admin"}[role]
     await member_repo.upsert(user_id=user_id, project_id=default_project.id, role=project_role)
 
-    return await _login_as(transport, username, password)
+    return await _login_as(app_env, username, password)
 
 
 async def _forge_session_cookie_client(
@@ -109,22 +96,20 @@ async def _forge_session_cookie_client(
         user_id=user.id, user_session_version=user.session_version,
     )
     return httpx.AsyncClient(
-        transport=transport, base_url="http://argus.test",
+        transport=app_env.transport, base_url="http://argus.test",
         cookies={SESSION_COOKIE_NAME: token},
     )
 
 
 @pytest.fixture
-async def role_clients(rbac_app):
+async def role_clients(app_env, admin_client):
     """One authenticated httpx client per role, all against the SAME app/db."""
-    app, transport = rbac_app
-    admin_client = await _login_as(transport, "admin", "admin-password-1")
+    app = app_env.app
 
-    operator_client = await _create_user_and_login(app, transport, admin_client, "op-user", "operator")
-    viewer_client = await _create_user_and_login(app, transport, admin_client, "view-user", "viewer")
+    operator_client = await _create_user_and_login(app_env, admin_client, "op-user", "operator")
+    viewer_client = await _create_user_and_login(app_env, admin_client, "view-user", "viewer")
 
     yield {"admin": admin_client, "operator": operator_client, "viewer": viewer_client}
-    await admin_client.aclose()
     await operator_client.aclose()
     await viewer_client.aclose()
 
@@ -167,8 +152,8 @@ ROUTE_MATRIX: list[tuple[str, str, str, Optional[dict]]] = [
 
 
 @pytest.mark.parametrize("method,path,minimum_role,body", ROUTE_MATRIX)
-async def test_route_role_matrix(rbac_app, role_clients, method, path, minimum_role, body):
-    app, transport = rbac_app
+async def test_route_role_matrix(app_env, admin_client, role_clients, method, path, minimum_role, body):
+    app = app_env.app
     admin_client = role_clients["admin"]
 
     # Fixtures the matrix needs: a server named "srv", plus one to delete per-parametrization
@@ -237,7 +222,7 @@ async def test_operator_cannot_run_config_import(role_clients):
     assert resp.status_code == 403
 
 
-async def test_operator_can_edit_policy_directly(rbac_app, role_clients):
+async def test_operator_can_edit_policy_directly(app_env, admin_client, role_clients):
     """The contrast case for the above: operators DO have policy-edit access on a single
     server, just not the bulk config-import path."""
     admin_client = role_clients["admin"]
@@ -251,10 +236,10 @@ async def test_operator_can_edit_policy_directly(rbac_app, role_clients):
     assert resp.status_code == 200
 
 
-async def test_unknown_role_denied_everywhere(rbac_app, role_clients):
+async def test_unknown_role_denied_everywhere(app_env, admin_client, role_clients):
     """Fail-closed guard (same bug class as F26): a garbage role string in the users table must
     resolve to NO ACCESS on every route, never a permissive default."""
-    app, transport = rbac_app
+    app = app_env.app
     admin_client = role_clients["admin"]
 
     resp = await admin_client.post(
@@ -281,7 +266,7 @@ async def test_unknown_role_denied_everywhere(rbac_app, role_clients):
         user_id=user.id, user_session_version=DEFAULT_SESSION_VERSION,
     )
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://argus.test", cookies={SESSION_COOKIE_NAME: token},
+        transport=app_env.transport, base_url="http://argus.test", cookies={SESSION_COOKIE_NAME: token},
     ) as bad_client:
         # Every rank, including the LOWEST (viewer), must deny this principal.
         resp = await bad_client.get("/api/v1/servers")
@@ -308,10 +293,10 @@ async def test_role_change_writes_admin_event(role_clients):
     assert "viewer -> operator" in matching[0]["summary"]
 
 
-async def test_role_change_revokes_existing_session_immediately(rbac_app, role_clients):
+async def test_role_change_revokes_existing_session_immediately(app_env, admin_client, role_clients):
     """A role change (demotion in particular) must take effect on the NEXT request, not wait
     for the old cookie to expire up to 7 days later."""
-    app, transport = rbac_app
+    app = app_env.app
     admin_client = role_clients["admin"]
 
     resp = await admin_client.post(
@@ -330,7 +315,7 @@ async def test_role_change_revokes_existing_session_immediately(rbac_app, role_c
         user_id=user.id, user_session_version=user.session_version,
     )
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://argus.test", cookies={SESSION_COOKIE_NAME: token},
+        transport=app_env.transport, base_url="http://argus.test", cookies={SESSION_COOKIE_NAME: token},
     ) as demoted_client:
         # Works fine before the demotion.
         assert (await demoted_client.get("/api/v1/keys")).status_code == 200
@@ -343,8 +328,8 @@ async def test_role_change_revokes_existing_session_immediately(rbac_app, role_c
         assert resp.status_code == 401
 
 
-async def test_disabling_user_revokes_session_immediately(rbac_app, role_clients):
-    app, transport = rbac_app
+async def test_disabling_user_revokes_session_immediately(app_env, admin_client, role_clients):
+    app = app_env.app
     admin_client = role_clients["admin"]
 
     resp = await admin_client.post(
@@ -363,7 +348,7 @@ async def test_disabling_user_revokes_session_immediately(rbac_app, role_clients
         user_id=user.id, user_session_version=user.session_version,
     )
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://argus.test", cookies={SESSION_COOKIE_NAME: token},
+        transport=app_env.transport, base_url="http://argus.test", cookies={SESSION_COOKIE_NAME: token},
     ) as disabled_client:
         assert (await disabled_client.get("/api/v1/servers")).status_code == 200
 
@@ -382,11 +367,11 @@ async def test_admin_cannot_disable_own_account(role_clients):
     assert resp.status_code == 400
 
 
-async def test_data_plane_unaffected_by_role(rbac_app, role_clients):
+async def test_data_plane_unaffected_by_role(app_env, admin_client, role_clients):
     """/mcp/* authorisation is API-key scoping only — completely independent of control-plane
     role. A viewer-role session cookie must have NO bearing on data-plane access (there is no
     session-cookie auth path on /mcp/* at all; only Bearer API keys)."""
-    app, transport = rbac_app
+    app = app_env.app
     # No API key presented at all — auth_mode is "keyed", so this must be rejected regardless
     # of which (if any) control-plane session cookie rides along, proving session-based RBAC
     # grants nothing on the data plane.
@@ -394,3 +379,7 @@ async def test_data_plane_unaffected_by_role(rbac_app, role_clients):
         "/mcp/some-server", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
     )
     assert resp.status_code in (401, 404)
+
+@pytest.fixture(autouse=True)
+def _require_setup(admin_client):
+    pass

@@ -37,6 +37,14 @@ async def client(tmp_path: Path, upstream):
     await db.close()
 
 
+@pytest.fixture
+async def client(app_env, upstream):
+    server_repo = ServerRepo(app_env.db)
+    await server_repo.create(slug="s", name="S", upstream_url=f"{upstream.url}/mcp")
+    async with app_env.client() as c:
+        yield c
+
+
 async def test_get_tools_passthrough_mode_all_allowed(client):
     resp = await client.get("/api/v1/servers/s/tools")
     assert resp.status_code == 200

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import asyncpg
 
@@ -58,6 +61,34 @@ class DatabaseNotConfiguredError(Exception):
     embedded/default backend to silently degrade to. Failing loudly at boot matches the posture
     archon/settings.py already takes for a misconfigured secret provider or webhook URL: a
     misconfigured data store must not present as an empty-but-working gateway."""
+
+
+class PoolExhaustedError(Exception):
+    """Raised when a connection pool is exhausted and a connection cannot be acquired within the timeout."""
+
+
+@contextlib.asynccontextmanager
+async def acquire_with_timeout(pool: asyncpg.Pool, timeout: float) -> AsyncIterator[asyncpg.Connection]:
+    """Acquire a pooled connection, converting acquisition timeout into PoolExhaustedError.
+
+    The try/except deliberately wraps ONLY the acquisition, not the caller's body. An earlier
+    shape wrapped the `yield` too, which meant an asyncio.TimeoutError raised for any unrelated
+    reason INSIDE the caller's `async with` block (a wait_for around a slow query, a cancelled
+    upstream call) came back out as "pool exhausted, check for a connection leak" — sending
+    whoever debugs it at entirely the wrong subsystem. Only a timeout from pool.acquire() itself
+    is evidence of exhaustion.
+    """
+    acquisition = pool.acquire(timeout=timeout)
+    try:
+        conn = await acquisition.__aenter__()
+    except asyncio.TimeoutError as e:
+        raise PoolExhaustedError(
+            f"pool exhausted after {timeout}s, check for a connection leak"
+        ) from e
+    try:
+        yield conn
+    finally:
+        await acquisition.__aexit__(*sys.exc_info())
 
 
 def _version_from_filename(filename: str) -> int:
@@ -213,6 +244,8 @@ class Database:
     DEFAULT_READER_POOL_MIN = 1
     DEFAULT_READER_POOL_MAX = 10
 
+    POOL_ACQUIRE_TIMEOUT = 10.0  # seconds
+
     def __init__(
         self,
         dsn: Optional[str] = None,
@@ -248,7 +281,7 @@ class Database:
         )
         # Migrations run on the writer pool, under the advisory lock in _apply_migrations, so
         # concurrently-starting instances cannot race to apply the same file.
-        async with self.writer.acquire() as conn:
+        async with acquire_with_timeout(self.writer, self.POOL_ACQUIRE_TIMEOUT) as conn:
             await _apply_migrations(conn)
 
     async def close(self) -> None:

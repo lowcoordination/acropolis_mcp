@@ -9,7 +9,7 @@ import asyncpg
 
 from argus.bridge import BridgeError, ProtocolBridge
 from argus.policy import tool_is_visible
-from db.database import Database, utcnow
+from db.database import Database, acquire_with_timeout, utcnow
 from db.models import ServerPolicy
 
 DEFAULT_TTL_MS = 300_000  # 5 minutes — used for 2025-generation upstreams, which carry no ttlMs
@@ -26,11 +26,11 @@ class ToolsCache:
 
     def _read(self):
         assert self._db.reader is not None, "Database.connect() not awaited"
-        return self._db.reader.acquire()
+        return acquire_with_timeout(self._db.reader, self._db.POOL_ACQUIRE_TIMEOUT)
 
     def _write(self):
         assert self._db.writer is not None, "Database.connect() not awaited"
-        return self._db.writer.acquire()
+        return acquire_with_timeout(self._db.writer, self._db.POOL_ACQUIRE_TIMEOUT)
 
     async def _cached_rows(self, server_id: int) -> list[asyncpg.Record]:
         async with self._read() as conn:

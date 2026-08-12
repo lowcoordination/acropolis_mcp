@@ -48,30 +48,22 @@ async def upstream():
         yield server
 
 
+pytestmark = pytest.mark.parametrize("app_env", [{"auth_mode": "keyed", "probe_on_create": False}], indirect=True)
+
 @pytest.fixture
-async def quota_app(tmp_path: Path, upstream):
+async def quota_app(app_env, upstream):
     """A fully wired app in auth_mode='keyed', with the setup wizard already run, a server
     registered against the real FastMCP fixture, and an admin session ready to mint keys.
     Yields (app, db, admin_client, transport, server_slug)."""
-    settings = Settings(
-        data_dir=str(tmp_path), auth_mode="keyed",
-        health_poll_enabled=False, audit_retention_enabled=False,
-    )
-    db = Database(tmp_path)
-    await db.connect()
-    server_repo = ServerRepo(db)
+    server_repo = ServerRepo(app_env.db)
     await server_repo.create(slug="q", name="Q", upstream_url=f"{upstream.url}/mcp")
 
-    app = create_app(settings, db)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as admin_client:
-            setup_resp = await admin_client.post(
-                "/api/v1/setup", json={"admin_password": "hunter22222", "auth_mode": "keyed"}
-            )
-            assert setup_resp.status_code == 200
-            yield app, db, admin_client, transport, "q"
-    await db.close()
+    async with app_env.client() as admin_client:
+        setup_resp = await admin_client.post(
+            "/api/v1/setup", json={"admin_password": "hunter22222", "auth_mode": "keyed"}
+        )
+        assert setup_resp.status_code == 200
+        yield app_env.app, app_env.db, admin_client, app_env.transport, "q"
 
 
 async def _mint_key(admin_client: httpx.AsyncClient, name: str, quota_calls=None, quota_period=None) -> dict:
@@ -156,9 +148,12 @@ class TestQuotaExceeded:
         created = await _mint_key(admin_client, "burst-race", quota_calls=5, quota_period="day")
         key = created["plaintext"]
 
-        responses = await asyncio.gather(*[
-            _call_tool(transport, key, slug, "echo", req_id=i) for i in range(20)
-        ])
+        responses = await asyncio.wait_for(
+            asyncio.gather(*[
+                _call_tool(transport, key, slug, "echo", req_id=i) for i in range(20)
+            ]),
+            timeout=10.0,
+        )
         allowed = sum(1 for r in responses if r.status_code == 200)
 
         # The upstream call counter is the ground truth for "how many calls actually got
@@ -577,7 +572,7 @@ class TestNoQuotaConfiguredIsUnchangedBehavior:
         assert entry["quota_calls"] is None
         assert entry["quota_period"] is None
 
-    async def test_no_usage_repo_wired_is_a_pure_noop(self, tmp_path, upstream):
+    async def test_no_usage_repo_wired_is_a_pure_noop(self, tmp_path, upstream, app_env):
         """The stronger regression claim: a Pipeline constructed WITHOUT a UsageRepo at all
         (usage_repo=None, the default — every pre-feature call site and unit test) behaves
         exactly as it did before this feature existed, not just 'quota unset behaves fine'."""
@@ -602,7 +597,7 @@ class TestNoQuotaConfiguredIsUnchangedBehavior:
         )
         assert pipeline._usage is None
 
-        app = create_app(settings, db)
+        app = create_app(settings, db, enable_health_probing=False)
         transport = httpx.ASGITransport(app=app)
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:

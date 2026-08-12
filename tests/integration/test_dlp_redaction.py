@@ -155,8 +155,9 @@ class TestRedactActuallyMutatesForwardedBody:
         )
         assert resp.status_code == 200
 
-        assert body_capturing_upstream.call_count == 1
-        raw_body = body_capturing_upstream.received_bodies[0]
+        tool_calls = [b for b in body_capturing_upstream.received_bodies if b'"tools/call"' in b]
+        assert len(tool_calls) == 1
+        raw_body = tool_calls[0]
         # The actual claim under test: the raw bytes that left the process do not contain the
         # secret, and do contain the redaction placeholder — not the client's response, not a
         # mock's recorded call, the literal bytes read off the socket on the upstream side.
@@ -180,7 +181,9 @@ class TestRedactActuallyMutatesForwardedBody:
             app, "dlp-test", "write_file",
             {"path": "/tmp/notes.txt", "content": "email nick@example.com", "overwrite": True},
         )
-        raw_body = body_capturing_upstream.received_bodies[0]
+        tool_calls = [b for b in body_capturing_upstream.received_bodies if b'"tools/call"' in b]
+        assert len(tool_calls) == 1
+        raw_body = tool_calls[0]
         forwarded = json.loads(raw_body)
         args = forwarded["params"]["arguments"]
         assert args["path"] == "/tmp/notes.txt"  # untouched
@@ -202,8 +205,8 @@ class TestBlockNeverReachesUpstream:
 
         resp = await _post_tools_call(app, "dlp-test", "echo", {"message": "card 4111111111111111"})
         assert resp.status_code == 403
-        assert body_capturing_upstream.call_count == 0
-        assert body_capturing_upstream.received_bodies == []
+        tool_calls = [b for b in body_capturing_upstream.received_bodies if b'"tools/call"' in b]
+        assert len(tool_calls) == 0
 
     async def test_block_writes_blocked_audit_row_naming_the_detector(self, app_and_db):
         app, db, server_repo = app_and_db
@@ -305,7 +308,9 @@ class TestNoDlpConfigIsUnchangedBehavior:
             {"message": "card 4111111111111111 and email nick@example.com and AKIAIOSFODNN7EXAMPLE"},
         )
         assert resp.status_code == 200
-        raw_body = body_capturing_upstream.received_bodies[0]
+        tool_calls = [b for b in body_capturing_upstream.received_bodies if b'"tools/call"' in b]
+        assert len(tool_calls) == 1
+        raw_body = tool_calls[0]
         forwarded = json.loads(raw_body)
         assert forwarded["params"]["arguments"]["message"] == (
             "card 4111111111111111 and email nick@example.com and AKIAIOSFODNN7EXAMPLE"

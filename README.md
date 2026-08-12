@@ -46,3 +46,5 @@ Run tests:
 ```bash
 pytest
 ```
+
+Test speed relies heavily on tests opting out of health polling via `probe_on_create=False`. Do not use real health probing when adding new control plane tests unless you explicitly need to assert on the probe's side effects.
