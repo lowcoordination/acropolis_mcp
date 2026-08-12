@@ -42,13 +42,9 @@ class AggregatePipeline:
         self._settings_repo = settings_repo
 
     async def _aggregate_enabled(self) -> bool:
-        # F15 fix (review 2026-08-04): aggregate_enabled was stored, defaulted, returned by
-        # GET /settings, written by PUT /settings, and rendered as a UI toggle — and NOTHING
-        # read it. argus/app.py always registered this pipeline and argus/routes.py always
-        # registered POST /mcp unconditionally. An operator who toggled the aggregate endpoint
-        # off got a 200 from the API and a persisted setting while the endpoint stayed fully
-        # live — a control that silently no-ops is worse than an absent one, since it actively
-        # tells the operator the merged cross-server tool surface is closed when it isn't.
+        # This setting must actually be READ here — it is surfaced as an operator-facing UI
+        # toggle, and a control that silently no-ops is worse than an absent one: it tells the
+        # operator the merged cross-server tool surface is closed when it isn't.
         # Same DB-is-live pattern as Pipeline._current_auth_mode: read per request so a change
         # via the Settings page takes effect immediately, matching what its save button implies.
         if self._settings_repo is not None:
@@ -83,12 +79,11 @@ class AggregatePipeline:
                 endpoint="aggregate",
             )
 
-        # §26 fix (review 2026-08-04): this used to be a bare `await request.body()` with no
-        # size limit at all — unlike the per-server path (Pipeline._read_body_guarded), which
-        # enforces settings.max_body_bytes. An authenticated-but-malicious (or just careless)
-        # caller could send an arbitrarily large body to this endpoint and force it fully into
-        # memory before the JSON-RPC parse even runs. Reuse the per-server pipeline's own guard
-        # rather than duplicating the content-length + actual-size check here.
+        # SECURITY: must go through _read_body_guarded, never a bare `await request.body()` —
+        # an authenticated-but-malicious (or just careless) caller could otherwise force an
+        # arbitrarily large body fully into memory before the JSON-RPC parse even runs. Reuses
+        # the per-server pipeline's guard (settings.max_body_bytes) rather than duplicating the
+        # content-length + actual-size check here.
         try:
             body_bytes = await self._per_server._read_body_guarded(request)
         except RoutingError as e:
@@ -104,11 +99,9 @@ class AggregatePipeline:
         except json.JSONDecodeError:
             body_json = None
 
-        # F11 fix (review 2026-08-04): a JSON-RPC batch (top-level array — spec-legal) parses
-        # successfully but isn't a dict, so body_json.get(...) below would raise
-        # AttributeError -> unhandled 500. Confirmed:
-        # `[{"jsonrpc":"2.0","id":1,"method":"ping"}]` crashed pre-fix. Same fix as
-        # argus/pipeline.py's _process — treat non-dict JSON the same as unparseable JSON.
+        # A JSON-RPC batch (top-level array — spec-legal) parses successfully but isn't a dict,
+        # so body_json.get(...) below would raise AttributeError -> unhandled 500. Treat
+        # non-dict JSON the same as unparseable JSON, matching argus/pipeline.py's _process.
         if not isinstance(body_json, dict):
             body_json = None
 
@@ -138,8 +131,9 @@ class AggregatePipeline:
         )
 
     async def _caller_project_id(self, api_key_id: Optional[int]) -> Optional[int]:
-        """Enterprise #4 (multi-tenancy, issue #5): resolves which project the aggregate view
-        should be scoped to. `None` (open auth_mode, no key at all) means "no project filter" —
+        """Resolves which project the aggregate view should be scoped to (multi-tenancy).
+
+        `None` (open auth_mode, no key at all) means "no project filter" —
         an unauthenticated/keyless deployment has no notion of a calling project, so the
         aggregate stays instance-wide in that mode, same as it always has. A real key ALWAYS
         scopes to its own project — this is the deliberate behavior change from pre-feature
@@ -162,11 +156,11 @@ class AggregatePipeline:
             status_code=200, media_type="application/json",
         )
 
-    # F14 fix (review 2026-08-04): each server's tool fetch (upstream handshake + tools/list
-    # round-trip on a cache miss) gets its own deadline well below the full
-    # upstream_timeout_seconds budget, so one slow/unreachable server can only ever cost this
-    # much wall time — never the full per-call timeout, and never serially stacked with every
-    # other server's cost (see the asyncio.gather fan-out below).
+    # Each server's tool fetch (upstream handshake + tools/list round-trip on a cache miss) gets
+    # its own deadline well below the full upstream_timeout_seconds budget, so one
+    # slow/unreachable server can only ever cost this much wall time — never the full per-call
+    # timeout, and never serially stacked with every other server's cost (see the asyncio.gather
+    # fan-out below).
     _PER_SERVER_DEADLINE_SECONDS = 10.0
 
     async def _fetch_one_server(self, server, policy) -> list[dict]:
@@ -201,17 +195,15 @@ class AggregatePipeline:
     async def _handle_tools_list(
         self, rpc_id: Any, start: float, client_ip=None, api_key_id: Optional[int] = None,
     ) -> Response:
-        # F14 fix: this used to be a plain `for server in servers: await get_policy(...); await
-        # get_filtered_tools(...)` loop — every server's cost (a full upstream handshake plus a
-        # tools/list round-trip on a cache miss) was SUMMED, sequentially. With 8 registered
-        # servers, cold cache, and two slow/unreachable ones at the old 120s upstream timeout,
-        # one client tools/list call could block ~4 minutes — and agents typically call
-        # tools/list first, so this was the very first thing a user experienced. Also: the
-        # aggregate path never audited at all, unlike the per-server path.
+        # Servers are fetched CONCURRENTLY (the gather below), never in a sequential loop: each
+        # server's cost is a full upstream handshake plus a tools/list round-trip on a cache
+        # miss, and summing those serially made one client tools/list call block for minutes
+        # with a handful of cold/unreachable servers. Agents typically call tools/list first, so
+        # that was the very first thing a user experienced.
         #
-        # Enterprise #4: project_id=None (open auth_mode) means unfiltered, matching pre-feature
-        # instance-wide behavior in that mode; a real key scopes to its own project — see
-        # _caller_project_id's docstring for why this is a deliberate, documented behavior change.
+        # project_id=None (open auth_mode) means unfiltered; a real key scopes to its own
+        # project — see _caller_project_id's docstring for why that is a deliberate behavior
+        # change.
         project_id = await self._caller_project_id(api_key_id)
         servers = [
             s for s in (await self._servers.list(project_id=project_id)) if s.enabled and s.in_aggregate

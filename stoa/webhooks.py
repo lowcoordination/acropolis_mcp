@@ -86,21 +86,20 @@ class WebhookDispatcher(BackgroundLoop):
         self._queue: Optional[asyncio.Queue] = None
         self._debounce: dict[tuple[str, str], _DebounceEntry] = {}
         self._cap = _CapState()
-        # Enterprise #11: (key_prefix, period_start_iso) -> highest threshold already fired
-        # this period. Per-PERIOD debounce, not the time-windowed DEBOUNCE_WINDOW_SECONDS
+        # (key_prefix, period_start_iso) -> highest threshold already fired this period.
+        # Per-PERIOD debounce, not the time-windowed DEBOUNCE_WINDOW_SECONDS
         # pattern the rest of this class uses for BLOCKED/unhealthy/drift — a quota alert's
         # correct debounce boundary is "once per threshold per billing period," which could be
         # hours or a month wide, not a fixed 60s window. period_start_iso is part of the key so
         # a NEW period (the caller computes a new start via argus.quotas.period_start) starts
         # with a clean slate automatically, with no separate reset job needed.
         self._quota_fired: dict[tuple[str, str], int] = {}
-        # Enterprise #11 self-review fix: a burst of concurrent requests can all read
-        # self._quota_fired BEFORE any of them writes it back — the classic check-then-act race
-        # (see tests/integration/test_quotas.py::test_concurrent_burst_crossing_threshold_
-        # fires_webhook_exactly_once for the regression test). One lock, keyed by
-        # (key_prefix, period_start_iso), makes "check what's fired, then record what just
-        # fired" atomic across concurrent callers instead of two separate awaits with a gap
-        # between them.
+        # Without this lock a burst of concurrent requests can all read self._quota_fired BEFORE
+        # any of them writes it back — the classic check-then-act race, which would fire the
+        # same threshold alert once per concurrent caller (regression test:
+        # tests/integration/test_quotas.py::test_concurrent_burst_crossing_threshold_
+        # fires_webhook_exactly_once). One lock makes "check what's fired, then record what just
+        # fired" atomic instead of two separate awaits with a gap between them.
         self._quota_lock = asyncio.Lock()
 
     async def fire(self, event_type: str, payload: dict) -> None:
@@ -202,12 +201,12 @@ class WebhookDispatcher(BackgroundLoop):
                     "matched": event.get("matched"),
                     "reason": event.get("reason"),
                     "count": count,
-                    # Enterprise #10 (DLP): the detector NAME is safe to send (operator-facing
-                    # metadata, same trust level as `rule`) — the matched/redacted VALUE never
-                    # is. `event.get("matched")` above is None on a DLP-driven block (see
+                    # SECURITY: the DLP detector NAME is safe to send (operator-facing metadata,
+                    # same trust level as `rule`) — the matched/redacted VALUE never is.
+                    # `event.get("matched")` above is None on a DLP-driven block (see
                     # argus/policy.py's Decision — DLP never populates `matched`), so this key
                     # is the only DLP-specific field this payload ever carries, mirroring the
-                    # existing deliberate exclusion of args_summary from webhook payloads.
+                    # deliberate exclusion of args_summary from webhook payloads.
                     "dlp_detector": event.get("dlp_detector"),
                 },
             )
@@ -234,7 +233,7 @@ class WebhookDispatcher(BackgroundLoop):
     async def notify_approval_pending(
         self, *, proposal_id: int, target_type: str, target_id: str, proposer: str,
     ) -> None:
-        """Enterprise #9: fires the `approval_pending` webhook event when a proposal is created
+        """Fires the `approval_pending` webhook event when a proposal is created
         (called from archon/approvals.py). Edge semantics like notify_unhealthy — a proposal
         creation happens at most once per proposal by construction, so there is nothing to
         debounce (unlike BLOCKED/quota, which fire per matching request and need the window).
@@ -264,7 +263,7 @@ class WebhookDispatcher(BackgroundLoop):
     async def fire_quota_threshold(
         self, *, key_prefix: str, key_name: str, threshold: int, period: str, period_start_iso: str,
     ) -> None:
-        """Enterprise #11: fires the `quota` webhook event when a call crosses an
+        """Fires the `quota` webhook event when a call crosses an
         80%/100%-of-quota threshold. Called from argus/pipeline.py's _check_quota /
         _maybe_fire_quota_webhook, which already determined THAT a threshold was newly crossed
         by the call currently being evaluated — this method's only remaining job is the
