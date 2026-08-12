@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
@@ -28,7 +29,7 @@ from argus.headers import (
     strip_hop_by_hop,
 )
 from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
-from argus.policy import evaluate
+from argus.policy import Decision, evaluate
 from argus.quotas import period_start
 from argus.rate_limiter import RateLimiterRegistry, server_key, tool_key
 from argus.toolslist import ToolsCache
@@ -59,6 +60,19 @@ class RoutingError(Exception):
         self.body = body
         self.media_type = media_type
         super().__init__(body)
+
+
+@dataclass
+class _EnforcementOutcome:
+    """Result of the shared enforcement prelude (issue #52).
+
+    `blocked_response` non-None means the caller returns it immediately — no forwarding. When
+    it is None, `decision`/`policy` describe the (allowed) call the caller is about to forward.
+    """
+
+    blocked_response: Optional[Response] = None
+    decision: Optional[Decision] = None
+    policy: Optional[ServerPolicy] = None
 
 
 class Pipeline:
@@ -344,8 +358,8 @@ class Pipeline:
                 # And only when a bridge is configured: if self._bridge is None the 2026 branch
                 # is skipped and even a 2026 client falls through to the passthrough path below.
                 # Do not merge the two paths — one proxies bytes, the other translates protocol
-                # generations. Their shared enforcement prelude is deliberately duplicated;
-                # see the dedup issue (#52).
+                # generations. Their shared enforcement prelude lives in _enforce (deduped in
+                # issue #52); the paths legitimately diverge after it.
                 generation = force_generation or detect_client_generation(request)
 
                 if rpc_method == "server/discover":
@@ -365,69 +379,23 @@ class Pipeline:
                     # guard) rather than re-reading body_json.get("params", {}) here — there
                     # is only one place the params-can-be-None case is guarded.
                     tool_name = params.get("name")
-                    arguments = params.get("arguments") or {}
-
-                    if not tool_name or not isinstance(tool_name, str):
-                        await self._audit.log(
-                            server_slug=server.slug, tool="<missing>", decision="BLOCKED",
-                            endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
-                            reason="tools/call missing required 'name' field", status_code=400,
-                            latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-                        )
-                        return Response(
-                            content=rpc_error(rpc_id, "tools/call missing required 'name' field"),
-                            status_code=400, media_type="application/json",
-                        )
-
-                    policy = await self._servers.get_policy(server.id)
-                    blocked_response = await self._check_rate_limits(
-                        server, policy, tool_name, api_key_id, rpc_id, start, client_ip
+                    outcome = await self._enforce(
+                        server, rpc_method, rpc_id, params, tool_name, api_key_id,
+                        start, client_ip, origin=origin,
                     )
-                    if blocked_response is not None:
-                        await self._record_usage(server, tool_name, api_key_id)
-                        return blocked_response
-
-                    # After auth, after rate limiting, before policy evaluation — the
-                    # non-negotiable ordering from 02-quotas-and-usage.md. A quota-exceeded
-                    # call is refused here, before evaluate() ever runs, so the upstream is
-                    # never reached and no DLP/param-rule work is wasted on a call that's
-                    # about to be rejected anyway.
-                    quota_response = await self._check_quota(
-                        server, tool_name, api_key_id, rpc_id, start, client_ip
-                    )
-                    if quota_response is not None:
-                        await self._record_usage(server, tool_name, api_key_id)
-                        return quota_response
-
-                    decision = await self._evaluate_with_tracing(tool_name, arguments, server, policy)
-                    await self._audit.log(
-                        server_slug=server.slug, tool=tool_name,
-                        decision="BLOCKED" if decision.blocked else "ALLOWED",
-                        endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
-                        rule=decision.rule, matched=decision.matched,
-                        args_summary=decision.args_summary, reason=decision.reason,
-                        latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-                        dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
-                        dlp_match_count=decision.dlp_match_count,
-                    )
-                    await self._record_usage(server, tool_name, api_key_id)
-
-                    if decision.blocked:
-                        return Response(
-                            content=rpc_error(
-                                rpc_id, f"Blocked by acropolis: {decision.reason}",
-                                data={"tool": tool_name, "rule": decision.rule, "matched": decision.matched},
-                            ),
-                            status_code=403, media_type="application/json",
-                        )
+                    if outcome.blocked_response is not None:
+                        return outcome.blocked_response
 
                     # DLP redact: the redacted body MUST be what actually leaves the process —
                     # re-serialize the JSON-RPC envelope with the redacted arguments substituted
                     # in and forward THAT, never the original body_bytes.
-                    if decision.dlp_redacted_arguments is not None:
+                    if (
+                        outcome.decision is not None
+                        and outcome.decision.dlp_redacted_arguments is not None
+                    ):
                         rewritten = dict(body_json)
                         rewritten_params = dict(params)
-                        rewritten_params["arguments"] = decision.dlp_redacted_arguments
+                        rewritten_params["arguments"] = outcome.decision.dlp_redacted_arguments
                         rewritten["params"] = rewritten_params
                         body_bytes = json.dumps(rewritten).encode("utf-8")
                 else:
@@ -478,6 +446,85 @@ class Pipeline:
             policy_span.set_attribute("acropolis.rule", decision.rule)
             return decision
 
+    async def _enforce(
+        self, server: ServerRecord, rpc_method: str, rpc_id: Any, params: dict,
+        tool_name: Optional[str], api_key_id: Optional[int], start: float,
+        client_ip: Optional[str], origin: Optional[str] = None, *, bridged: bool = False,
+    ) -> _EnforcementOutcome:
+        """The enforcement prelude shared by _process (passthrough) and _handle_bridged (issue
+        #52): tool_name validation -> get_policy -> rate limits -> quota -> evaluate -> audit ->
+        record_usage -> 403-if-blocked, in that order.
+
+        The ordering is the non-negotiable one from 02-quotas-and-usage.md: quota is enforced
+        after auth, after rate limiting, before policy evaluation — a quota-exceeded call is
+        refused before evaluate() ever runs, so the upstream is never reached and no DLP/param
+        rule work is wasted on a call that's about to be rejected anyway.
+
+        The `bridged` flag threads to the audit rows (bridged=True marks the 2026-generation
+        forwarding path). The two callers legitimately diverge AFTER this method — one forwards
+        raw body bytes, the other translates protocol generations (see _forward vs bridge_call).
+        """
+        arguments = params.get("arguments") or {}
+        audit_common = dict(
+            server_slug=server.slug, endpoint="per-server", rpc_method=rpc_method,
+            api_key_id=api_key_id, latency_ms=int((time.monotonic() - start) * 1000),
+            client_ip=client_ip, origin=origin,
+        )
+        if bridged:
+            audit_common["bridged"] = True
+
+        if not tool_name or not isinstance(tool_name, str):
+            await self._audit.log(
+                tool="<missing>", decision="BLOCKED",
+                reason="tools/call missing required 'name' field", status_code=400,
+                **audit_common,
+            )
+            return _EnforcementOutcome(
+                blocked_response=Response(
+                    content=rpc_error(rpc_id, "tools/call missing required 'name' field"),
+                    status_code=400, media_type="application/json",
+                )
+            )
+
+        policy = await self._servers.get_policy(server.id)
+        blocked_response = await self._check_rate_limits(
+            server, policy, tool_name, api_key_id, rpc_id, start, client_ip
+        )
+        if blocked_response is not None:
+            await self._record_usage(server, tool_name, api_key_id)
+            return _EnforcementOutcome(blocked_response=blocked_response)
+
+        quota_response = await self._check_quota(
+            server, tool_name, api_key_id, rpc_id, start, client_ip
+        )
+        if quota_response is not None:
+            await self._record_usage(server, tool_name, api_key_id)
+            return _EnforcementOutcome(blocked_response=quota_response)
+
+        decision = await self._evaluate_with_tracing(tool_name, arguments, server, policy)
+        await self._audit.log(
+            tool=tool_name,
+            decision="BLOCKED" if decision.blocked else "ALLOWED",
+            rule=decision.rule, matched=decision.matched,
+            args_summary=decision.args_summary, reason=decision.reason,
+            dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
+            dlp_match_count=decision.dlp_match_count,
+            **audit_common,
+        )
+        await self._record_usage(server, tool_name, api_key_id)
+
+        if decision.blocked:
+            return _EnforcementOutcome(
+                blocked_response=Response(
+                    content=rpc_error(
+                        rpc_id, f"Blocked by acropolis: {decision.reason}",
+                        data={"tool": tool_name, "rule": decision.rule, "matched": decision.matched},
+                    ),
+                    status_code=403, media_type="application/json",
+                )
+            )
+        return _EnforcementOutcome(decision=decision, policy=policy)
+
     def _handle_discover(self, server: ServerRecord, rpc_id: Any) -> Response:
         result = synthesize_server_discover(server)
         return Response(
@@ -517,59 +564,13 @@ class Pipeline:
     ) -> Response:
         if rpc_method == "tools/call":
             tool_name = params.get("name")
-            arguments = params.get("arguments") or {}
-
-            if not tool_name or not isinstance(tool_name, str):
-                await self._audit.log(
-                    server_slug=server.slug, tool="<missing>", decision="BLOCKED",
-                    endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
-                    reason="tools/call missing required 'name' field", status_code=400,
-                    latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
-                    client_ip=client_ip, origin=origin,
-                )
-                return Response(
-                    content=rpc_error(rpc_id, "tools/call missing required 'name' field"),
-                    status_code=400, media_type="application/json",
-                )
-
-            policy = await self._servers.get_policy(server.id)
-            blocked_response = await self._check_rate_limits(
-                server, policy, tool_name, api_key_id, rpc_id, start, client_ip
+            outcome = await self._enforce(
+                server, rpc_method, rpc_id, params, tool_name, api_key_id,
+                start, client_ip, origin=origin, bridged=True,
             )
-            if blocked_response is not None:
-                await self._record_usage(server, tool_name, api_key_id)
-                return blocked_response
+            if outcome.blocked_response is not None:
+                return outcome.blocked_response
 
-            # Same ordering as the non-bridged path in _process — after auth, after rate
-            # limiting, before policy evaluation.
-            quota_response = await self._check_quota(
-                server, tool_name, api_key_id, rpc_id, start, client_ip
-            )
-            if quota_response is not None:
-                await self._record_usage(server, tool_name, api_key_id)
-                return quota_response
-
-            decision = await self._evaluate_with_tracing(tool_name, arguments, server, policy)
-            await self._audit.log(
-                server_slug=server.slug, tool=tool_name,
-                decision="BLOCKED" if decision.blocked else "ALLOWED",
-                endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
-                rule=decision.rule, matched=decision.matched,
-                args_summary=decision.args_summary, reason=decision.reason,
-                latency_ms=int((time.monotonic() - start) * 1000), bridged=True,
-                client_ip=client_ip, origin=origin,
-                dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
-                dlp_match_count=decision.dlp_match_count,
-            )
-            await self._record_usage(server, tool_name, api_key_id)
-            if decision.blocked:
-                return Response(
-                    content=rpc_error(
-                        rpc_id, f"Blocked by acropolis: {decision.reason}",
-                        data={"tool": tool_name, "rule": decision.rule, "matched": decision.matched},
-                    ),
-                    status_code=403, media_type="application/json",
-                )
             # DLP redact: the bridged path forwards `params` directly to
             # ProtocolBridge.bridge_call rather than raw body bytes, so redaction here means
             # substituting the redacted arguments into `params` before that call — no
@@ -580,9 +581,12 @@ class Pipeline:
             # correctness, but keeping "can this call still be blocked" resolved before "what
             # do we forward" is the safer invariant to read and to preserve under future
             # changes.
-            if decision.dlp_redacted_arguments is not None:
+            if (
+                outcome.decision is not None
+                and outcome.decision.dlp_redacted_arguments is not None
+            ):
                 params = dict(params)
-                params["arguments"] = decision.dlp_redacted_arguments
+                params["arguments"] = outcome.decision.dlp_redacted_arguments
         else:
             await self._audit.log(
                 server_slug=server.slug, tool=None, decision="PASSTHROUGH",
