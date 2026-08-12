@@ -46,17 +46,16 @@ from stoa.retention import AuditRetentionJob
 from stoa.webhooks import WebhookDispatcher
 
 
-# F20 fix (review 2026-08-04): no Content-Security-Policy, X-Frame-Options, or
-# X-Content-Type-Options anywhere, no middleware registered. No CSP means no defence-in-depth
-# if an XSS is ever introduced into the React SPA; no frame protection means the admin
-# dashboard is clickjackable (embed it in an invisible iframe over a fake UI, trick the admin
-# into clicking through actions on the real page underneath). Applied gateway-wide, including
-# /mcp/* — those responses are JSON, not HTML, but the headers are harmless there and this way
-# nothing has to remember to apply them selectively. HSTS is deliberately NOT set here: TLS, if
-# any, is terminated by a reverse proxy in front of Acropolis (see
-# docs/tls-and-reverse-proxy.md), and HSTS is a proxy-layer concern — setting it here would
-# advertise HTTPS-only even when an operator is legitimately running plain HTTP on a trusted
-# LAN, which is this product's documented default. Documented in that same doc instead.
+# Security headers applied gateway-wide, including /mcp/* — those responses are JSON, not HTML,
+# but the headers are harmless there and this way nothing has to remember to apply them
+# selectively. No CSP means no defence-in-depth if an XSS is ever introduced into the React
+# SPA; no frame protection means the admin dashboard is clickjackable (embed it in an invisible
+# iframe over a fake UI, trick the admin into clicking through actions on the real page
+# underneath). HSTS is deliberately NOT set here: TLS, if any, is terminated by a reverse proxy
+# in front of Acropolis (see docs/tls-and-reverse-proxy.md), and HSTS is a proxy-layer concern
+# — setting it here would advertise HTTPS-only even when an operator is legitimately running
+# plain HTTP on a trusted LAN, which is this product's documented default. Documented in that
+# same doc instead.
 async def _security_headers_middleware(request, call_next):
     response = await call_next(request)
     response.headers["Content-Security-Policy"] = "default-src 'self'"
@@ -68,13 +67,12 @@ async def _security_headers_middleware(request, call_next):
 _logger = logging.getLogger("argus.app")
 
 
-# F3 fix (review 2026-08-04, second half): a global safety net so an exception from ANYWHERE
-# in the app — not just the specific _forward() site the review named — never escapes as a
-# bare Starlette 500 with a stack trace leaked to the client. The specific fix at the call site
-# (RoutingError(502, ...) in argus/pipeline.py's _forward) is what makes THAT failure mode
-# return a proper JSON-RPC error and get audited; this handler is the backstop for anything
-# else that wasn't specifically anticipated. Logged at ERROR with the traceback server-side
-# (exc_info=True) so it's still debuggable — only the CLIENT-facing body is generic.
+# Global safety net: an exception from ANYWHERE in the app must never escape as a bare
+# Starlette 500 with a stack trace leaked to the client. RoutingError(502, ...) at the
+# pipeline's _forward call site is what turns THAT failure mode into a proper JSON-RPC error
+# that gets audited; this handler is the backstop for anything else that wasn't specifically
+# anticipated. Logged at ERROR with the traceback server-side (exc_info=True) so it stays
+# debuggable — only the CLIENT-facing body is generic.
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> Response:
     _logger.error("unhandled exception on %s %s", request.method, request.url.path, exc_info=exc)
     if request.url.path.startswith("/mcp"):
@@ -87,14 +85,14 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> Resp
     return JSONResponse(status_code=500, content={"detail": "internal error"})
 
 
-# Issue #44: pool exhaustion is BACKPRESSURE, not an internal fault. Without this handler it
-# falls through to _unhandled_exception_handler above and reports as a 500 — which both lies to
-# the client (retrying is exactly the right move here, unlike a real 500) and pollutes the
-# internal-error rate that's meant to signal genuine bugs. 503 + Retry-After is the honest
-# signal. Logged at WARNING rather than ERROR with no traceback: an exhausted pool under load is
-# an operational capacity event, not a crash, and the exception's own message already names the
-# pool and timeout. The client-facing body stays generic — PoolExhaustedError's text mentions
-# internal pool topology and connection-leak hints, which is operator information, not caller
+# Pool exhaustion is BACKPRESSURE, not an internal fault. Without this handler it falls through
+# to _unhandled_exception_handler above and reports as a 500 — which both lies to the client
+# (retrying is exactly the right move here, unlike a real 500) and pollutes the internal-error
+# rate that's meant to signal genuine bugs. 503 + Retry-After is the honest signal. Logged at
+# WARNING rather than ERROR with no traceback: an exhausted pool under load is an operational
+# capacity event, not a crash, and the exception's own message already names the pool and
+# timeout. The client-facing body stays generic — PoolExhaustedError's text mentions internal
+# pool topology and connection-leak hints, which is operator information, not caller
 # information.
 async def _pool_exhausted_handler(request: Request, exc: Exception) -> Response:
     _logger.warning("pool exhausted on %s %s: %s", request.method, request.url.path, exc)
@@ -131,49 +129,48 @@ def create_app(
     audit_repo = AuditRepo(db)
     settings_repo = SettingsRepo(db)
     user_repo = UserRepo(db)
-    # Enterprise #4 (multi-tenancy, issue #5): always constructed, same "no disabled build"
-    # shape as usage_repo above — project scoping is on unconditionally post-migration (every
-    # instance has at least the backfilled 'default' project).
+    # Always constructed — project scoping is on unconditionally post-migration (every instance
+    # has at least the backfilled 'default' project), same "no disabled build" shape as
+    # usage_repo below.
     project_repo = ProjectRepo(db)
     project_member_repo = ProjectMemberRepo(db)
-    # Enterprise #9: ProposalRepo is always constructed and always wired into the router, the
-    # same "no disabled build" shape as usage_repo — the feature's off-by-default guarantee
-    # comes from the DB-backed approvals_enabled setting, not from omitting the repo.
+    # ProposalRepo is always constructed and always wired into the router — the feature's
+    # off-by-default guarantee comes from the DB-backed approvals_enabled setting, not from
+    # omitting the repo.
     proposal_repo = ProposalRepo(db)
-    # Enterprise #11: usage_repo is always constructed (unlike secret_provider/tracing, there's
-    # no "disabled" build for this one — quotas/usage query availability doesn't depend on an
-    # env var) and always wired into Pipeline. The feature's own off-by-default guarantee comes
-    # from api_keys.quota_calls being NULL by default, not from omitting this repo.
+    # usage_repo is always constructed (unlike secret_provider/tracing, there's no "disabled"
+    # build for this one — quotas/usage query availability doesn't depend on an env var) and
+    # always wired into Pipeline. The feature's off-by-default guarantee comes from
+    # api_keys.quota_calls being NULL by default, not from omitting this repo.
     usage_repo = UsageRepo(db)
 
     api_keys = ApiKeyService(api_key_repo)
     rate_limiter = RateLimiterRegistry()
     audit = AuditLogger(audit_repo)
-    # Enterprise #5: selected once at startup from settings.secret_provider ("local" by default,
-    # byte-identical to pre-feature behaviour). Constructed here — not lazily per-request — so a
-    # misconfigured key/Vault address (EncryptedProviderConfigError / OpenBaoConfigError) fails
-    # loudly at boot, the same way a missing admin_token or a bad webhook_url would, rather than
-    # surfacing as a mysterious first-request failure.
+    # Selected once at startup from settings.secret_provider ("local" by default). Constructed
+    # here — not lazily per-request — so a misconfigured key/Vault address
+    # (EncryptedProviderConfigError / OpenBaoConfigError) fails loudly at boot, the same way a
+    # missing admin_token or a bad webhook_url would, rather than surfacing as a mysterious
+    # first-request failure.
     secret_provider = build_secret_provider(settings)
-    # Enterprise #9: built once at startup, same shape as secret_provider above — reads
-    # ACROPOLIS_OTEL_ENABLED / ACROPOLIS_OTEL_SAMPLE_RATIO from the environment. init() (called
-    # in lifespan below, not here) is where the actual OTel SDK / OTLP exporter gets built (or,
-    # if ACROPOLIS_OTEL_ENABLED=true but the `otel` extra isn't installed, where it degrades to
-    # a logged no-op) — kept separate from construction so tests can build a TracingManager
+    # Built once at startup, same shape as secret_provider above — reads ACROPOLIS_OTEL_ENABLED
+    # / ACROPOLIS_OTEL_SAMPLE_RATIO from the environment. init() (called in lifespan below, not
+    # here) is where the actual OTel SDK / OTLP exporter gets built (or, if
+    # ACROPOLIS_OTEL_ENABLED=true but the `otel` extra isn't installed, where it degrades to a
+    # logged no-op) — kept separate from construction so tests can build a TracingManager
     # without it trying to import opentelemetry at all when disabled.
     tracing = build_tracing_manager()
-    # F13 fix (review 2026-08-04): httpx.AsyncClient(timeout=N) applies N to ALL FOUR of
-    # connect/read/write/pool — including pool acquisition wait, which has nothing to do with
-    # how long a real upstream tool call should be allowed to take. With the default
-    # Limits(max_connections=100), one upstream that accepts TCP connections but never
-    # responds could exhaust all 100 in-flight request slots, and every request to every OTHER
-    # server would then block acquiring a pool slot for up to the full 120s upstream_timeout —
-    # a single hung MCP server taking down the whole gateway. connect/pool get short, fixed
-    # budgets (a real handshake or a free connection slot should appear in single-digit
-    # seconds); read/write keep the operator-configured budget, since a legitimately slow tool
-    # call still needs to be allowed to run long. max_connections raised well above the
-    # previous default so a burst across many registered servers doesn't itself become the
-    # bottleneck.
+    # httpx.AsyncClient(timeout=N) would apply N to ALL FOUR of connect/read/write/pool —
+    # including pool acquisition wait, which has nothing to do with how long a real upstream
+    # tool call should be allowed to take. With the default Limits(max_connections=100), one
+    # upstream that accepts TCP connections but never responds could exhaust all 100 in-flight
+    # request slots, and every request to every OTHER server would then block acquiring a pool
+    # slot for up to the full 120s upstream_timeout — a single hung MCP server taking down the
+    # whole gateway. connect/pool get short, fixed budgets (a real handshake or a free
+    # connection slot should appear in single-digit seconds); read/write keep the
+    # operator-configured budget, since a legitimately slow tool call still needs to be allowed
+    # to run long. max_connections raised well above httpx's default so a burst across many
+    # registered servers doesn't itself become the bottleneck.
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(
             connect=5.0, pool=5.0,
@@ -190,10 +187,9 @@ def create_app(
     # loop is start()ed in lifespan below — it must not decide whether the poller EXISTS, because
     # the same object is also wired into the control-plane router, where it powers two
     # REQUEST-PATH features that have nothing to do with background polling: the immediate probe
-    # on server-create, and the operator's manual POST /servers/{slug}/probe. Handing the router a
-    # None poller silently turns that endpoint into a no-op that still returns 200 with stale
-    # health — a much broader behaviour change than "don't run the poll loop", and one that
-    # matches neither the flag's name nor what settings.health_poll_enabled meant before it.
+    # on server-create, and the operator's manual POST /servers/{slug}/probe. Handing the router
+    # a None poller silently turns that endpoint into a no-op that still returns 200 with stale
+    # health — a much broader behaviour change than "don't run the poll loop".
     health_poller = HealthPoller(
         server_repo, http_client, handshake_cache,
         interval_seconds=settings.health_poll_interval_seconds,
@@ -204,9 +200,9 @@ def create_app(
         audit_repo, settings_repo,
         check_interval_seconds=settings.audit_retention_check_interval_seconds,
     )
-    # Enterprise #9: approval-proposal TTL sweep — always constructed and always started (same
-    # always-on shape as ConfigSource): when approvals are disabled the proposals table is
-    # empty and run_once() is a cheap no-op, so no gating flag is needed.
+    # Approval-proposal TTL sweep — always constructed and always started (same always-on
+    # shape as ConfigSource): when approvals are disabled the proposals table is empty and
+    # run_once() is a cheap no-op, so no gating flag is needed.
     proposal_expiry_job = ProposalExpiryJob(
         ApprovalService(
             proposal_repo=proposal_repo,
@@ -243,13 +239,13 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Enterprise #9: init() is where the OTel SDK / OTLP exporter actually gets built (a
-        # no-op if ACROPOLIS_OTEL_ENABLED is unset/false — see TracingManager.init's own early
-        # return). Called first, same "fail loudly at boot rather than mysteriously on the first
+        # init() is where the OTel SDK / OTLP exporter actually gets built (a no-op if
+        # ACROPOLIS_OTEL_ENABLED is unset/false — see TracingManager.init's own early return).
+        # Called first, same "fail loudly at boot rather than mysteriously on the first
         # request" reasoning as secret_provider's construction above — though unlike a
-        # misconfigured Vault address, a bad OTel config degrades to a logged warning rather than
-        # raising, since tracing is an observability nice-to-have, not a security control the
-        # gateway should refuse to start without.
+        # misconfigured Vault address, a bad OTel config degrades to a logged warning rather
+        # than raising, since tracing is an observability nice-to-have, not a security control
+        # the gateway should refuse to start without.
         tracing.init()
         audit.start()
         webhook_dispatcher.start()
@@ -257,8 +253,8 @@ def create_app(
             health_poller.start()
         if settings.audit_retention_enabled:
             retention_job.start()
-        # Enterprise #9: the proposal TTL sweep is unconditional — see its construction comment
-        # for why (empty-table no-op when approvals are disabled).
+        # The proposal TTL sweep is unconditional — see its construction comment for why
+        # (empty-table no-op when approvals are disabled).
         proposal_expiry_job.start()
         # GitOps polling is opt-in via gitops_enabled setting
         await config_source.start()
@@ -371,12 +367,12 @@ def _mount_web_ui(app: FastAPI) -> None:
         # leading "/" defuses (1); resolving and checking containment via is_relative_to defuses
         # both, including any percent-decoded or symlink-based escape.
         #
-        # §26 fix (review 2026-08-04): this catch-all is registered LAST specifically so it
-        # never shadows a REGISTERED /api/* or /mcp/* route — but a MISS on those prefixes (a
-        # typo'd path, an old client hitting a removed endpoint, a probe) still fell through to
-        # here and got served the SPA's index.html with a 200, rather than a 404. An API client
-        # has no use for HTML and every reason to want an honest 404 to detect a broken
-        # integration; only real browser navigation should ever see index.html.
+        # The catch-all is registered LAST specifically so it never shadows a REGISTERED
+        # /api/* or /mcp/* route — but a MISS on those prefixes (a typo'd path, an old client
+        # hitting a removed endpoint, a probe) would otherwise fall through to here and get the
+        # SPA's index.html with a 200, rather than a 404. An API client has no use for HTML and
+        # every reason to want an honest 404 to detect a broken integration; only real browser
+        # navigation should ever see index.html.
         if full_path.startswith("api/") or full_path == "api":
             return Response(status_code=404, content="Not Found")
 
