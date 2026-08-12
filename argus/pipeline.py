@@ -44,12 +44,10 @@ logger = logging.getLogger("argus.pipeline")
 
 
 def _client_ip(request: Request) -> Optional[str]:
-    """F22 fix (review 2026-08-04): client_ip is a parameter on AuditLogger.log() and a column
-    in audit_events — grep confirmed no call site anywhere ever passed it, so every audit
-    record had client_ip = NULL. For a gateway whose selling point is auditability, not being
-    able to attribute a blocked/allowed call to a source materially undercuts the feature for
-    incident response. request.client.host is available at every call site that has a Request
-    object; this small helper is threaded through instead of duplicating the None-check."""
+    """client_ip is a column in audit_events and a parameter on AuditLogger.log() — every call
+    site that has a Request must attribute the event to a source, or incident response has
+    nothing to work with. request.client.host is available wherever a Request is; this helper
+    centralizes the None-check instead of duplicating it."""
     return request.client.host if request.client else None
 
 
@@ -64,11 +62,10 @@ class RoutingError(Exception):
 
 
 class Pipeline:
-    """
-    M2: per-server proxy that additionally bridges 2026-generation stateless clients to
-    2025-generation upstreams (the whole real fleet, today). A 2025-generation client is still
-    served by raw passthrough, unchanged from M1 — bridging only engages when Mcp-Method is
-    present on the request (see argus.generation.detect_client_generation).
+    """Per-server proxy that additionally bridges 2026-generation stateless clients to
+    2025-generation upstreams. A 2025-generation client is served by raw passthrough; bridging
+    only engages when Mcp-Method is present on the request (see
+    argus.generation.detect_client_generation).
     """
 
     def __init__(
@@ -96,22 +93,19 @@ class Pipeline:
         self._bridge = bridge
         self._tools_cache = tools_cache
         self._settings_repo = settings_repo
-        # Enterprise #5: defaults to LocalSecretProvider (pass-through) so every existing caller
-        # that doesn't wire a provider through — including the entire pre-feature test suite —
-        # gets byte-identical behaviour. app.py wires the real, settings-selected provider.
+        # Defaults to LocalSecretProvider (pass-through) so a Pipeline built without a provider
+        # behaves exactly as if no secret tier were configured; app.py wires the real,
+        # settings-selected provider.
         self._secrets = secret_provider or LocalSecretProvider()
-        # Enterprise #9: same "defaults to an inert no-op" shape as _secrets above — every
-        # existing caller (including the whole pre-feature test suite) that doesn't wire a
-        # TracingManager through gets a manager whose .span() context managers are pure no-ops
-        # and whose .active is always False, so this constructor default is itself part of the
-        # "disabled = byte-identical to today" guarantee, not just ACROPOLIS_OTEL_ENABLED=false.
+        # Same "defaults to an inert no-op" shape as _secrets above: a Pipeline built without a
+        # TracingManager gets one whose .span() context managers are pure no-ops and whose
+        # .active is always False, so the disabled path is identical whether or not
+        # ACROPOLIS_OTEL_ENABLED is set.
         self._tracing = tracing or _DisabledTracingManager()
-        # Enterprise #11: usage_repo=None (the default every pre-feature test/call site gets)
-        # means BOTH quota enforcement and usage rollup writes are no-ops — see
-        # _check_quota/_record_usage below. This is deliberately the SAME "absent = byte-
-        # identical to today" shape as _secrets/_tracing above, not just "no quota configured
-        # on any given key" — a Pipeline built without a UsageRepo at all (as every existing
-        # test does) must behave exactly as it did before this feature existed.
+        # usage_repo=None (the default for call sites that don't wire one) means BOTH quota
+        # enforcement and usage rollup writes are no-ops — see _check_quota/_record_usage
+        # below. Same "absent = disabled" shape as _secrets/_tracing above: a Pipeline built
+        # without a UsageRepo enforces nothing and records nothing.
         self._usage = usage_repo
         self._webhooks = webhook_dispatcher
 
@@ -144,11 +138,11 @@ class Pipeline:
         """
         start = time.monotonic()
         server: Optional[ServerRecord] = None
-        # Enterprise #9: the root span parents under the CALLER's own inbound traceparent (if
-        # any), so a trace the calling agent already started continues through Acropolis rather
-        # than starting a new, disconnected trace here. extract_context returns None when
-        # tracing is inactive or no traceparent was sent — start_as_current_span(context=None)
-        # behaves exactly like calling it with no context kwarg at all in that case.
+        # The root span parents under the CALLER's own inbound traceparent (if any), so a trace
+        # the calling agent already started continues through Acropolis rather than starting a
+        # new, disconnected trace here. extract_context returns None when tracing is inactive
+        # or no traceparent was sent — start_as_current_span(context=None) behaves exactly like
+        # calling it with no context kwarg at all in that case.
         parent_ctx = self._tracing.extract_context(
             request.headers.get("traceparent"), request.headers.get("tracestate"),
         )
@@ -240,28 +234,26 @@ class Pipeline:
             raise RoutingError(401, rpc_error(None, "invalid or disabled api key"))
         if not self._api_keys.key_permits_server(record, slug):
             raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
-        # Enterprise #4 (multi-tenancy, issue #5): a SEPARATE check from key_permits_server above
-        # — server_scopes is an operator-configured allowlist of slugs (may be None = "any
-        # server"), while this is the project-agreement invariant that must hold regardless of
-        # what server_scopes says: a key minted in project A must never reach a server in
-        # project B, even if server_scopes was (mis)configured to name that server by slug. The
-        # two checks COMPOSE (both must pass), neither replaces the other. Deliberately does NOT
-        # consult any notion of "global admin" — there is no Principal/session on the data plane,
-        # only a key; the global-admin-superset rule is a CONTROL-plane (session-based) concept
-        # in archon/project_rbac.py and must never leak into this purely key-vs-server check.
-        # `server` is the SAME record _resolve_server already fetched in handle() above — reused
-        # here rather than re-querying by slug, since this method now runs strictly after that
-        # resolution on every real call path.
+        # A SEPARATE check from key_permits_server above — server_scopes is an
+        # operator-configured allowlist of slugs (may be None = "any server"), while this is
+        # the project-agreement invariant that must hold regardless: a key minted in project A
+        # must never reach a server in project B, even if server_scopes was (mis)configured to
+        # name that server by slug. The two checks COMPOSE (both must pass), neither replaces
+        # the other. Deliberately does NOT consult any notion of "global admin" — there is no
+        # Principal/session on the data plane, only a key; the global-admin-superset rule is a
+        # CONTROL-plane (session-based) concept in archon/project_rbac.py and must never leak
+        # into this purely key-vs-server check. `server` is the SAME record _resolve_server
+        # already fetched in handle() above — reused here rather than re-querying by slug,
+        # since this method now runs strictly after that resolution on every real call path.
         #
-        # Hardening (remediation, review 2026-08-10): explicit `is None` check rather than
-        # relying on `!=` alone. In Python `None != None` is False, so a bare
-        # `record.project_id != server.project_id` would treat a project-less KEY and a
-        # project-less SERVER as matching — currently unreachable (0010_projects.sql backfills
-        # every existing row to 'default', and both ApiKeyRepo.create/ServerRepo.create resolve
-        # an explicit project_id at write time — see that migration's header), but this is the
-        # one project-boundary check in the codebase that didn't fail closed on NULL the way
-        # archon/project_rbac.py's resolvers all deliberately do. Made explicit so it holds even
-        # if that invariant is ever violated by a future code path, not just by luck today.
+        # Explicit `is None` check rather than relying on `!=` alone: `None != None` is False
+        # in Python, so a bare `record.project_id != server.project_id` would treat a
+        # project-less KEY and a project-less SERVER as matching. Currently unreachable
+        # (0010_projects.sql backfills every existing row to 'default', and both
+        # ApiKeyRepo.create/ServerRepo.create resolve an explicit project_id at write time —
+        # see that migration's header), but this is the one project-boundary check in the
+        # codebase that must fail closed on NULL the way archon/project_rbac.py's resolvers
+        # all deliberately do, even if that invariant is ever violated by a future code path.
         if record.project_id is None or record.project_id != server.project_id:
             raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
         return record.id
@@ -306,13 +298,11 @@ class Pipeline:
             except json.JSONDecodeError:
                 body_json = None
 
-            # F11 fix (review 2026-08-04): a JSON-RPC batch (a top-level array — spec-legal) or
-            # a bare top-level JSON string/number both parse successfully but aren't a dict, so
-            # body_json.get(...) below would raise AttributeError -> unhandled 500. Confirmed:
-            # `[{"jsonrpc":"2.0","id":1,"method":"ping"}]` and a bare `"hello"` body both
-            # crashed the pipeline pre-fix. Treat anything non-dict the same as unparseable —
-            # falls through to the PASSTHROUGH/forward path below with rpc_method="" untouched,
-            # same as today's un-parseable-JSON case, rather than inventing new handling.
+            # A JSON-RPC batch (a top-level array — spec-legal) or a bare top-level JSON
+            # string/number both parse successfully but aren't a dict, and body_json.get(...)
+            # below would raise AttributeError. Treat anything non-dict the same as
+            # unparseable — falls through to the passthrough/forward path below with
+            # rpc_method="" untouched, rather than inventing new handling.
             if not isinstance(body_json, dict):
                 body_json = None
 
@@ -353,11 +343,9 @@ class Pipeline:
                     )
 
                 if rpc_method == "tools/call":
-                    # F11 fix: this used to re-read body_json.get("params", {}) from scratch
-                    # instead of reusing the `params` local computed above (line 216, which
-                    # already has the `or {}` guard) — re-introducing the exact
-                    # params-can-be-None crash two lines after it was fixed for the `params`
-                    # local. Reuse `params` here so there's only one place this is guarded.
+                    # Reuse the `params` local computed above (which already has the `or {}`
+                    # guard) rather than re-reading body_json.get("params", {}) here — there
+                    # is only one place the params-can-be-None case is guarded.
                     tool_name = params.get("name")
                     arguments = params.get("arguments") or {}
 
@@ -381,11 +369,11 @@ class Pipeline:
                         await self._record_usage(server, tool_name, api_key_id)
                         return blocked_response
 
-                    # Enterprise #11: after auth, after rate limiting, before policy evaluation
-                    # — the non-negotiable ordering from 02-quotas-and-usage.md. A quota-exceeded
-                    # call is refused here, before evaluate() ever runs, so the upstream is never
-                    # reached and no DLP/param-rule work is wasted on a call that's about to be
-                    # rejected anyway.
+                    # After auth, after rate limiting, before policy evaluation — the
+                    # non-negotiable ordering from 02-quotas-and-usage.md. A quota-exceeded
+                    # call is refused here, before evaluate() ever runs, so the upstream is
+                    # never reached and no DLP/param-rule work is wasted on a call that's
+                    # about to be rejected anyway.
                     quota_response = await self._check_quota(
                         server, tool_name, api_key_id, rpc_id, start, client_ip
                     )
@@ -415,12 +403,9 @@ class Pipeline:
                             status_code=403, media_type="application/json",
                         )
 
-                    # DLP redact (enterprise #10): the redacted body MUST be what actually
-                    # leaves the process — re-serialize the JSON-RPC envelope with the redacted
-                    # arguments substituted in and forward THAT, never the original body_bytes.
-                    # This is the third consumer of the body_override seam (after
-                    # AggregatePipeline's de-namespacing rewrite and the tool tester), reusing
-                    # it rather than inventing a parallel forwarding path.
+                    # DLP redact: the redacted body MUST be what actually leaves the process —
+                    # re-serialize the JSON-RPC envelope with the redacted arguments substituted
+                    # in and forward THAT, never the original body_bytes.
                     if decision.dlp_redacted_arguments is not None:
                         rewritten = dict(body_json)
                         rewritten_params = dict(params)
@@ -452,7 +437,7 @@ class Pipeline:
         policy.dlp_custom_patterns" gate (argus/policy.py), so a server with no DLP config never
         gets a dlp.scan span at all, same as it never pays for the scan itself.
 
-        Attribute secrecy (enterprise #9 non-negotiable): only server slug, tool name, decision,
+        Attribute secrecy (non-negotiable): only server slug, tool name, decision,
         rule name, dlp_detector, dlp_action are ever set here — NEVER decision.matched (the
         DLP/param-rule matched VALUE) and NEVER arguments/args_summary. This mirrors exactly
         which Decision fields the DLP PR already deemed safe to audit/webhook (see
@@ -537,8 +522,8 @@ class Pipeline:
                 await self._record_usage(server, tool_name, api_key_id)
                 return blocked_response
 
-            # Enterprise #11: same ordering as the non-bridged path in _process — after auth,
-            # after rate limiting, before policy evaluation.
+            # Same ordering as the non-bridged path in _process — after auth, after rate
+            # limiting, before policy evaluation.
             quota_response = await self._check_quota(
                 server, tool_name, api_key_id, rpc_id, start, client_ip
             )
@@ -567,15 +552,16 @@ class Pipeline:
                     ),
                     status_code=403, media_type="application/json",
                 )
-            # DLP redact (enterprise #10): the bridged path forwards `params` directly to
+            # DLP redact: the bridged path forwards `params` directly to
             # ProtocolBridge.bridge_call rather than raw body bytes, so redaction here means
             # substituting the redacted arguments into `params` before that call — no
             # body_override needed on this path. Deliberately placed AFTER the blocked-return
             # above (matching the non-bridged path's structure in _process) — a block never
             # carries dlp_redacted_arguments (see argus/policy.py's evaluate: the redact branch
             # always has blocked=False), so this ordering is not currently load-bearing for
-            # correctness, but keeping "can this call still be blocked" resolved before "what do
-            # we forward" is the safer invariant to read and to preserve under future changes.
+            # correctness, but keeping "can this call still be blocked" resolved before "what
+            # do we forward" is the safer invariant to read and to preserve under future
+            # changes.
             if decision.dlp_redacted_arguments is not None:
                 params = dict(params)
                 params["arguments"] = decision.dlp_redacted_arguments
@@ -633,39 +619,20 @@ class Pipeline:
         api_key_id: Optional[int], rpc_id: Any, start: float,
         client_ip: Optional[str] = None,
     ) -> Optional[Response]:
-        # F8 fix (review 2026-08-04): this used to be `if policy.rate_limit and not
-        # is_registered(srv_key): register(...)` — a bucket was built ONCE per process and
-        # never refreshed, so an operator raising a limit from 5/minute to 500/minute got a 200
-        # from the API but the gateway kept enforcing 5/minute until restart. The fix can't be
-        # "just always call register()" either — TokenBucket construction resets consumed
-        # state, so registering fresh on every request would hand every caller an always-full
-        # bucket and defeat rate limiting entirely. Instead: (re)register only when the SPEC
-        # STRING has actually changed since it was last registered for this key, via
-        # RateLimiterRegistry.ensure_current — a no-op on the hot path once the bucket matches
-        # the live policy, but picks up an operator's change on the very next request.
+        # Re-register only when the spec string has changed: always calling register() would
+        # reset consumed token state and defeat rate limiting entirely, while never
+        # re-registering means an operator's limit change is ignored until restart.
+        # RateLimiterRegistry.ensure_current is a no-op on the hot path once the bucket
+        # matches the live policy.
         #
-        # F9 fix (review 2026-08-04): tool_key(...) and the now-removed api_key_key(...) were
-        # both constructed and passed to check_all() here, but nothing anywhere ever called
-        # register() for either — check_all() treats an unregistered key as "unlimited", so
-        # both lookups always passed regardless of load. A compromised or runaway API key had
-        # NO rate limit whatsoever, despite the code reading as though one was enforced.
+        # check_all() treats an unregistered key as "unlimited": only srv_key is registered
+        # here, so it is the sole enforced limit. tool_key is checked but never registered —
+        # per-tool limits are a tracked gap (tool_policies.rate_limit exists in the schema but
+        # ServerPolicy doesn't surface it; see tool_key()'s docstring). Per-API-key limits
+        # have no schema field at all; adding one is a real feature (migration + API + UI).
         #
-        # Per-tool limits: the DB column (tool_policies.rate_limit) exists but ServerPolicy
-        # doesn't surface it — documented as a tracked gap on tool_key()'s own docstring rather
-        # than silently dropped, since it matches what the real guard-config.yml fleet actually
-        # configured (server-level only).
-        #
-        # Per-API-key limits: there is currently no schema field to configure one (api_keys has
-        # no rate_limit column) — adding one is a real feature (migration + API + UI), out of
-        # scope for this fix. Removed the dead api_key_key construction rather than leave code
-        # that LOOKED like it enforced a per-key limit while doing nothing; see F23-adjacent
-        # design-gap note in the vault (03-reliability-and-ops.md) for where to land it.
-        #
-        # §26 fix (review 2026-08-04): `policy` used to be fetched HERE via a fresh
-        # self._servers.get_policy(server.id) call, and the caller fetched it AGAIN
-        # immediately afterward to evaluate the tool decision — two DB reads of the same,
-        # request-scoped-immutable data per tools/call. Now the caller fetches once and passes
-        # it in.
+        # `policy` is passed in by the caller, which fetched it once for this request — it is
+        # not re-fetched here (two DB reads of request-scoped-immutable data per tools/call).
         srv_key = server_key(server.slug)
         if policy.rate_limit:
             self._rate_limiter.ensure_current(srv_key, policy.rate_limit)
@@ -691,8 +658,8 @@ class Pipeline:
         self, server: ServerRecord, tool_name: str, api_key_id: Optional[int],
         rpc_id: Any, start: float, client_ip: Optional[str] = None,
     ) -> Optional[Response]:
-        """Enterprise #11: call-count budget over a billing period, enforced AFTER auth and
-        AFTER the rate limiter, BEFORE policy evaluation — the non-negotiable ordering from
+        """Call-count budget over a billing period, enforced AFTER auth and AFTER the rate
+        limiter, BEFORE policy evaluation — the non-negotiable ordering from
         02-quotas-and-usage.md. Rate limiting answers "how fast"; this answers "how much, over
         a period" — a different, complementary primitive (see argus/rate_limiter.py's own
         module-level framing), not a replacement for it.
@@ -793,11 +760,11 @@ class Pipeline:
     async def _record_usage(
         self, server: ServerRecord, tool_name: Optional[str], api_key_id: Optional[int],
     ) -> None:
-        """Enterprise #11: increments the usage rollup for this call, in the SAME code path
-        that emits the tools/call audit event — called immediately alongside (never instead
-        of) self._audit.log for every tools/call decision (rate-limit block, quota block,
-        policy allow/deny alike), so a rollup total can never drift from a count of the audit
-        rows for the same window. See tests/integration/test_quotas.py's
+        """Increments the usage rollup for this call, in the SAME code path that emits the
+        tools/call audit event — called immediately alongside (never instead of)
+        self._audit.log for every tools/call decision (rate-limit block, quota block, policy
+        allow/deny alike), so a rollup total can never drift from a count of the audit rows
+        for the same window. See tests/integration/test_quotas.py's
         TestRollupsMatchAuditRows for the test that proves this by direct comparison, and
         AuditLogger.log's own docstring for the parallel "one write path" discipline this
         mirrors.
@@ -811,9 +778,9 @@ class Pipeline:
         try:
             await self._usage.increment(
                 ts_iso=utcnow(), api_key_id=api_key_id, server_id=server.id, tool=tool_name,
-                # Enterprise #4: attribute the rollup to the SERVER's project (a server belongs
-                # to exactly one project; the calling key's project is checked for AGREEMENT with
-                # this in _authenticate below, not used as the attribution source here).
+                # Attribute the rollup to the SERVER's project (a server belongs to exactly
+                # one project; the calling key's project is checked for AGREEMENT with this in
+                # _authenticate below, not used as the attribution source here).
                 project_id=server.project_id,
             )
         except Exception:
@@ -838,10 +805,10 @@ class Pipeline:
         """Resolves `server.upstream_auth_header` (a literal OR a reference) to the plaintext
         credential that must be sent to the upstream, via the configured SecretProvider.
 
-        Enterprise #5's non-negotiable: failure here must be an explicit ERROR, NEVER a silent
-        fall-through to forwarding without the credential — that would risk leaking a request to
-        an upstream that expects auth, or turn a Vault blip into a confusing unauthenticated-401
-        storm. Every call site (bridged tools/call, raw passthrough forward, tools/list) routes
+        Non-negotiable: failure here must be an explicit ERROR, NEVER a silent fall-through to
+        forwarding without the credential — that would risk leaking a request to an upstream
+        that expects auth, or turn a Vault blip into a confusing unauthenticated-401 storm.
+        Every call site (bridged tools/call, raw passthrough forward, tools/list) routes
         through this one method so that guarantee can't drift between them; see
         tests/integration/test_secret_resolution_failure.py's regression test proving this.
 
@@ -854,13 +821,11 @@ class Pipeline:
         if server.upstream_auth_header is None:
             return None
 
-        # Enterprise #9: only span this when upstream_auth_header is actually a REFERENCE
-        # (vault://..., enc:v1:...) that requires a real resolution round-trip — matching the
-        # plan's "secrets.resolve (only when the upstream credential is a reference, not a
-        # literal)". For the "local"/literal case, self._secrets.resolve() is a same-process,
-        # zero-I/O pass-through (see archon/secrets/local.py) and a span there would just be
-        # noise around a no-op, exactly what design decision #2 (manual spans, not blanket
-        # auto-instrumentation) is meant to avoid.
+        # Only span this when upstream_auth_header is actually a REFERENCE (vault://...,
+        # enc:v1:...) that requires a real resolution round-trip. For the "local"/literal case,
+        # self._secrets.resolve() is a same-process, zero-I/O pass-through (see
+        # archon/secrets/local.py) and a span there would just be noise around a no-op —
+        # manual spans, not blanket auto-instrumentation.
         from archon.secrets import is_reference
 
         traced = is_reference(server.upstream_auth_header)
@@ -912,22 +877,21 @@ class Pipeline:
         )
         forward_headers = strip_hop_by_hop(request.headers.raw)
 
-        # F23 fix (review 2026-08-04): if this server has a configured upstream credential,
-        # inject it as the Authorization header sent to the upstream — this is the actual
-        # mechanism the design gap was about. Appended AFTER strip_hop_by_hop, and as a plain
-        # list append rather than a header-merge, so it always wins even though the client's
-        # own Authorization was already stripped (F5) — there should never be two.
+        # If this server has a configured upstream credential, inject it as the Authorization
+        # header sent to the upstream. Appended AFTER strip_hop_by_hop, and as a plain list
+        # append rather than a header-merge, so it always wins even though the client's own
+        # Authorization was already stripped — there should never be two.
         if resolved_auth_header:
             forward_headers = [
                 (k, v) for k, v in forward_headers if k.lower() != b"authorization"
             ]
             forward_headers.append((b"authorization", resolved_auth_header.encode()))
 
-        # Enterprise #9: traceparent/tracestate are added here — deliberately, inside
-        # upstream.forward's span, and ONLY here. argus/headers.py's strip_hop_by_hop already
-        # removed any traceparent/tracestate the CLIENT sent (see that module's module-level
-        # comment on why: an unmediated client-supplied traceparent passing straight through was
-        # never a governed feature, just an accident of a denylist). What crosses the wire now is
+        # traceparent/tracestate are added here — deliberately, inside upstream.forward's
+        # span, and ONLY here. argus/headers.py's strip_hop_by_hop already removed any
+        # traceparent/tracestate the CLIENT sent (see that module's module-level comment on
+        # why: an unmediated client-supplied traceparent passing straight through was never a
+        # governed feature, just an accident of a denylist). What crosses the wire now is
         # exclusively the gateway's own span context, correctly parent-chained under whatever
         # inbound traceparent the root `request` span was told to honor (see Pipeline.handle).
         # inject_headers() returns {} when tracing is inactive, making this an unconditional,
@@ -944,14 +908,12 @@ class Pipeline:
             upstream_req = self._client.build_request(
                 method=request.method, url=upstream_url, content=body_bytes, headers=forward_headers,
             )
-            # F3 fix (review 2026-08-04): self._client.send() had no exception handling — any
-            # httpx transport error (refused connection, DNS failure, TLS error) escaped as an
-            # unhandled exception, past Pipeline.handle's `except RoutingError` (the only thing
-            # that logs an audit event), all the way to Starlette as a bare 500 with a stack
-            # trace and a non-JSON-RPC body. This is the MOST LIKELY real-world event in a
-            # self-hosted deployment — an MCP server container restarting — and it broke in the
-            # ugliest possible way, with the gateway's own audit trail showing nothing happened.
-            # The bridged path (argus/bridge.py:106) already handled this correctly; matched here.
+            # self._client.send() must convert transport errors (refused connection, DNS
+            # failure, TLS error) into a RoutingError that gets audited — this is the MOST
+            # LIKELY real-world event in a self-hosted deployment (an MCP server container
+            # restarting), and an unhandled exception here would escape to Starlette as a bare
+            # 500 with a non-JSON-RPC body and nothing in the audit trail. The bridged path
+            # (argus/bridge.py) handles the same case; matched here.
             try:
                 r = await self._client.send(upstream_req, stream=True)
             except httpx.HTTPError as e:
