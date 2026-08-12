@@ -338,6 +338,24 @@ class Pipeline:
                         )
                         return mismatch_response
 
+                # TWO forwarding paths fork below, decided by detect_client_generation
+                # (presence of the Mcp-Method header; argus/generation.py):
+                #
+                #   GEN_2025 -> _forward (line ~900): raw byte proxy. Streams the upstream
+                #       response back verbatim (aiter_raw + BackgroundTask(r.aclose)), strips
+                #       hop-by-hop and credential headers, keeps no upstream session. Errors
+                #       surface as RoutingError(502, ...).
+                #   GEN_2026 -> _handle_bridged (line ~510): protocol translation. Buffers the
+                #       upstream body, parses SSE, re-envelopes as plain JSON, injects the
+                #       cached initialize handshake per server. Errors surface as
+                #       BridgeError(502, ...).
+                #
+                # Only GEN_2026 clients reach bridge_call; only GEN_2025 clients reach _forward.
+                # And only when a bridge is configured: if self._bridge is None the 2026 branch
+                # is skipped and even a 2026 client falls through to the passthrough path below.
+                # Do not merge the two paths — one proxies bytes, the other translates protocol
+                # generations. Their shared enforcement prelude is deliberately duplicated;
+                # see the dedup issue (#52).
                 generation = force_generation or detect_client_generation(request)
 
                 if rpc_method == "server/discover":
@@ -898,6 +916,8 @@ class Pipeline:
         self, request: Request, server: ServerRecord, path: str, body_bytes: bytes,
         resolved_auth_header: Optional[str] = None,
     ) -> Response:
+        # GEN_2025 passthrough path (see the fork comment in _process): raw byte proxy to the
+        # upstream. The bridged counterpart is ProtocolBridge.bridge_call (argus/bridge.py).
         # SECURITY: httpx.URL normalises dot segments during parsing, so
         # f"{upstream}/mcp/../../admin" resolves OUTSIDE the configured upstream endpoint —
         # an arbitrary path on the upstream host, bypassing whatever prefix the operator
