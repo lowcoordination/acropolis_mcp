@@ -62,7 +62,7 @@ class ConfigSource(BackgroundLoop):
 
     Usage:
         config_source = ConfigSource(server_repo, settings_repo)
-        await config_source.start()
+        config_source.start()
         ...
         await config_source.stop()
     """
@@ -93,10 +93,9 @@ class ConfigSource(BackgroundLoop):
         self._owns_http = http_client is None
         self._state = DriftState()
         self._webhook_dispatcher = None  # set by app.py if webhooks enabled
-        self._started = False
 
     async def __aenter__(self) -> "ConfigSource":
-        await self.start()
+        self.start()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -110,17 +109,11 @@ class ConfigSource(BackgroundLoop):
     def state(self) -> DriftState:
         return self._state
 
-    async def start(self) -> None:
-        if not self._started:
-            self._started = True
-            self._task = asyncio.create_task(self._poll_loop())
-
     async def _on_stop(self) -> None:
-        self._started = False
         if self._owns_http:
             await self._http.aclose()
 
-    async def _poll_loop(self) -> None:
+    async def _loop(self) -> None:
         while True:
             try:
                 await self.check_once()
