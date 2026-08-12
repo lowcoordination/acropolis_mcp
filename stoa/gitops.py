@@ -200,6 +200,10 @@ class ConfigSource(BackgroundLoop):
                 project_repo=self._project_repo,
             )
         except Exception as e:
+            # Not silent — surfaced through DriftState: status="error" and last_error ride
+            # into the UI banner and the drift /metrics gauge, where a GitOps operator looks.
+            # The one `except Exception` in argus/stoa without a logger call (see issue #56's
+            # audit) — the failure text is preserved in last_error for display instead.
             self._state.status = "error"
             self._state.last_check = time.time()
             self._state.last_error = f"plan computation failed: {e}"
