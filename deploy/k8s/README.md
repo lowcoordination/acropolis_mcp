@@ -64,14 +64,27 @@ Then open `http://localhost:8000` and finish setup, same as the
 
 ## Replica count
 
-Pre-Postgres-cutover, this was hard-capped at 1 because SQLite has a single-writer model and the
-Deployment used `strategy: Recreate` to guarantee only one pod ever touched the on-disk files at
-once. Postgres (enterprise #7, issue #8) removed that constraint — concurrent writers are now
-Postgres's job, not this app's. `deployment.yaml` is still left at `replicas: 1` because nothing
-else in this manifest set has been worked through for multiple replicas yet (no HPA, no
-documented pool-sizing-per-replica guidance beyond the note in `deployment.yaml` itself); raise it
-once you've sized Postgres's `max_connections` and this app's own pool settings for the replica
-count you want. See [docs/postgres.md](../../docs/postgres.md).
+**Keep this at 1.** Rate limiting is process-local — `RateLimiterRegistry`
+(`argus/rate_limiter.py`) holds its token buckets in an in-memory dict with no shared backing
+store, so N replicas enforce N independent copies of every configured limit. A policy set to
+100/minute actually allows 100×N/minute across the deployment.
+
+Nothing surfaces this when it happens: no log line, no metric, and the policy page still shows
+the configured value. It is a silent bypass of a security control, which is why the cap is worth
+keeping even though it costs you horizontal scaling.
+
+Pre-Postgres-cutover this was capped at 1 for a *different* reason — SQLite's single-writer
+model, with `strategy: Recreate` guaranteeing one pod touched the on-disk files at a time.
+Postgres (enterprise #7, issue #8) removed **that** constraint; concurrent writers are now
+Postgres's job. The rate limiter is a separate constraint the cutover did not address, and it
+still applies.
+
+Scaling horizontally is safe only once rate limiting is backed by a shared store
+([issue #31](https://github.com/lowcoordination/acropolis_mcp/issues/31)). Until then, scale
+vertically via the resource limits in `deployment.yaml`.
+
+When #31 lands, size Postgres's `max_connections` and this app's own pool settings for the
+replica count you want — see [docs/postgres.md](../../docs/postgres.md).
 
 ## Secrets
 
