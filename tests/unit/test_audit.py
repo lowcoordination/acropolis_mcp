@@ -81,7 +81,7 @@ async def test_stop_is_bounded_when_flush_blocks(db, monkeypatch):
     await logger.log(server_slug="fetch", tool=None, decision="PASSTHROUGH")
 
     await asyncio.wait_for(logger.stop(), timeout=6.5)
-    assert logger._flush_task is None
+    assert logger._task is None
 
 
 async def test_stop_drains_pending_queue(db):

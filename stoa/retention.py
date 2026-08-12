@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
+from archon.background import BackgroundLoop
 from db.repo import AuditRepo, SettingsRepo
 
 logger = logging.getLogger("stoa.retention")
@@ -11,7 +12,7 @@ logger = logging.getLogger("stoa.retention")
 DEFAULT_CHECK_INTERVAL_SECONDS = 3600.0
 
 
-class AuditRetentionJob:
+class AuditRetentionJob(BackgroundLoop):
     """Background task: periodically prunes audit_events older than the live
     settings.audit_retention_days value.
 
@@ -20,31 +21,19 @@ class AuditRetentionJob:
     Pipeline._current_auth_mode — takes effect on the job's next tick without a restart.
     """
 
+    _log_name = "audit retention job"
+    _logger = logger
+
     def __init__(
         self,
         audit_repo: AuditRepo,
         settings_repo: SettingsRepo,
         check_interval_seconds: float = DEFAULT_CHECK_INTERVAL_SECONDS,
     ):
+        super().__init__()
         self._audit_repo = audit_repo
         self._settings_repo = settings_repo
         self._interval = check_interval_seconds
-        self._task: asyncio.Task | None = None
-
-    def start(self) -> None:
-        if self._task is None:
-            self._task = asyncio.create_task(self._loop())
-
-    async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                logger.warning("audit retention job did not stop within 5s; abandoning it")
-            self._task = None
 
     async def run_once(self) -> int:
         raw_days = await self._settings_repo.get("audit_retention_days")
