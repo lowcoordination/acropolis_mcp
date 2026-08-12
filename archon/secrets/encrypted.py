@@ -97,6 +97,8 @@ def _parse_key_material(raw: str) -> bytes:
 
 class EnvKeySource:
     def __init__(self, env_var: str = "ACROPOLIS_SECRET_KEY"):
+        # Deliberate Settings bypass: the encrypted provider bootstraps the mechanism that
+        # decrypts settings, so reading the key via Settings would be a circular dependency.
         raw = os.environ.get(env_var)
         if not raw:
             raise EncryptedProviderConfigError(f"{env_var} is not set")
@@ -120,6 +122,9 @@ class FileKeySource:
 
 def build_key_source() -> KeySource:
     """Resolve a KeySource from the environment, per the module docstring's precedence order."""
+    # Deliberate Settings bypass (both reads): the encrypted provider bootstraps the mechanism
+    # that decrypts settings, so it cannot depend on fully-resolved Settings without a circular
+    # dependency — the key must come straight from the environment.
     if os.environ.get("ACROPOLIS_SECRET_KEY"):
         logger.info("Initializing EncryptedSecretProvider from ACROPOLIS_SECRET_KEY environment variable")
         return EnvKeySource()
