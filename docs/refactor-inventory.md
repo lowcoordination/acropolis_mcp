@@ -5,7 +5,7 @@ Survey date: 2026-08-12. Scope: 7,595 lines across three packages
 
 Motivation: the codebase has grown feature-by-feature (enterprise items #5–#11, two review
 rounds, a Postgres cutover) without a consolidation pass. Issue #46 was a symptom — a defensive
-guard written once, never revisited, silently wrong for three years of falsy ids.
+guard written once, never revisited, and silently wrong for every falsy id since.
 
 Findings are ordered by **severity × blast radius**, not by size. Each says what to do and,
 where relevant, what NOT to do.
