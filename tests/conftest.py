@@ -37,11 +37,17 @@ import os
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 
 import asyncpg
+import httpx
 import pytest
+from fastapi import FastAPI
 
 import db.database as db_database
+from archon.settings import Settings
+from argus.app import create_app
+from db.database import Database
 
 
 def _run_sync(coro_factory, timeout: float = 120.0):
@@ -295,13 +301,6 @@ def pg_dsn(postgres_admin_dsn):
     finally:
         _drop_database(postgres_admin_dsn, dsn)
 
-import httpx
-from dataclasses import dataclass
-from fastapi import FastAPI
-from archon.settings import Settings
-from argus.app import create_app
-from db.database import Database
-import pytest
 
 @dataclass
 class AppEnv:
@@ -315,7 +314,14 @@ class AppEnv:
 
 @pytest.fixture
 async def app_env(tmp_path, request):
-    overrides = getattr(request, "param", {})
+    # COPY, never the caller's dict. pytest hands every test in a module the SAME param object
+    # from its `pytestmark = pytest.mark.parametrize("app_env", [{...}], indirect=True)`, so the
+    # .pop()s below would otherwise drain it permanently: the first test in the module consumed
+    # every key and every test after it silently fell back to defaults. That was invisible where
+    # it mattered most — test_rbac/test_quotas/test_multi_tenancy all declare auth_mode="keyed",
+    # and only their FIRST test actually ran keyed while the rest ran with auth open and still
+    # passed. See issue #47.
+    overrides = dict(getattr(request, "param", None) or {})
     probe_on_create = overrides.pop("probe_on_create", True)
     settings = Settings(
         data_dir=str(tmp_path),

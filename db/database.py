@@ -243,7 +243,7 @@ class Database:
     DEFAULT_WRITER_POOL_MAX = 5
     DEFAULT_READER_POOL_MIN = 1
     DEFAULT_READER_POOL_MAX = 10
-    
+
     POOL_ACQUIRE_TIMEOUT = 10.0  # seconds
 
     def __init__(
