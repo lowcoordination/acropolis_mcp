@@ -48,7 +48,9 @@ def otel_enabled_by_env() -> bool:
     """Reads the gate directly from the environment. A plain function rather than a
     Settings field (like ACROPOLIS_SECRET_KEY in archon/secrets/encrypted.py) — deliberately,
     so tracing configuration follows the same "standard OTel env vars, one Acropolis gate" story
-    end to end, rather than round-tripping through pydantic-settings for half of it."""
+    end to end, rather than round-tripping through pydantic-settings for half of it. Also a
+    bootstrap-order requirement: this must be decided before the OTel SDK loads, which happens
+    before Settings is necessarily constructed."""
     return os.environ.get(ENABLED_ENV_VAR, "").strip().lower() in _TRUE_VALUES
 
 
@@ -257,6 +259,8 @@ def build_tracing_manager() -> TracingManager:
     shape: one function, called once at startup in app.py, that turns env config into the
     runtime object every other component is handed."""
     enabled = otel_enabled_by_env()
+    # Same deliberate Settings bypass as otel_enabled_by_env: the ratio must be known at
+    # TracingManager construction, before the OTel SDK loads and before Settings is built.
     ratio_raw = os.environ.get(SAMPLE_RATIO_ENV_VAR, "1.0")
     try:
         ratio = float(ratio_raw)

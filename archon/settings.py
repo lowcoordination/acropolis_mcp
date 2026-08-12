@@ -3,6 +3,13 @@ from __future__ import annotations
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# Known deliberate exceptions to "all config goes through Settings" — sites that read
+# os.environ directly and MUST NOT be folded into this class:
+#   - argus/tracing.py (otel_enabled_by_env, build_tracing_manager): tracing must be decided
+#     before the OTel SDK loads, which happens before Settings is necessarily constructed.
+#   - archon/secrets/encrypted.py (EnvKeySource, build_key_source): the secret provider
+#     bootstraps the mechanism that decrypts settings, so it cannot depend on fully-resolved
+#     Settings without a circular dependency.
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ACROPOLIS_")
 
