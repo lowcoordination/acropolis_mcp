@@ -6,12 +6,24 @@ metadata:
   labels:
     app: acropolis
 spec:
-  # Postgres (enterprise #7, issue #8) removed the single-writer constraint SQLite had — there's
-  # no longer a correctness reason to cap this at 1. Left at 1 here because nothing else in this
-  # manifest set (no HPA, no session affinity considerations documented) has been worked through
-  # for a multi-replica deployment yet; raise it once you have, and size Postgres's own
-  # max_connections and this app's ACROPOLIS_DB_WRITER_POOL_MAX/ACROPOLIS_DB_READER_POOL_MAX
-  # (docs/postgres.md) for the total replica count you land on.
+  # DO NOT raise this without reading the following.
+  #
+  # Rate limiting is PROCESS-LOCAL: RateLimiterRegistry (argus/rate_limiter.py) holds its token
+  # buckets in an in-memory dict with no shared backing store. N replicas therefore enforce N
+  # INDEPENDENT copies of every configured limit, so a 100/minute policy becomes 100*N/minute in
+  # practice. That is a silent security-control bypass, not a performance footnote: nothing logs
+  # it, no metric shows it, and the policy page keeps displaying the configured value.
+  #
+  # Postgres (enterprise #7, issue #8) did remove the single-writer constraint SQLite had, so
+  # there is no longer a DATABASE reason to cap this at 1 — but the rate limiter is an
+  # independent constraint that the cutover did not address, and it still stands.
+  #
+  # Scaling past 1 replica is safe only once rate limiting is backed by a shared store
+  # (issue #31). Until then, scale vertically (resources below), not horizontally.
+  #
+  # When #31 lands and this cap is lifted, also size Postgres's own max_connections and this
+  # app's ACROPOLIS_DB_WRITER_POOL_MAX / ACROPOLIS_DB_READER_POOL_MAX (docs/postgres.md) for the
+  # total replica count.
   replicas: 1
   # No `strategy:` override — RollingUpdate (the Deployment default) is safe now. Pre-cutover
   # this was pinned to `Recreate` because SQLite's single-writer model meant two pods briefly

@@ -54,6 +54,12 @@ Each running instance opens up to `writer_max + reader_max` connections — if y
 one replica, keep `replica_count × (writer_max + reader_max)` comfortably under Postgres's own
 `max_connections` (default 100 on a stock install).
 
+> **Before running more than one replica:** rate limiting is process-local
+> (`argus/rate_limiter.py`), so every replica enforces its own independent copy of each
+> configured limit. Postgres removed the *database* reason to cap replicas at 1; it did not
+> remove this one. See `deploy/k8s/README.md` and
+> [issue #31](https://github.com/lowcoordination/acropolis_mcp/issues/31).
+
 **What actually hits these pools per request**: an external architecture review claimed 5+
 sequential queries per tool call could exhaust the pool under load. Verified against the code,
 that overstates it — audit logging is queued, not synchronous on the request path (`log()` does
