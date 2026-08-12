@@ -244,7 +244,22 @@ class Database:
     DEFAULT_READER_POOL_MIN = 1
     DEFAULT_READER_POOL_MAX = 10
 
-    POOL_ACQUIRE_TIMEOUT = 10.0  # seconds
+    # Deliberately shorter than any request-level budget this acquire sits INSIDE, because a
+    # backstop that expires no sooner than the thing it backstops never fires first and so
+    # protects nothing. At the previous 10.0 it was pinned to the tightest such budget
+    # (stoa.health.PROBE_TIMEOUT_SECONDS, also 10.0), meaning a probe whose DB acquire was
+    # starved hit the probe's own timeout with no indication the pool was the cause.
+    #
+    # 5.0 mirrors the pool=5.0 the shared httpx client already uses (argus/app.py) for the
+    # directly analogous wait — "a free connection slot from a pool" — on the same reasoning:
+    # a slot either frees up in single-digit seconds or the pool is genuinely exhausted, and
+    # the caller is better served by a fast, correctly-labelled PoolExhaustedError than by a
+    # long stall that surfaces as someone else's timeout.
+    #
+    # Conservative in the direction that matters: this only ever converts a hang into an
+    # error, never the reverse. If exhaustion shows up in practice, raise
+    # {reader,writer}_pool_max — raising THIS value just lengthens the stall.
+    POOL_ACQUIRE_TIMEOUT = 5.0  # seconds
 
     def __init__(
         self,
