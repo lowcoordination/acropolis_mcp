@@ -182,18 +182,13 @@ class Pipeline:
                 return response
             except RoutingError as e:
                 root_span.set_attribute("http.status_code", e.status_code)
-                await self._audit.log(
-                    server_slug=slug,
-                    tool=None,
-                    decision="ERROR",
+                return await self._error(
+                    server_slug=slug, tool=None, status=e.status_code,
+                    content=e.body, media_type=e.media_type,
+                    reason=e.body[:200], start=start,
+                    client_ip=_client_ip(request), origin=origin,
                     endpoint="per-server",
-                    status_code=e.status_code,
-                    latency_ms=int((time.monotonic() - start) * 1000),
-                    reason=e.body[:200],
-                    client_ip=_client_ip(request),
-                    origin=origin,
                 )
-                return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
 
     async def _resolve_server(self, slug: str) -> ServerRecord:
         from db.repo import ServerNotFoundError
@@ -331,15 +326,11 @@ class Pipeline:
                 # the rewritten body's tool name legitimately won't match the ORIGINAL request's
                 # (still-namespaced) Mcp-Name header, if one was even present.
                 if force_generation is None:
-                    mismatch_response = self._check_header_consistency(request, rpc_method, body_name)
+                    mismatch_response = await self._check_header_consistency(
+                        request, rpc_method, body_name, server=server,
+                        api_key_id=api_key_id, start=start, client_ip=client_ip,
+                    )
                     if mismatch_response is not None:
-                        await self._audit.log(
-                            server_slug=server.slug, tool=body_name, decision="ERROR",
-                            endpoint="per-server", rpc_method=rpc_method,
-                            api_key_id=api_key_id, reason="Mcp-Method/Mcp-Name header mismatch",
-                            status_code=400, latency_ms=int((time.monotonic() - start) * 1000),
-                            client_ip=client_ip,
-                        )
                         return mismatch_response
 
                 # TWO forwarding paths fork below, decided by detect_client_generation
@@ -474,15 +465,13 @@ class Pipeline:
             audit_common["bridged"] = True
 
         if not tool_name or not isinstance(tool_name, str):
-            await self._audit.log(
-                tool="<missing>", decision="BLOCKED",
-                reason="tools/call missing required 'name' field", status_code=400,
-                **audit_common,
-            )
             return _EnforcementOutcome(
-                blocked_response=Response(
-                    content=rpc_error(rpc_id, "tools/call missing required 'name' field"),
-                    status_code=400, media_type="application/json",
+                blocked_response=await self._refuse(
+                    server_slug=server.slug, tool="<missing>", rpc_id=rpc_id,
+                    message="tools/call missing required 'name' field", status=400,
+                    rule=None, api_key_id=api_key_id, start=start, client_ip=client_ip,
+                    bridged=bridged, origin=origin,
+                    endpoint="per-server", rpc_method=rpc_method, status_code=400,
                 )
             )
 
@@ -524,6 +513,54 @@ class Pipeline:
                 )
             )
         return _EnforcementOutcome(decision=decision, policy=policy)
+
+    async def _refuse(
+        self, *, server_slug, tool, rpc_id, message, status, rule, api_key_id,
+        start, client_ip, data=None, reason=None, bridged=False, origin=None,
+        **audit_extra,
+    ) -> Response:
+        """Log a BLOCKED audit row and build the matching JSON-RPC error response (issue #53).
+
+        Pairing refusal-and-audit in one call makes "blocked without an audit row"
+        unrepresentable — the compliance-relevant failure for a gateway whose audit trail is a
+        product feature. `reason` defaults to `message`; pass it explicitly where the audit
+        reason differs from the client-facing message (e.g. the policy-block site logs
+        decision.reason but serves "Blocked by acropolis: {reason}"). Pass `status_code` via
+        audit_extra when the audit row should carry one (only the missing-name site does today).
+        """
+        await self._audit.log(
+            server_slug=server_slug, tool=tool, decision="BLOCKED", rule=rule,
+            reason=reason if reason is not None else message,
+            api_key_id=api_key_id, client_ip=client_ip,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            bridged=bridged, origin=origin, **audit_extra,
+        )
+        return Response(
+            content=rpc_error(rpc_id, message, data=data),
+            status_code=status, media_type="application/json",
+        )
+
+    async def _error(
+        self, *, server_slug, tool, status, content, reason, api_key_id=None,
+        start, client_ip, media_type="application/json", bridged=False, origin=None,
+        **audit_extra,
+    ) -> Response:
+        """Log an ERROR audit row and serve the given JSON-RPC error body (issue #53).
+
+        `content` is the exact body to serve, already rpc_error()-built at the call site —
+        several ERROR paths serve a body that was constructed elsewhere (RoutingError's or
+        BridgeError's); `reason` is what the audit row records and may differ from the
+        client-facing message. ERROR audit rows always carry status_code, so unlike _refuse
+        this helper passes `status` through to the audit itself.
+        """
+        await self._audit.log(
+            server_slug=server_slug, tool=tool, decision="ERROR",
+            reason=reason, status_code=status,
+            api_key_id=api_key_id, client_ip=client_ip,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            bridged=bridged, origin=origin, **audit_extra,
+        )
+        return Response(content=content, status_code=status, media_type=media_type)
 
     def _handle_discover(self, server: ServerRecord, rpc_id: Any) -> Response:
         result = synthesize_server_discover(server)
@@ -610,29 +647,33 @@ class Pipeline:
                 upstream_auth_header=resolved_auth_header,
             )
         except BridgeError as e:
-            await self._audit.log(
-                server_slug=server.slug, tool=None, decision="ERROR",
-                endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
-                reason=e.body[:200], status_code=e.status_code, bridged=True,
-                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-                origin=origin,
+            return await self._error(
+                server_slug=server.slug, tool=None, status=e.status_code,
+                content=e.body, reason=e.body[:200],
+                api_key_id=api_key_id, start=start, client_ip=client_ip,
+                bridged=True, origin=origin,
+                endpoint="per-server", rpc_method=rpc_method,
             )
-            return Response(content=e.body, status_code=e.status_code, media_type="application/json")
 
         return Response(content=json.dumps(body), status_code=status, media_type="application/json")
 
-    def _check_header_consistency(
-        self, request: Request, rpc_method: str, body_name: Optional[str]
+    async def _check_header_consistency(
+        self, request: Request, rpc_method: str, body_name: Optional[str],
+        *, server: ServerRecord, api_key_id: Optional[int], start: float,
+        client_ip: Optional[str],
     ) -> Optional[Response]:
         mcp_method_header = request.headers.get(MCP_METHOD_HEADER)
         mcp_name_header = request.headers.get(MCP_NAME_HEADER)
         if not header_matches_body(mcp_method_header, mcp_name_header, rpc_method, body_name):
-            return Response(
+            return await self._error(
+                server_slug=server.slug, tool=body_name, status=400,
                 content=rpc_error(
                     None, "Mcp-Method/Mcp-Name header does not match request body",
                     code=HEADER_MISMATCH_ERROR,
                 ),
-                status_code=400, media_type="application/json",
+                reason="Mcp-Method/Mcp-Name header mismatch",
+                api_key_id=api_key_id, start=start, client_ip=client_ip,
+                endpoint="per-server", rpc_method=rpc_method,
             )
         return None
 
@@ -664,15 +705,12 @@ class Pipeline:
         keys = [srv_key] if policy.rate_limit else []
         keys.append(tool_key(server.slug, tool_name))
         if not await self._rate_limiter.check_all(keys):
-            await self._audit.log(
-                server_slug=server.slug, tool=tool_name, decision="BLOCKED",
-                endpoint="per-server", rpc_method="tools/call", api_key_id=api_key_id,
-                rule="rate_limit", reason="Rate limit exceeded",
-                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-            )
-            return Response(
-                content=rpc_error(rpc_id, "Rate limit exceeded", data={"tool": tool_name}),
-                status_code=429, media_type="application/json",
+            return await self._refuse(
+                server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
+                message="Rate limit exceeded", status=429, rule="rate_limit",
+                api_key_id=api_key_id, start=start, client_ip=client_ip,
+                endpoint="per-server", rpc_method="tools/call",
+                data={"tool": tool_name},
             )
         return None
 
@@ -733,17 +771,13 @@ class Pipeline:
             await self._maybe_fire_quota_webhook(key, used + 1, since)
             return None
 
-        await self._audit.log(
-            server_slug=server.slug, tool=tool_name, decision="BLOCKED",
-            endpoint="per-server", rpc_method="tools/call", api_key_id=api_key_id,
-            rule="quota", reason=f"Quota exceeded: {used}/{key.quota_calls} calls this {key.quota_period}",
-            latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-        )
-        return Response(
-            content=rpc_error(
-                rpc_id, "Quota exceeded", data={"tool": tool_name, "quota_period": key.quota_period},
-            ),
-            status_code=429, media_type="application/json",
+        return await self._refuse(
+            server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
+            message="Quota exceeded", status=429, rule="quota",
+            reason=f"Quota exceeded: {used}/{key.quota_calls} calls this {key.quota_period}",
+            api_key_id=api_key_id, start=start, client_ip=client_ip,
+            endpoint="per-server", rpc_method="tools/call",
+            data={"tool": tool_name, "quota_period": key.quota_period},
         )
 
     async def _maybe_fire_quota_webhook(self, key, projected_used: int, since_iso: str) -> None:
@@ -870,15 +904,14 @@ class Pipeline:
             return await self._secrets.resolve(server.upstream_auth_header)
         except SecretResolutionError as e:
             reason = f"secret resolution failed: {e.reason}"
-            await self._audit.log(
-                server_slug=server.slug, tool=tool_name, decision="ERROR",
-                endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
-                reason=reason, status_code=502,
-                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-                origin=origin, bridged=bridged,
-            )
             raise self._CredentialResolutionFailed(
-                Response(content=rpc_error(rpc_id, reason), status_code=502, media_type="application/json")
+                await self._error(
+                    server_slug=server.slug, tool=tool_name, status=502,
+                    content=rpc_error(rpc_id, reason),
+                    reason=reason, api_key_id=api_key_id, start=start,
+                    client_ip=client_ip, origin=origin, bridged=bridged,
+                    endpoint="per-server", rpc_method=rpc_method,
+                )
             )
 
     async def _forward(

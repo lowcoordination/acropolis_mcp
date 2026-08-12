@@ -62,14 +62,11 @@ class AggregatePipeline:
         client_ip = _client_ip(request)
 
         if not await self._aggregate_enabled():
-            await self._audit.log(
-                server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
-                status_code=404, reason="aggregate endpoint is disabled in settings",
-                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-            )
-            return Response(
+            return await self._per_server._error(
+                server_slug=None, tool=None, status=404,
                 content=rpc_error(None, "aggregate endpoint is disabled"),
-                status_code=404, media_type="application/json",
+                reason="aggregate endpoint is disabled in settings",
+                start=start, client_ip=client_ip, endpoint="aggregate",
             )
 
         # tools/call re-dispatches through Pipeline.handle(), which does its own (per-server-
@@ -79,12 +76,12 @@ class AggregatePipeline:
         try:
             api_key_id = await self._per_server.authenticate_no_scope(request)
         except RoutingError as e:
-            await self._audit.log(
-                server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
-                status_code=e.status_code, reason=e.body[:200],
-                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+            return await self._per_server._error(
+                server_slug=None, tool=None, status=e.status_code,
+                content=e.body, media_type=e.media_type,
+                reason=e.body[:200], start=start, client_ip=client_ip,
+                endpoint="aggregate",
             )
-            return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
 
         # §26 fix (review 2026-08-04): this used to be a bare `await request.body()` with no
         # size limit at all — unlike the per-server path (Pipeline._read_body_guarded), which
@@ -95,12 +92,12 @@ class AggregatePipeline:
         try:
             body_bytes = await self._per_server._read_body_guarded(request)
         except RoutingError as e:
-            await self._audit.log(
-                server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
-                status_code=e.status_code, reason=e.body[:200],
-                latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+            return await self._per_server._error(
+                server_slug=None, tool=None, status=e.status_code,
+                content=e.body, media_type=e.media_type,
+                reason=e.body[:200], start=start, client_ip=client_ip,
+                endpoint="aggregate",
             )
-            return Response(status_code=e.status_code, content=e.body, media_type=e.media_type)
 
         try:
             body_json = json.loads(body_bytes) if body_bytes else None
@@ -132,14 +129,12 @@ class AggregatePipeline:
         if rpc_method == "server/discover":
             return await self._handle_discover(rpc_id, api_key_id)
 
-        await self._audit.log(
-            server_slug=None, tool=None, decision="ERROR", endpoint="aggregate",
-            rpc_method=rpc_method, reason=f"unsupported method on aggregate endpoint: {rpc_method}",
-            status_code=501, latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-        )
-        return Response(
+        return await self._per_server._error(
+            server_slug=None, tool=None, status=501,
             content=rpc_error(rpc_id, f"'{rpc_method}' is not supported on the aggregate endpoint"),
-            status_code=501, media_type="application/json",
+            reason=f"unsupported method on aggregate endpoint: {rpc_method}",
+            start=start, client_ip=client_ip, endpoint="aggregate",
+            rpc_method=rpc_method,
         )
 
     async def _caller_project_id(self, api_key_id: Optional[int]) -> Optional[int]:
