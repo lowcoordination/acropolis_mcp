@@ -315,3 +315,54 @@ trace in Tempo's or Jaeger's web UI) — since OTLP is a standardized wire proto
 collector accepted and correctly parsed the spans, there's no Acropolis-specific reason to expect
 a specific UI to render them differently, but that specific rendering step was not the thing
 exercised here.
+
+## Connection pool sizing (asyncpg)
+
+Acropolis talks to Postgres through two **separate** asyncpg pools (see `db/database.py`):
+a reader pool and a writer pool. They are independent budgets, sized separately, and this is
+deliberate — reads and writes have different concurrency profiles on the request path, and
+separating them means a write-heavy burst cannot starve reads (or vice versa).
+
+### Defaults and the reasoning behind them
+
+| Pool | Default max | Why |
+|---|---|---|
+| Reader | 10 | Most of the request path is reads; the reader pool is the one under real traffic. |
+| Writer | 5 | Writes on the request path are minimal and atomic (usage rollup upserts); the audit log is not a per-request write at all (see below). |
+
+Both are configurable via `ACROPOLIS_DB_READER_POOL_MAX` / `ACROPOLIS_DB_WRITER_POOL_MAX`
+(`archon/settings.py`, wired through `argus/__main__.py`).
+
+### What actually touches the pool per request
+
+The audit log does **not** consume a pool slot per request: `argus/audit.py` enqueues to an
+`asyncio.Queue` and a background task flushes batched inserts every 100ms or 200 events,
+whichever comes first. The realistic `tools/call` hot path is roughly **three reads on the
+reader pool** (API-key verification, server policy, and — only for keys that have a quota
+configured — the quota `total_since` lookup), plus one writer-pool usage-rollup upsert.
+That makes the default reader pool of 10 comfortably sufficient for the vast majority of
+deployments; the "5+ queries per request, audit write per request" framing from the August 2026
+external review does not hold against the code (the review's correction record lives in
+`docs/remediation-2026-08-antigravity-review.md`).
+
+### When and how to raise the limits
+
+The signal that the defaults are too small is **queueing, not errors**: asyncpg callers wait
+for a free connection, so the symptom is rising p50/p99 latency on `tools/call` while Postgres
+itself shows low CPU and plenty of idle capacity (i.e. the bottleneck is the pool, not the
+database). Raise `ACROPOLIS_DB_READER_POOL_MAX` first — it is the pool on the hot path.
+
+One caution if you run multiple replicas: each replica opens its own reader+writer pools, so
+total connections scale with replica count. Keep `N × (reader + writer)` under your Postgres
+`max_connections`, and prefer raising the pool size over adding replicas until the
+process-local rate limiter is replaced (see R4 / issue #31 in the remediation doc — replicas
+today multiply every configured rate limit by the replica count).
+
+### Why there is no read-through cache for server/policy config
+
+A read-through cache for `ServerRepo`/`get_policy` was **considered and rejected** for now:
+policy evaluation is a security-enforcement path, and a cache introduces a staleness window
+between "operator changed the policy" and "enforcement honors it." The pool is the cheaper and
+safer lever — at the concurrency levels this project targets, three reads on a 10-connection
+pool is not the constraint, and caching enforcement state would buy throughput at the cost of
+correctness. Revisit only if measurement shows pool queueing that sizing cannot fix.

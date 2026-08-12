@@ -38,6 +38,12 @@ logger = logging.getLogger("argus.policy")
 # threaded helper process early, and forks each worker from THAT — never from Argus's live,
 # multi-threaded process. ~22ms overhead per call (vs. ~3ms for fork, ~85ms for spawn which
 # re-imports Python each time) — an acceptable cost for correctness on a security-critical path.
+# R5 (issue #32, 2026-08-10): measured on the devbox (Python 3.14.6) at ~109ms per match p50 —
+# ~5x the 22ms figure above, which came from the original author's environment. The number is
+# machine/Python-version dependent; treat the magnitude, not the constant, as the claim. Full
+# measurement (single-match cost, concurrency ceiling ~126 matches/s at the 16-way semaphore
+# cap, adversarial 0.5s-timeout tail) and the go/no-go verdict on an re2 rewrite are recorded
+# in tests/bench/results/r5-redos-2026-08-10.md.
 _REGEX_MATCH_TIMEOUT_SECONDS = 0.5
 _mp_context = multiprocessing.get_context("forkserver")
 
