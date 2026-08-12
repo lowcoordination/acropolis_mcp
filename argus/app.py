@@ -257,7 +257,7 @@ def create_app(
         # (empty-table no-op when approvals are disabled).
         proposal_expiry_job.start()
         # GitOps polling is opt-in via gitops_enabled setting
-        await config_source.start()
+        config_source.start()
         try:
             yield
         finally:
