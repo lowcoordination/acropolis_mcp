@@ -26,58 +26,27 @@ logger = logging.getLogger("db.repo")
 _UNSET = object()  # sentinel: distinguishes "argument omitted" from "argument is None"
 
 
-# ─── gateway_write_lock conversion audit (enterprise #7, issue #8) ────────────────────────────
+# ─── gateway_write_lock conversion ───────────────────────────────────────────────────────────
 #
-# Every write path in this module used to run inside `async with self._db.gateway_write_lock`, a
-# per-process asyncio.Lock that serialized all writes because SQLite has a single writer. That
-# lock is DELETED. Being per-process, it was also exactly what made multi-replica deployment
-# impossible: a second pod would not have contended for it, so every invariant it "protected"
-# would have silently stopped holding the moment anyone scaled past one instance.
+# No per-process write lock in this module, deliberately: the old gateway_write_lock existed to
+# serialize writes for SQLite's single writer — and being per-process, a second replica would
+# not have contended for it, so the invariants it protected would have silently stopped holding
+# in a multi-replica deployment. Postgres enforces the same invariants in the database, where
+# they hold across processes.
 #
-# Each site was converted individually rather than blanket-removed. Each carries an inline
-# comment naming its replacement; the shapes used, and when each applies:
-#
-#   [SINGLE-STATEMENT]  One INSERT/UPDATE/DELETE, no read-then-write. asyncpg runs a lone
-#                       statement in an implicit transaction and Postgres makes it atomic, so the
-#                       lock was pure overhead here. No explicit transaction added — wrapping a
-#                       single statement in BEGIN/COMMIT buys nothing and just costs round-trips.
-#
-#   [TRANSACTION]       Multi-statement write that must be all-or-nothing and must never be
-#                       observed half-applied by a reader. Replaced with an explicit
-#                       `async with conn.transaction()`. Postgres MVCC additionally guarantees no
-#                       reader sees the gap — which under SQLite required the separate-connection
-#                       WAL trick the old Database docstring described at length.
-#
-#   [UPSERT]            Read-modify-write collapsed into a single atomic
-#                       `INSERT ... ON CONFLICT DO UPDATE`. Preferred over transaction+lock
-#                       wherever the operation is expressible this way, because it is race-free
-#                       without holding anything: concurrent callers serialize on the row itself.
-#
-#   [ATOMIC-RMW]        Read-modify-write expressed as one statement operating on the stored
-#                       value (`SET x = x + 1`) plus `RETURNING`, so no read happens outside the
-#                       write. Replaces the read-after-write-under-lock pattern.
-#
-#   [FOR UPDATE]        A genuine check-then-act across statements where the checked row must not
-#                       change underneath. Takes a row lock inside a transaction. Used sparingly —
-#                       most apparent instances are better served by a UNIQUE constraint plus
-#                       catching the violation, which is what the create paths do (a UNIQUE index
-#                       is a stronger guarantee than any lock this code could take, since it also
-#                       holds against writers that never run this code).
-#
-# The check-slug-then-INSERT paths (ServerRepo.create, ProjectRepo.create, UserRepo.create) are
-# the subtlest: the pre-flight SELECT is kept for a clean, typed error on the common case, but it
-# is NO LONGER what makes the operation correct. The UNIQUE constraint is, and each of those
-# methods now catches asyncpg.UniqueViolationError and converts it to the same conflict exception
-# the pre-flight check raises — so the loser of a true race gets the identical error shape rather
-# than an unhandled 500. Race coverage: tests/integration/test_postgres_races.py.
+# Each write path names the replacement shape in its inline comment: [SINGLE-STATEMENT] (one
+# atomic statement), [TRANSACTION] (all-or-nothing multi-statement), [UPSERT] / [ATOMIC-RMW]
+# (read-modify-write collapsed into one statement), [FOR UPDATE] (check-then-act across
+# statements). Check-slug-then-INSERT paths keep a pre-flight SELECT only for a clean typed
+# error — the UNIQUE constraint is what makes them correct, with UniqueViolationError converted
+# to the same conflict exception. Race coverage: tests/integration/test_postgres_races.py.
 # ──────────────────────────────────────────────────────────────────────────────────────────────
 
 
-# Enterprise #10 (DLP): dlp_detectors + dlp_custom_patterns are stored as ONE JSON TEXT column
+# DLP: dlp_detectors + dlp_custom_patterns are stored as ONE JSON TEXT column
 # (server_policies.dlp_config, migration 0008_gateway_dlp_config.sql) rather than further
-# normalized tables — see that migration's comment for why this departs from the original
-# plan doc's "no migration needed" premise, and why JSON-in-a-column (not per-detector rows)
-# was the call made here.
+# normalized tables — see that migration's comment for why JSON-in-a-column (not per-detector
+# rows) is the call made here.
 def _encode_dlp_config(
     detectors: dict[str, str], custom_patterns: list[DlpCustomPattern]
 ) -> Optional[str]:
@@ -163,7 +132,7 @@ def _row_to_server(row: asyncpg.Record) -> ServerRecord:
 
 
 async def _default_project_id(conn: asyncpg.Connection) -> Optional[int]:
-    """Enterprise #4: resolves the backfilled 'default' project's id, used by ServerRepo.create/
+    """Resolves the backfilled 'default' project's id, used by ServerRepo.create/
     ApiKeyRepo.create as the fallback when a caller passes project_id=None (or omits it) —
     NOT left as a literal NULL row. Every server/key created through the real control-plane API
     already resolves an explicit project_id before calling these methods (archon/api.py's
@@ -220,19 +189,18 @@ class ServerRepo(_PoolAccess):
     the old Database docstring described; under Postgres it is what a transaction already means."""
 
     async def list(self, project_id: Optional[int] = None) -> list[ServerRecord]:
-        # F4 fix (review 2026-08-04): defense-in-depth half. The CREATE path now validates the
-        # slug (archon/schemas.py's _validate_slug) so a bad row shouldn't be writable anymore
-        # — but this is the method that used to turn any bad row already in the DB (from before
-        # the fix, or any path that bypasses the API validator) into a PERMANENT outage: every
-        # caller of list() (GET /servers, GET /stats, aggregate tools/list/discover, the health
-        # poller) would raise on the Pydantic ValidationError inside _row_to_server, with no way
-        # to even see the bad row to delete it. Skip-and-log instead of propagating, so one bad
-        # row degrades to "one server invisible" rather than "everything that calls list() is
-        # down."
+        # Defense-in-depth: the CREATE path validates the slug (archon/schemas.py's
+        # _validate_slug) so a bad row shouldn't be writable anymore — but list() must not turn
+        # a bad row already in the DB (from any path that bypasses the API validator) into a
+        # PERMANENT outage: every caller of list() (GET /servers, GET /stats, aggregate
+        # tools/list/discover, the health poller) would raise on the Pydantic ValidationError
+        # inside _row_to_server, with no way to even see the bad row to delete it. Skip-and-log
+        # instead of propagating, so one bad row degrades to "one server invisible" rather than
+        # "everything that calls list() is down."
         #
-        # Enterprise #4: `project_id=None` means "no project filter" (every existing caller pre-
-        # this-feature, and every instance-wide use like the health poller) — NOT "servers with
-        # no project". Pass a real project id explicitly to scope.
+        # `project_id=None` means "no project filter" (every existing instance-wide use like the
+        # health poller) — NOT "servers with no project". Pass a real project id explicitly to
+        # scope.
         async with self._read() as conn:
             if project_id is not None:
                 rows = await conn.fetch(
@@ -295,9 +263,9 @@ class ServerRepo(_PoolAccess):
                 if await conn.fetchval("SELECT 1 FROM servers WHERE slug = $1", slug):
                     raise SlugConflictError(slug)
 
-                # Enterprise #4: project_id=None (the default, and every pre-projects caller's
-                # implicit choice) resolves to the 'default' project rather than staying NULL —
-                # see _default_project_id's docstring for why this must not be a NULL row.
+                # project_id=None (the default) resolves to the 'default' project rather than
+                # staying NULL — see _default_project_id's docstring for why this must not be a
+                # NULL row.
                 if project_id is None:
                     project_id = await _default_project_id(conn)
 
@@ -352,7 +320,7 @@ class ServerRepo(_PoolAccess):
         if in_aggregate is not None:
             _next("in_aggregate", in_aggregate)
         if upstream_auth_header is not _UNSET:
-            # F23: unlike the other fields, None here is meaningful ("clear the configured
+            # Unlike the other fields, None here is meaningful ("clear the configured
             # credential"), so a sentinel distinguishes "field omitted, don't touch it" from
             # "field explicitly set to null" — the None-means-omitted convention every other
             # field on this method uses would make it impossible to ever clear a credential.
@@ -383,7 +351,7 @@ class ServerRepo(_PoolAccess):
             await conn.execute("DELETE FROM servers WHERE id = $1", current.id)
 
     async def set_project(self, slug: str, project_id: int) -> ServerRecord:
-        """Enterprise #4: reassign an EXISTING server to a different project. Deliberately a
+        """Reassign an EXISTING server to a different project. Deliberately a
         separate, narrow method rather than a field on `update()` — reassignment is rare (config
         import with a changed project_slug, or a future explicit "move server" admin action),
         and keeping it out of update()'s general field list avoids a project_id=None sentinel
@@ -402,7 +370,7 @@ class ServerRepo(_PoolAccess):
         self, slug: str, health_status: str, upstream_protocol: Optional[str] = None,
         discover_json: Optional[str] = None, health_reason: Optional[str] = None,
     ) -> None:
-        # Enterprise #5: health_reason is NOT COALESCE'd like upstream_protocol/discover_json —
+        # health_reason is NOT COALESCE'd like upstream_protocol/discover_json —
         # it must be overwritten with exactly what THIS probe found (None when the cause wasn't a
         # secret-resolution failure), or a stale reason from a previous failed probe would keep
         # showing after the server recovers or the cause changes to a plain network outage.
@@ -473,11 +441,10 @@ class ServerRepo(_PoolAccess):
         )
 
     async def get_policies_for(self, server_ids: list[int]) -> dict[int, ServerPolicy]:
-        """F14 fix (review 2026-08-04): batched version of get_policy for the aggregate
-        endpoint, which used to call get_policy() once PER SERVER (3 round-trips each) inside
-        a loop — 3N queries for N registered servers. One query per table with
-        `WHERE server_id IN (...)`, grouped in Python, returns the same data in 3 queries
-        total regardless of how many servers are being fetched. Servers with no policy row yet
+        """Batched version of get_policy for the aggregate endpoint: one query per table with
+        `WHERE server_id IN (...)`, grouped in Python — 3 queries total regardless of how many
+        servers are being fetched, rather than 3 per server (3N for N registered servers).
+        Servers with no policy row yet
         get the same passthrough/no-rate-limit default get_policy() returns.
 
         Postgres port: the three `IN (...)` clauses became `= ANY($1)` with the id list bound as
@@ -600,10 +567,9 @@ class ServerRepo(_PoolAccess):
 
 
 class ApiKeyRepo(_PoolAccess):
-    # F7: touch_last_used used to commit() on every authenticated data-plane request — a
-    # gratuitous disk write on its own, and the specific trigger that made set_policy's
-    # DELETE-then-reinsert race real (see the pre-cutover Database docstring). Debounced
-    # in-process rather than removed outright, since "last used" is still useful for an operator
+    # touch_last_used is debounced in-process rather than written on every authenticated
+    # data-plane request — a gratuitous write on its own, and the specific trigger that made
+    # set_policy's DELETE-then-reinsert race real. "last used" is still useful for an operator
     # auditing which keys are stale — freshness within this window is a fine trade for not
     # writing on every single proxied call.
     #
@@ -632,7 +598,7 @@ class ApiKeyRepo(_PoolAccess):
         # the same one). RETURNING id replaces cur.lastrowid.
         async with self._write() as conn:
             async with conn.transaction():
-                # Enterprise #4: same 'default'-project fallback as ServerRepo.create — see
+                # Same 'default'-project fallback as ServerRepo.create — see
                 # _default_project_id's docstring.
                 if project_id is None:
                     project_id = await _default_project_id(conn)
@@ -665,7 +631,7 @@ class ApiKeyRepo(_PoolAccess):
         return self._row_to_record(row) if row else None
 
     async def list(self, project_id: Optional[int] = None) -> list[ApiKeyRecord]:
-        # Enterprise #4: same None-means-unfiltered convention as ServerRepo.list.
+        # Same None-means-unfiltered convention as ServerRepo.list.
         async with self._read() as conn:
             if project_id is not None:
                 rows = await conn.fetch(
@@ -888,14 +854,7 @@ class AuditRepo(_PoolAccess):
         return count or 0
 
     async def prune_older_than(self, cutoff_iso: str, batch_size: int = 5000) -> int:
-        # §26 fix (review 2026-08-04): a single unbounded DELETE here could touch an arbitrarily
-        # large number of rows in one transaction — e.g. after retention was disabled for a while
-        # and a large backlog built up. The original reasoning was SQLite-specific (audit.db had
-        # ONE connection, and a long DELETE would block AuditLogger's flush loop on it).
-        #
-        # That specific blocking mechanism is gone — the flush loop now uses its own pooled
-        # connection and Postgres writers don't block each other on unrelated rows. Batching is
-        # KEPT anyway, for reasons that outlive the SQLite constraint: one giant DELETE holds a
+        # Batching a potentially huge DELETE is kept deliberately: one giant DELETE holds a
         # correspondingly giant transaction open, which bloats WAL, defers autovacuum's ability
         # to reclaim any of the dead tuples until it commits, and takes a long-lived lock set
         # that a rolling upgrade or a pg_dump would then contend with. Committing per batch keeps
@@ -935,8 +894,8 @@ def _hour_bucket(ts_iso: str) -> str:
     Deliberately parses and re-serializes via datetime rather than string-slicing the ISO text
     (`ts_iso[:13] + ":00:00+00:00"`) — a naive slice breaks the instant a timestamp isn't
     exactly the `+00:00` suffix shape (e.g. a `Z` suffix, or a differing UTC-offset
-    representation), which is exactly the class of bug stoa/retention.py's §26 fix (its own
-    header comment) had to work around for the same reason. Going through datetime.fromisoformat
+    representation), which is exactly the class of bug stoa/retention.py had to work around for
+    the same reason (see its header comment). Going through datetime.fromisoformat
     normalizes the input shape before truncation, so this stays correct regardless of which
     valid ISO8601 spelling produced the timestamp."""
     dt = datetime.fromisoformat(ts_iso)
@@ -974,7 +933,7 @@ def _to_tool_sentinel(tool: Optional[str]) -> str:
 
 
 class UsageRepo(_PoolAccess):
-    """Enterprise #11 (quotas + usage attribution): durable call-count rollups, one row per
+    """Quotas + usage attribution: durable call-count rollups, one row per
     (UTC hour bucket, api_key_id, server_id, tool).
 
     A separate TABLE from audit_events — see 0009_usage_rollups.sql's header comment for why
@@ -1487,7 +1446,7 @@ def _row_to_project(row: asyncpg.Record) -> ProjectRecord:
 
 
 class ProjectRepo(_PoolAccess):
-    """CRUD for `projects` (enterprise #4, issue #5). Deliberately thin — no membership logic
+    """CRUD for `projects`. Deliberately thin — no membership logic
     here (see ProjectMemberRepo below); this repo only owns the project row itself."""
 
     async def list(self) -> list[ProjectRecord]:
@@ -1610,7 +1569,7 @@ class ProjectMemberRepo(_PoolAccess):
 
 
 class ProposalRecord(BaseModel):
-    """One approval-workflow proposal (enterprise #9, issue #10).
+    """One approval-workflow proposal.
 
     `payload` is the stored INTENT — a JSON string of {"request": ..., "baseline": ...} (see
     0011_proposals.sql's header for why intent, not a frozen diff). Exposed as Optional-free str
@@ -1631,10 +1590,10 @@ class ProposalRecord(BaseModel):
     resolver_user_id: Optional[int] = None
     resolver: Optional[str] = None
     resolution_reason: Optional[str] = None
-    # 0012_proposals_project_scope.sql (remediation, review 2026-08-10): populated for
-    # 'server_policy' proposals (the target server's project), NULL for 'config_import'
-    # proposals (instance-wide by nature — a config import can touch every project in one
-    # file, so it stays global-admin-gated, not project-gated). See that migration's header.
+    # 0012_proposals_project_scope.sql: populated for 'server_policy' proposals (the target
+    # server's project), NULL for 'config_import' proposals (instance-wide by nature — a config
+    # import can touch every project in one file, so it stays global-admin-gated, not
+    # project-gated). See that migration's header.
     project_id: Optional[int] = None
 
     def parse_payload(self) -> dict:
@@ -1662,7 +1621,7 @@ def _row_to_proposal(row: asyncpg.Record) -> ProposalRecord:
 
 
 class ProposalRepo(_PoolAccess):
-    """Approval-workflow proposals (enterprise #9, issue #10).
+    """Approval-workflow proposals.
 
     The state transition out of 'pending' is the one place this class needs real care: resolve()
     is a compare-and-swap (UPDATE ... WHERE state = 'pending' ... RETURNING) so that two
@@ -1686,7 +1645,7 @@ class ProposalRepo(_PoolAccess):
     ) -> ProposalRecord:
         """Insert one pending proposal. `payload` must already be a JSON string.
 
-        `project_id` (0012_proposals_project_scope.sql, remediation 2026-08-10): the caller
+        `project_id` (0012_proposals_project_scope.sql): the caller
         (ApprovalService) is responsible for resolving this — None for a 'config_import'
         proposal (instance-wide, by design), the target server's project_id for a
         'server_policy' proposal. This repo just stores whatever it's given; it has no opinion
@@ -1717,7 +1676,7 @@ class ProposalRepo(_PoolAccess):
     ) -> list[ProposalRecord]:
         """List proposals, newest first. `state` filters to a single state (None = all).
 
-        `project_id` (remediation, review 2026-08-10): filters to one project's proposals —
+        `project_id` filters to one project's proposals —
         used by GET /proposals when the caller is a project admin, not a global admin, mirroring
         GET /keys's own project_id query-param branch. None means "no project filter" (the
         global-admin default), NOT "only proposals with no project" — a caller who wants only
