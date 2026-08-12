@@ -16,10 +16,8 @@ logger = logging.getLogger("db.database")
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
-# ONE forward-only migration sequence for ONE database. The pre-cutover SQLite schema had two
-# independent series (gateway.db's and audit.db's), which is why the originals contained two
-# 0001s and two 0008s — a version collision that only worked because each file had its own
-# schema_migrations table. See 0001_init.sql's header for the full one-database decision.
+# ONE forward-only migration sequence for ONE database, numbered 0001..0012 with no gaps or
+# duplicates — see 0001_init.sql's header for the full one-database decision.
 MIGRATIONS = [
     "0001_init.sql",
     "0002_upstream_credential.sql",
@@ -57,8 +55,8 @@ class SchemaTooNewError(Exception):
 class DatabaseNotConfiguredError(Exception):
     """Raised at startup when no Postgres connection URL is configured.
 
-    Postgres is a HARD REQUIREMENT as of enterprise #7 — there is no SQLite fallback and no
-    embedded/default backend to silently degrade to. Failing loudly at boot matches the posture
+    Postgres is a HARD REQUIREMENT — there is no SQLite fallback and no embedded/default
+    backend to silently degrade to. Failing loudly at boot matches the posture
     archon/settings.py already takes for a misconfigured secret provider or webhook URL: a
     misconfigured data store must not present as an empty-but-working gateway."""
 
@@ -71,12 +69,11 @@ class PoolExhaustedError(Exception):
 async def acquire_with_timeout(pool: asyncpg.Pool, timeout: float) -> AsyncIterator[asyncpg.Connection]:
     """Acquire a pooled connection, converting acquisition timeout into PoolExhaustedError.
 
-    The try/except deliberately wraps ONLY the acquisition, not the caller's body. An earlier
-    shape wrapped the `yield` too, which meant an asyncio.TimeoutError raised for any unrelated
-    reason INSIDE the caller's `async with` block (a wait_for around a slow query, a cancelled
-    upstream call) came back out as "pool exhausted, check for a connection leak" — sending
-    whoever debugs it at entirely the wrong subsystem. Only a timeout from pool.acquire() itself
-    is evidence of exhaustion.
+    The try/except deliberately wraps ONLY the acquisition, not the caller's body: only a
+    timeout from pool.acquire() itself is evidence of exhaustion. Wrapping the `yield` too
+    would misattribute an asyncio.TimeoutError raised anywhere inside the caller's `async with`
+    block (a wait_for around a slow query, a cancelled upstream call) as "pool exhausted, check
+    for a connection leak" — sending whoever debugs it at entirely the wrong subsystem.
     """
     acquisition = pool.acquire(timeout=timeout)
     try:
@@ -101,16 +98,10 @@ def _version_from_filename(filename: str) -> int:
 async def _init_connection(conn: asyncpg.Connection) -> None:
     """Per-connection setup, run by the pool for every new connection.
 
-    This is where the SQLite PRAGMAs used to be, and it is deliberately much smaller:
-      - `journal_mode=WAL` — GONE, not translated. It existed to buy cross-connection snapshot
-        isolation (a reader on a second connection seeing only committed state). Postgres gives
-        that unconditionally via MVCC; there is no equivalent knob and none is needed.
-      - `busy_timeout=5000` — GONE. It existed because SQLite's single-writer lock made
-        "database is locked" a routine, retryable condition. Postgres has row-level locking, so
-        the failure mode it papered over does not exist. Statement-level timeouts are an
-        operator concern (postgresql.conf / the connection URL), not something this app forces.
-      - `foreign_keys=ON` — GONE. SQLite needed this because it enforces FK constraints only
-        when explicitly asked, per connection. Postgres always enforces them.
+    Deliberately no SQLite-era PRAGMAs — they papered over limitations Postgres doesn't have:
+    MVCC gives cross-connection snapshot isolation (WAL was for that), row-level locking removes
+    the single-writer "database is locked" condition (busy_timeout was for that), and FKs are
+    always enforced (foreign_keys=ON was for that). Re-adding them would be inert noise.
 
     What IS set here: JSON/JSONB codecs. asyncpg returns JSONB as a raw `str` by default rather
     than decoded Python objects. The repo layer round-trips these values through json.dumps /
@@ -148,13 +139,11 @@ async def _apply_migrations(
     users migration, seeds a legacy admin_password_hash, then applies the rest — the real upgrade
     path an existing instance takes).
 
-    Two things differ from the SQLite version beyond dialect. First, each migration runs inside
-    an explicit TRANSACTION together with its own schema_migrations bookkeeping row — Postgres
-    has transactional DDL, so a migration that fails halfway leaves NOTHING applied, rather than
-    SQLite's executescript() behaviour where a failure could leave some statements committed and
-    the version row unwritten (a state that then needed manual repair). Second, a SESSION-level
-    advisory lock serializes the whole migration pass across processes: with Postgres, two app
-    instances can now genuinely start at the same moment against the same database, and both
+    Two structural properties. First, each migration runs inside an explicit TRANSACTION
+    together with its own schema_migrations bookkeeping row — Postgres has transactional DDL,
+    so a migration that fails halfway leaves NOTHING applied; there is no half-applied state to
+    repair by hand. Second, a SESSION-level advisory lock serializes the whole pass across
+    processes: two app instances can start at the same moment against the same database and
     would otherwise race to apply the same migration.
 
     The lock is taken with pg_advisory_lock (session-scoped) rather than pg_advisory_xact_lock
@@ -202,36 +191,26 @@ async def _apply_migrations(
 class Database:
     """Owns the asyncpg connection pools for the single Acropolis Postgres database.
 
-    POST-CUTOVER (enterprise #7). This class used to hold three long-lived aiosqlite connections
-    — a dedicated gateway.db WRITER, a separate gateway.db READER, and one for audit.db — plus an
-    `asyncio.Lock` (`gateway_write_lock`) that serialized every write in the process. All four are
-    gone. What replaced them, and why:
+    Two pools, deliberately: a small WRITER pool (writes are short and the control plane is
+    low-volume) and a larger READER pool (every data-plane request does at least one read —
+    key lookup, policy fetch). Under SQLite the reader/writer split was load-bearing for
+    correctness: a reader sharing the writer's connection could observe an uncommitted
+    DELETE-then-reinsert mid-gap and transiently see an empty denylist. Under Postgres, MVCC
+    makes that impossible on ANY connection, so the split is now a resource-isolation choice,
+    not a correctness crutch. It bounds how many connections write traffic can consume so a
+    burst of data-plane writes cannot starve the control plane's reads, and it leaves a seam
+    for pointing `reader` at a read replica later without touching a single repo method.
 
-    `gateway_write_lock` is DELETED, not made a no-op. It existed to work around SQLite's
-    single-writer model: within one process, every write had to be serialized because SQLite
-    could not do it. That lock was also precisely what made running more than one replica
-    impossible — being per-PROCESS, a second pod would not have contended for it at all, so the
-    invariants it protected would simply have stopped holding. Postgres enforces the same
-    invariants in the database, where they belong and where they hold across processes. Every one
-    of its call sites was converted individually (see db/repo.py — each carries a comment naming
-    the shape that replaced it), not blanket-removed: several guarded multi-statement
-    read-modify-write sequences (check-slug-then-insert, read-before-then-write-after for audit
-    diffs) that need a real transaction or SELECT ... FOR UPDATE, and dropping the lock without
-    supplying one would have shipped a TOCTOU this code never had to survive before.
+    There is deliberately NO per-process write lock. The old `gateway_write_lock` existed to
+    work around SQLite's single-writer model — and being per-PROCESS, a second replica would
+    not have contended for it at all, so the invariants it protected would simply have stopped
+    holding in a multi-replica deployment. Postgres enforces the same invariants in the
+    database, where they hold across processes. The multi-statement read-modify-write call
+    sites that genuinely need protection use a transaction or SELECT ... FOR UPDATE instead
+    (see db/repo.py).
 
-    The reader/writer SPLIT is kept, now as two pools rather than two connections. Under SQLite it
-    was load-bearing for correctness (see the pre-cutover docstring: a reader sharing the writer's
-    connection could observe an uncommitted DELETE-then-reinsert mid-gap and transiently see an
-    empty denylist — the gateway failing open on every policy save). Under Postgres, MVCC makes
-    that impossible on ANY connection, so the split is no longer a correctness requirement. It is
-    kept for two operational reasons: it bounds how many connections write traffic can consume so
-    a burst of data-plane writes cannot starve the control plane's reads, and it leaves a seam for
-    pointing `reader` at a read replica later without touching a single repo method. Recorded
-    explicitly so the next reader knows this is now a resource-isolation choice, not the
-    correctness crutch it used to be.
-
-    audit_events is no longer a separate database — it is a table in this one (see
-    0001_init.sql's header for that decision).
+    audit_events is not a separate database — it is a table in this one (see 0001_init.sql's
+    header for that decision).
     """
 
     # Pool sizing. Deliberately modest defaults: the writer pool is small because writes are
@@ -246,12 +225,8 @@ class Database:
 
     # Deliberately shorter than any request-level budget this acquire sits INSIDE, because a
     # backstop that expires no sooner than the thing it backstops never fires first and so
-    # protects nothing. At the previous 10.0 it was pinned to the tightest such budget
-    # (stoa.health.PROBE_TIMEOUT_SECONDS, also 10.0), meaning a probe whose DB acquire was
-    # starved hit the probe's own timeout with no indication the pool was the cause.
-    #
-    # 5.0 mirrors the pool=5.0 the shared httpx client already uses (argus/app.py) for the
-    # directly analogous wait — "a free connection slot from a pool" — on the same reasoning:
+    # protects nothing. 5.0 mirrors the pool=5.0 the shared httpx client already uses
+    # (argus/app.py) for the directly analogous wait — "a free connection slot from a pool":
     # a slot either frees up in single-digit seconds or the pool is genuinely exhausted, and
     # the caller is better served by a fast, correctly-labelled PoolExhaustedError than by a
     # long stall that surfaces as someone else's timeout.
