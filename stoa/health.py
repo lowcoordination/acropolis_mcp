@@ -23,10 +23,10 @@ DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 # upstream should fail fast, not stall the whole poll cycle for every other registered server.
 PROBE_TIMEOUT_SECONDS = 10.0
 
-# Enterprise #5: the reason string stored on servers.health_reason when a probe fails
-# specifically because the configured secret couldn't be resolved — distinguishable, by a
-# human or by test assertions, from a plain network-level probe failure (which leaves
-# health_reason None; see the docstring on probe_server below).
+# The reason string stored on servers.health_reason when a probe fails specifically because the
+# configured secret couldn't be resolved — distinguishable, by a human or by test assertions,
+# from a plain network-level probe failure (which leaves health_reason None; see the docstring
+# on probe_server below).
 SECRET_RESOLUTION_FAILURE_PREFIX = "secret resolution failed: "
 
 
@@ -49,16 +49,16 @@ async def probe_server(
     """
     secrets = secret_provider or LocalSecretProvider()
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
-    # F23 fix (review 2026-08-04): a server with a configured upstream credential needs it on
-    # the health probe too, or every registered server requiring auth would show permanently
-    # unhealthy regardless of whether tools/call itself works.
+    # A server with a configured upstream credential needs it on the health probe too, or every
+    # registered server requiring auth would show permanently unhealthy regardless of whether
+    # tools/call itself works.
     #
-    # Enterprise #5: this now goes through the configured SecretProvider — resolve() returns the
-    # literal unchanged under `local` (byte-identical to the F23 behaviour above), or resolves a
-    # `vault://`/`enc:v1:` reference under the other tiers. A resolution failure must NEVER be
-    # treated the same as "no credential configured" (which would probe unauthenticated and
-    # either misreport health or, worse, look healthy against an upstream that doesn't actually
-    # need auth) — it is reported as its own distinguishable unhealthy reason instead.
+    # This goes through the configured SecretProvider — resolve() returns the literal unchanged
+    # under `local`, or resolves a `vault://`/`enc:v1:` reference under the other tiers. A
+    # resolution failure must NEVER be treated the same as "no credential configured" (which
+    # would probe unauthenticated and either misreport health or, worse, look healthy against an
+    # upstream that doesn't actually need auth) — it is reported as its own distinguishable
+    # unhealthy reason instead.
     resolved_auth_header: str | None = None
     if server.upstream_auth_header:
         try:
@@ -81,13 +81,11 @@ async def probe_server(
         return ("unhealthy", None, None, None)
 
     if resp.status_code == 200:
-        # F12 fix (review 2026-08-04): json.loads(resp.text) was unguarded — a 200 response
-        # with a non-JSON body (e.g. an auth proxy's HTML login page in front of a
-        # misconfigured upstream) raised JSONDecodeError here, which escaped probe_server ->
-        # _probe_and_store -> poll_once. poll_once iterated servers SERIALLY with no
-        # per-server try/except, so this one bad server aborted the whole poll cycle and every
-        # server after it in slug order got permanently stale health. Every other parse site
-        # in the codebase was already defended; this one wasn't.
+        # This parse MUST stay guarded: a 200 response with a non-JSON body (e.g. an auth
+        # proxy's HTML login page in front of a misconfigured upstream) otherwise raises
+        # JSONDecodeError that escapes probe_server -> _probe_and_store -> poll_once, and one
+        # bad server aborts the whole poll cycle — leaving every server after it in slug order
+        # with permanently stale health.
         try:
             parsed = (
                 parse_sse_body(resp.text)
@@ -101,9 +99,10 @@ async def probe_server(
         if parsed and "result" in parsed:
             # A real server/discover response — this is a 2026-generation server.
             return ("healthy", "2026-07-28", parsed["result"], None)
-        # F12 fix, second half: parsed.get("error", {}) raised AttributeError when "error" was
-        # present but explicitly null (dict.get's default only applies when the KEY is absent,
-        # not when its value is None) — `(parsed.get("error") or {})` handles both cases.
+        # `(parsed.get("error") or {})`, not `parsed.get("error", {})`: dict.get's default only
+        # applies when the KEY is absent, not when its value is explicitly null, and an upstream
+        # may legitimately send `"error": null`. The `or` is correct here precisely because the
+        # only falsy value this can take is one we want replaced.
         error_message = (parsed.get("error") or {}).get("message", "") if parsed else ""
         if "method" in error_message.lower():
             # Method-not-found-shaped error — fall through to the 2025 handshake below.
@@ -156,11 +155,10 @@ class HealthPoller(BackgroundLoop):
         self._secrets = secret_provider or LocalSecretProvider()
 
     async def poll_once(self) -> None:
-        # F12 fix, third half: even with probe_server() itself now fully guarded, wrap each
-        # _probe_and_store call individually so a future exception in EITHER the probe or the
-        # set_health() write for one server can never abort the whole cycle and leave every
-        # server after it in slug order permanently stale — defense in depth on top of the
-        # parse-site fix above, not a substitute for it.
+        # Each _probe_and_store is wrapped individually so an exception in EITHER the probe or
+        # the set_health() write for one server can never abort the whole cycle and leave every
+        # server after it in slug order permanently stale. Defense in depth on top of the
+        # guarded parse above, not a substitute for it.
         servers = await self._repo.list()
         for server in servers:
             if not server.enabled:
