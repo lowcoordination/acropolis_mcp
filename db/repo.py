@@ -7,15 +7,17 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from .database import Database, acquire_with_timeout, utcnow
 from .models import (
+    AdminEventRecord,
     ApiKeyRecord,
     DlpCustomPattern,
     ParamRule,
     ProjectMemberRecord,
     ProjectRecord,
+    ProposalRecord,
     ServerPolicy,
     ServerRecord,
     UserRecord,
@@ -1115,33 +1117,6 @@ class SettingsRepo(_PoolAccess):
                 )
 
 
-class AdminEventRecord(BaseModel):
-    id: int
-    ts: str
-    actor: Optional[str] = None  # NULL until identity milestone; 'admin-session' | 'admin-token' | 'cli'
-    action: str  # server.create | server.update | server.delete | policy.update | key.create | key.disable | key.delete | settings.update | config.import
-    target_type: Optional[str] = None  # 'server' | 'key' | 'settings' | 'config'
-    target_id: Optional[str] = None  # slug, key id, or NULL
-    before: Optional[str] = None  # JSON, allowlisted fields only, NULL on create
-    after: Optional[str] = None  # JSON, allowlisted fields only, NULL on delete
-    client_ip: Optional[str] = None
-    summary: str  # human-readable, e.g. "mode: allowlist -> passthrough"
-
-    def parse_before(self) -> Optional[dict]:
-        """Parse the before JSON into a dict. Returns None if before is NULL."""
-        if self.before is None:
-            return None
-        import json
-        return json.loads(self.before)
-
-    def parse_after(self) -> Optional[dict]:
-        """Parse the after JSON into a dict. Returns None if after is NULL."""
-        if self.after is None:
-            return None
-        import json
-        return json.loads(self.after)
-
-
 class AdminEventRepo(_PoolAccess):
     """Control-plane audit log — records administrative actions (server CRUD, policy changes,
     key mint/revoke, settings changes, config imports).
@@ -1566,40 +1541,6 @@ class ProjectMemberRepo(_PoolAccess):
                 "DELETE FROM project_members WHERE user_id = $1 AND project_id = $2",
                 user_id, project_id,
             )
-
-
-class ProposalRecord(BaseModel):
-    """One approval-workflow proposal.
-
-    `payload` is the stored INTENT — a JSON string of {"request": ..., "baseline": ...} (see
-    0011_proposals.sql's header for why intent, not a frozen diff). Exposed as Optional-free str
-    (NOT NULL in the schema) with parse_payload() for the same reason AdminEventRecord exposes
-    before/after as raw strings with parse helpers: the identity JSON codec in db/database.py
-    round-trips JSONB as str, and callers parse on demand.
-    """
-
-    id: int
-    target_type: str  # 'server_policy' | 'config_import'
-    target_id: str  # server slug, or 'config' for imports
-    payload: str  # JSON: {"request": ..., "baseline": ...}
-    proposer_user_id: Optional[int] = None
-    proposer: str  # Principal.actor
-    state: str  # pending | approved | rejected | expired
-    created_at: str
-    resolved_at: Optional[str] = None
-    resolver_user_id: Optional[int] = None
-    resolver: Optional[str] = None
-    resolution_reason: Optional[str] = None
-    # 0012_proposals_project_scope.sql: populated for 'server_policy' proposals (the target
-    # server's project), NULL for 'config_import' proposals (instance-wide by nature — a config
-    # import can touch every project in one file, so it stays global-admin-gated, not
-    # project-gated). See that migration's header.
-    project_id: Optional[int] = None
-
-    def parse_payload(self) -> dict:
-        import json
-
-        return json.loads(self.payload)
 
 
 def _row_to_proposal(row: asyncpg.Record) -> ProposalRecord:

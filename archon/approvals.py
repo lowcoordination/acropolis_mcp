@@ -29,12 +29,11 @@ from typing import Any, Optional
 from archon.admin_auth import Principal
 from archon.admin_audit import record, record_config_import, record_policy_change
 from archon.config_io import _policy_diff, export_config, plan_import
-from db.models import ServerPolicy
+from db.models import ProposalRecord, ServerPolicy
 from db.repo import (
     AdminEventRepo,
     ProjectRepo,
     ProposalNotFoundError,
-    ProposalRecord,
     ProposalRepo,
     ServerNotFoundError,
     ServerRepo,
