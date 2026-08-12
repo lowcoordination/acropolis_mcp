@@ -89,9 +89,20 @@ class ProtocolBridge:
                 ),
             )
 
+        # Issue #46: this was `sanitize_rpc_id(rpc_id) or 1`. The `or` was meant to supply a
+        # fallback id when the caller sent none, but it fires on every FALSY-yet-valid id too —
+        # 0, 0.0 and "" are all legal JSON-RPC ids, and all three got silently rewritten to 1.
+        #
+        # That is a lost-response bug, not a cosmetic one: the streamable-http upstream keys its
+        # per-request response streams by rpc id (mcp/server/streamable_http.py), and the gateway
+        # multiplexes concurrent calls onto ONE upstream session. A client numbering its requests
+        # from 0 therefore sends both id 0 and id 1 upstream as id 1; the second registration
+        # displaces the first, and the displaced request's response is written to a stream nobody
+        # is reading. It hangs until the read timeout. Only `None` may take the fallback.
+        sanitized_id = sanitize_rpc_id(rpc_id)
         upstream_body = {
             "jsonrpc": "2.0",
-            "id": sanitize_rpc_id(rpc_id) or 1,
+            "id": sanitized_id if sanitized_id is not None else 1,
             "method": rpc_method,
             "params": params,
         }

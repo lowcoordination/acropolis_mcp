@@ -2,6 +2,8 @@
 proves a stateless 2026-style call gets correctly translated and de-enveloped."""
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -153,3 +155,100 @@ async def test_bridge_transparently_re_handshakes_on_session_invalid():
     assert "error" not in body
     assert handshake_count == 2, "expected exactly one re-handshake after the 404"
     assert call_attempts == 2, "expected exactly one retry of the failed call"
+
+
+@pytest.mark.parametrize("falsy_id", [0, 0.0, ""])
+async def test_bridge_preserves_falsy_but_valid_rpc_ids(falsy_id):
+    """Regression for issue #46: `sanitize_rpc_id(rpc_id) or 1` rewrote every FALSY-yet-valid
+    JSON-RPC id (0, 0.0, "") to 1 on the way upstream.
+
+    That silently collided distinct concurrent requests: the streamable-http upstream keys its
+    per-request response streams by rpc id, and the gateway multiplexes concurrent calls onto
+    one upstream session, so a client numbering from 0 sent both id 0 and id 1 upstream as id 1.
+    The second displaced the first and the displaced response was never delivered — one request
+    in every concurrent burst hung until the read timeout.
+
+    Asserts on the id as it CROSSES THE WIRE, which is where the bug lived; asserting only on
+    the returned body would pass even while broken, since bridge_call re-stamps the response
+    with the caller's original id regardless."""
+    seen_upstream_ids = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        method = payload.get("method")
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0", "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {}, "serverInfo": {"name": "stub", "version": "0"},
+                    },
+                },
+                headers={"mcp-session-id": "session-1"},
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(200, json={})
+        if method == "tools/call":
+            seen_upstream_ids.append(payload["id"])
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": {"content": []}},
+            )
+        raise AssertionError(f"unexpected method: {method}")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        bridge = ProtocolBridge(client, UpstreamHandshakeCache(client))
+        status, body = await bridge.bridge_call(
+            server_id=1, upstream_url="http://stub.invalid/mcp", rpc_method="tools/call",
+            rpc_id=falsy_id, params={"name": "echo", "arguments": {}},
+        )
+
+    assert status == 200
+    assert seen_upstream_ids == [falsy_id], (
+        f"id {falsy_id!r} must reach the upstream unchanged, not be rewritten to 1"
+    )
+    assert body["id"] == falsy_id
+
+
+async def test_bridge_substitutes_an_id_only_when_the_caller_sent_none():
+    """The complement of the test above: the fallback must still fire for a genuinely absent
+    id, so #46's fix doesn't swing the other way and forward a null id upstream."""
+    seen_upstream_ids = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        method = payload.get("method")
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0", "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {}, "serverInfo": {"name": "stub", "version": "0"},
+                    },
+                },
+                headers={"mcp-session-id": "session-1"},
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(200, json={})
+        if method == "tools/call":
+            seen_upstream_ids.append(payload["id"])
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": payload["id"], "result": {"content": []}},
+            )
+        raise AssertionError(f"unexpected method: {method}")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        bridge = ProtocolBridge(client, UpstreamHandshakeCache(client))
+        await bridge.bridge_call(
+            server_id=1, upstream_url="http://stub.invalid/mcp", rpc_method="tools/call",
+            rpc_id=None, params={"name": "echo", "arguments": {}},
+        )
+
+    assert seen_upstream_ids == [1], "an absent id must still get the fallback"
