@@ -12,6 +12,7 @@ from typing import Optional
 
 import httpx
 
+from archon.background import BackgroundLoop
 from db.repo import SettingsRepo
 
 logger = logging.getLogger("stoa.webhooks")
@@ -48,7 +49,7 @@ class _CapState:
     suppressed: int = 0
 
 
-class WebhookDispatcher:
+class WebhookDispatcher(BackgroundLoop):
     """Subscribes to AuditLogger's live-tail pub/sub (the same seam the SSE tail and Item 1's
     tool tester use) and fires an outbound webhook on BLOCKED decisions and health-status
     transitions. A new subscriber, not new plumbing — per the plan's framing of why this is
@@ -60,12 +61,16 @@ class WebhookDispatcher:
     takes effect on the next event without a restart.
     """
 
+    _log_name = "webhook dispatcher task"
+    _logger = logger
+
     def __init__(
         self,
         audit_logger,
         settings_repo: SettingsRepo,
         http_client: Optional[httpx.AsyncClient] = None,
     ):
+        super().__init__()
         self._audit = audit_logger
         self._settings_repo = settings_repo
         # A DEDICATED client, not the shared app-wide one: that client's Limits/Timeout are
@@ -79,7 +84,6 @@ class WebhookDispatcher:
         )
         self._owns_http = http_client is None
         self._queue: Optional[asyncio.Queue] = None
-        self._task: Optional[asyncio.Task] = None
         self._debounce: dict[tuple[str, str], _DebounceEntry] = {}
         self._cap = _CapState()
         # Enterprise #11: (key_prefix, period_start_iso) -> highest threshold already fired
@@ -136,16 +140,11 @@ class WebhookDispatcher:
             self._queue = self._audit.subscribe()
             self._task = asyncio.create_task(self._loop())
 
-    async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                logger.warning("webhook dispatcher task did not stop within 5s; abandoning it")
-            self._task = None
+    async def _on_stop(self) -> None:
+        # Teardown beyond the base's task join: unsubscribe from the audit tail, cancel
+        # in-flight debounce sends, and close an owned client. The debounce-task management
+        # stays here deliberately — it is genuinely different from the single-task lifecycle
+        # and does not belong in the base.
         if self._queue is not None:
             self._audit.unsubscribe(self._queue)
             self._queue = None

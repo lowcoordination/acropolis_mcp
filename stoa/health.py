@@ -7,6 +7,7 @@ from typing import Optional
 
 import httpx
 
+from archon.background import BackgroundLoop
 from archon.secrets import SecretProvider, SecretResolutionError
 from archon.secrets.local import LocalSecretProvider
 from argus.upstream import CLIENT_INFO, UpstreamHandshakeCache, UpstreamHandshakeError, parse_sse_body
@@ -128,9 +129,12 @@ async def probe_server(
     return ("healthy", handshake.protocol_version, discover_json, None)
 
 
-class HealthPoller:
+class HealthPoller(BackgroundLoop):
     """Background task: periodically probes every enabled server and updates its health/
     protocol/discover_json fields via ServerRepo.set_health()."""
+
+    _log_name = "health poller task"
+    _logger = logger
 
     def __init__(
         self,
@@ -141,35 +145,15 @@ class HealthPoller:
         webhook_dispatcher: Optional[WebhookDispatcher] = None,
         secret_provider: Optional[SecretProvider] = None,
     ):
+        super().__init__()
         self._repo = server_repo
         self._client = client
         self._handshakes = handshake_cache
         self._interval = interval_seconds
-        self._task: asyncio.Task | None = None
         self._webhooks = webhook_dispatcher
         # Defaults to LocalSecretProvider (pass-through) — see Pipeline's identical default and
         # rationale; app.py wires the real, settings-selected provider.
         self._secrets = secret_provider or LocalSecretProvider()
-
-    def start(self) -> None:
-        if self._task is None:
-            self._task = asyncio.create_task(self._loop())
-
-    async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                # Bounded: cancellation of a task parked in a plain asyncio.sleep() is normally
-                # near-instant, but under real ASGI server shutdown (uvicorn + anyio task
-                # groups from in-flight MCP sessions) this has been observed to stall well
-                # past that. A poller must never be allowed to block app shutdown indefinitely
-                # — abandon it after a bounded wait rather than hang the process.
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                logger.warning("health poller task did not stop within 5s; abandoning it")
-            self._task = None
 
     async def poll_once(self) -> None:
         # F12 fix, third half: even with probe_server() itself now fully guarded, wrap each

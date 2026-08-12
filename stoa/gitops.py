@@ -19,6 +19,7 @@ from typing import Optional
 
 import httpx
 
+from archon.background import BackgroundLoop
 from archon.config_io import ImportPlan, plan_import
 from archon.schemas import _validate_webhook_url
 from db.repo import ProjectRepo, ServerRepo, SettingsRepo
@@ -46,7 +47,7 @@ class DriftState:
     last_error: Optional[str] = None
 
 
-class ConfigSource:
+class ConfigSource(BackgroundLoop):
     """Polls a configured git/HTTPS source and computes drift against live state.
 
     Settings (read live from SettingsRepo on every poll):
@@ -65,6 +66,9 @@ class ConfigSource:
         ...
         await config_source.stop()
     """
+
+    _log_name = "gitops poll task"
+    _logger = logger
 
     def __init__(
         self,
@@ -85,9 +89,9 @@ class ConfigSource:
         self._http = http_client or httpx.AsyncClient(
             timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=False
         )
+        super().__init__()
         self._owns_http = http_client is None
         self._state = DriftState()
-        self._task: Optional[asyncio.Task] = None
         self._webhook_dispatcher = None  # set by app.py if webhooks enabled
         self._started = False
 
@@ -111,17 +115,8 @@ class ConfigSource:
             self._started = True
             self._task = asyncio.create_task(self._poll_loop())
 
-    async def stop(self) -> None:
+    async def _on_stop(self) -> None:
         self._started = False
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                logger.warning("gitops poll task did not stop within 5s; abandoning it")
-            self._task = None
         if self._owns_http:
             await self._http.aclose()
 

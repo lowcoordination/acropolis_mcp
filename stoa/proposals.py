@@ -11,6 +11,7 @@ import asyncio
 import logging
 
 from archon.approvals import ApprovalService
+from archon.background import BackgroundLoop
 from db.repo import SettingsRepo
 
 logger = logging.getLogger("stoa.proposals")
@@ -18,7 +19,7 @@ logger = logging.getLogger("stoa.proposals")
 DEFAULT_CHECK_INTERVAL_SECONDS = 3600.0
 
 
-class ProposalExpiryJob:
+class ProposalExpiryJob(BackgroundLoop):
     """Background task: expires pending proposals older than the live
     settings.approvals_ttl_days value.
 
@@ -29,31 +30,19 @@ class ProposalExpiryJob:
     needs its own gate.
     """
 
+    _log_name = "proposal expiry job"
+    _logger = logger
+
     def __init__(
         self,
         approvals: ApprovalService,
         settings_repo: SettingsRepo,
         check_interval_seconds: float = DEFAULT_CHECK_INTERVAL_SECONDS,
     ):
+        super().__init__()
         self._approvals = approvals
         self._settings_repo = settings_repo
         self._interval = check_interval_seconds
-        self._task: asyncio.Task | None = None
-
-    def start(self) -> None:
-        if self._task is None:
-            self._task = asyncio.create_task(self._loop())
-
-    async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                logger.warning("proposal expiry job did not stop within 5s; abandoning it")
-            self._task = None
 
     async def run_once(self) -> int:
         # All TTL/expiry logic lives in ApprovalService.expire_due so it is unit-testable

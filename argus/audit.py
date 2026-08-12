@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from archon.background import BackgroundLoop
 from db.repo import AuditRepo
 
 logger = logging.getLogger("argus.audit")
@@ -14,34 +15,26 @@ FLUSH_INTERVAL_SECONDS = 0.1
 MAX_BATCH_SIZE = 200
 
 
-class AuditLogger:
+class AuditLogger(BackgroundLoop):
     """Async queue -> batched INSERT into audit.db.
 
     Callers enqueue events without blocking on disk; a background task flushes
     on a fixed interval or when the batch grows large, whichever comes first.
     """
 
+    _log_name = "audit flush task"
+    _logger = logger
+
     def __init__(self, repo: AuditRepo) -> None:
+        super().__init__()
         self._repo = repo
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._flush_task: Optional[asyncio.Task] = None
         self._subscribers: set[asyncio.Queue] = set()
 
-    def start(self) -> None:
-        if self._flush_task is None:
-            self._flush_task = asyncio.create_task(self._flush_loop())
-
-    async def stop(self) -> None:
-        if self._flush_task is not None:
-            self._flush_task.cancel()
-            try:
-                await asyncio.wait_for(self._flush_task, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                logger.warning("audit flush task did not stop within 5s; abandoning it")
-            self._flush_task = None
-        # Drain anything left in the queue on shutdown.
+    async def _on_stop(self) -> None:
+        # Drain anything left in the queue on shutdown. Bounded like the task join (in the
+        # base) — this is a DB write precisely when the pool is most likely to be contended,
+        # and an unbounded flush here used to be able to hang app shutdown (issue #48).
         try:
             await asyncio.wait_for(self._flush_batch(), timeout=5.0)
         except asyncio.TimeoutError:
@@ -119,7 +112,7 @@ class AuditLogger:
                 # drop the event for that one subscriber (their tail will show a gap, not stall).
                 logger.warning("audit tail subscriber queue full, dropping event")
 
-    async def _flush_loop(self) -> None:
+    async def _loop(self) -> None:
         while True:
             try:
                 await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
