@@ -35,12 +35,17 @@ class AuditLogger:
         if self._flush_task is not None:
             self._flush_task.cancel()
             try:
-                await self._flush_task
+                await asyncio.wait_for(self._flush_task, timeout=5.0)
             except asyncio.CancelledError:
                 pass
+            except asyncio.TimeoutError:
+                logger.warning("audit flush task did not stop within 5s; abandoning it")
             self._flush_task = None
         # Drain anything left in the queue on shutdown.
-        await self._flush_batch()
+        try:
+            await asyncio.wait_for(self._flush_batch(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("final audit flush did not complete within 5s; some events may be lost")
 
     async def log(
         self,

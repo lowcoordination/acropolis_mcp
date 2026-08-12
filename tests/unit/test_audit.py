@@ -61,6 +61,29 @@ async def test_log_and_flush_persists_event(db):
         await logger.stop()
 
 
+async def test_stop_is_bounded_when_flush_blocks(db, monkeypatch):
+    """Regression for #48: stop() must not hang shutdown when the final DB flush blocks.
+
+    Before the fix, both the task await and the final _flush_batch() were unbounded — a pool
+    contention stall during shutdown would block the lifespan finally block indefinitely,
+    leaking the shared httpx client, the secret provider's client, and unexported OTel spans
+    behind it. The bound is 5s per await; give stop() a generous margin and assert it returns
+    at all (and still cleans up the task reference).
+    """
+    logger = AuditLogger(AuditRepo(db))
+
+    async def _blocking_flush() -> None:
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(logger, "_flush_batch", _blocking_flush)
+
+    logger.start()
+    await logger.log(server_slug="fetch", tool=None, decision="PASSTHROUGH")
+
+    await asyncio.wait_for(logger.stop(), timeout=6.5)
+    assert logger._flush_task is None
+
+
 async def test_stop_drains_pending_queue(db):
     repo = AuditRepo(db)
     logger = AuditLogger(repo)
