@@ -62,7 +62,11 @@ class ProtocolBridge:
         self, server_id: int, upstream_url: str, rpc_method: str, rpc_id: Any, params: dict,
         meta: Optional[dict] = None, upstream_auth_header: Optional[str] = None,
     ) -> tuple[int, dict]:
-        """Returns (http_status, json_rpc_response_body) for a single bridged call."""
+        """Returns (http_status, json_rpc_response_body) for a single bridged call.
+
+        GEN_2026 bridged path (see the fork comment in Pipeline._process): protocol
+        translation. The passthrough counterpart is Pipeline._forward (argus/pipeline.py).
+        """
         meta = meta or {}
 
         if rpc_method in _2025_ONLY_LIFECYCLE_METHODS:
