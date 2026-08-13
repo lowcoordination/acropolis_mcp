@@ -192,56 +192,45 @@ there. This was a deliberate design boundary from the start of this milestone (c
 two would break every existing MCP client integration) and is regression-tested explicitly in
 `tests/integration/test_identity.py`.
 
-## Retiring the legacy session path
+## The legacy session path (retired)
 
-`archon/admin_auth.py` has four ways in, tried in order: the `admin_token` break-glass bearer,
-a session cookie carrying a `user_id`, a session cookie **without** one, and the
-"no admin configured yet" first-run window.
+`archon/admin_auth.py` has three ways in, tried in order: the `admin_token` break-glass bearer,
+a session cookie carrying a `user_id`, and the "no admin configured yet" first-run window.
 
-The third — the legacy user-less cookie — exists so a partially-applied upgrade degrades to
-"still works" rather than "locked out". It accepts a cookie issued before the identity milestone
-(or while `users` was empty), verified against the global `session_secret`/`session_version`.
+A fourth used to exist — a session cookie **without** a `user_id`, verified against the global
+`session_secret`/`session_version`. It existed so a partially-applied upgrade degraded to
+"still works" rather than "locked out": a cookie issued before the identity milestone, or while
+`users` was empty, would still authenticate.
 
-It is the only one of the four that can ever be retired. The break-glass bearer and the
-first-run window are permanent by design, and the user-bearing path is the normal one.
+**It has been retired** (issue #33 / R6). No argus deployment ever ran with real users through
+that migration boundary, so the condition it existed for never occurred and cannot retroactively
+occur now — there is no history to protect. `require_admin` now rejects a user_id-less cookie
+the same as any other malformed credential.
 
-### Check whether it is still reachable
+### If you're checking whether this affects you
 
 ```bash
 curl -s -b cookies.txt https://your-gateway/api/v1/diagnostics/legacy-session | jq
 ```
 
-```json
-{
-  "retirable": false,
-  "user_count": 3,
-  "session_version": 0,
-  "retired_at_session_version": null,
-  "reason": "3 user(s) exist, but session_version has not been bumped for retirement yet..."
-}
-```
+Always returns `"retirable": true` now — the endpoint is kept as a historical record and a
+regression tripwire (see its docstring), not a live gate. If you were relying on it to decide
+whether to run a retirement bump: you don't need to, the path is already gone.
 
-Admin-only, and it never mutates anything — a GET that invalidated every session in the fleet
-would be a surprising side effect.
+### The general procedure, for reference
 
-### Making it retirable
+A deployment that *did* have real session history — which no argus deployment does today, but a
+fork or a future feature reintroducing user-less sessions might — would need both of these
+before removal was safe, and would need to do the removal itself as code, not merely observe
+the diagnostic:
 
-Two conditions, both required:
-
-1. **`users` must be populated.** With zero users the legacy path is the *only* way a cookie
-   holder authenticates; removing it would lock you out of your own gateway. This is exactly the
-   partial-upgrade case the path was written for.
-2. **`session_version` must be bumped, and the bump recorded.** This is the load-bearing half.
-   A legacy cookie is only *provably* dead once a bump has invalidated it — without one,
-   "probably nobody still holds an old cookie" is a guess, and the cost of guessing wrong is a
-   locked-out admin.
-
-Bumping invalidates **every** outstanding session, including your own — everyone signs in again.
-Record the same value as `legacy_session_retired_at_version` so the diagnostic can tell a real
-retirement bump apart from routine version churn, and can detect a later rollback.
-
-Once `retirable` is `true`, path 3 in `require_admin` can be deleted along with
-`_LEGACY_ADMIN_PRINCIPAL`'s use there (it is still needed for the first-run window).
+1. **`users` populated.** With zero users the legacy path is the *only* way a cookie holder
+   authenticates; removing it locks the operator out.
+2. **`session_version` bumped, and the bump recorded** (the now-unused
+   `legacy_session_retired_at_version` settings key). A legacy cookie is only *provably* dead
+   once a bump has invalidated it — without one, "probably nobody still holds an old cookie" is
+   a guess whose failure mode is a locked-out admin. Bumping invalidates every outstanding
+   session, including the operator's own — everyone signs in again.
 
 ## Known limitations
 
