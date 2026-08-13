@@ -57,9 +57,13 @@ jobs:
       # doesn't reliably reap pip's own grandchild processes under degraded runner network
       # conditions); this step timeout is the outer backstop in case a future hang isn't one
       # that fix covers, not a substitute for it.
+      # -rs prints a one-line reason for every SKIPPED test. Without it `-q` reports only a
+      # count, and "N skipped" is indistinguishable between "an optional dependency is
+      # legitimately absent" and "a test suite you believed was running silently isn't" —
+      # a distinction that cost real debugging time on issue #31's Valkey backend.
       - name: Run pytest
         timeout-minutes: 15
-        run: python -m pytest -q
+        run: python -m pytest -q -rs
 
   frontend:
     runs-on: ubuntu-latest
