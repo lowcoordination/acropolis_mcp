@@ -33,7 +33,7 @@ Every audit row already carries the full attribution tuple: `api_key_id`, `serve
 `ts`, `latency_ms`, `decision` (see `argus/audit.py`). Attribution *data* was never the gap —
 durable *aggregation* and *enforcement* were. This feature adds both:
 
-- **`usage_rollups`** (migration `0010_usage_rollups.sql`, in `gateway.db`): one row per
+- **`usage_rollups`** (migration `0010_usage_rollups.sql`): one row per
   `(UTC hour bucket, api_key_id, server_id, tool)`, incremented synchronously in the same code
   path that writes the `tools/call` audit event (`argus/pipeline.py`). A rollup total can never
   drift from what the audit log shows for the same window — see
@@ -48,15 +48,20 @@ durable *aggregation* and *enforcement* were. This feature adds both:
 - **`GET /api/v1/usage`**, queryable by key/server/tool with a period picker (day/month/all).
 - **Threshold webhooks** (`quota` event) at 80%/100% of a key's quota, debounced per key+period.
 
-## Why rollups live in `gateway.db`, not `audit.db`
+## Why rollups are a separate table from `audit_events`
 
 `stoa/retention.py`'s `AuditRetentionJob` prunes `audit_events` on a rolling window (30 days by
-default). A usage rollup that lived in `audit.db` would silently lose exactly the history an
-operator most wants to look back over — "how much has this key used this month" needs to
-survive well past 30 days. This is the same reasoning that put `admin_events` in `gateway.db`
-rather than `audit.db` (see `db/repo.py`'s `AdminEventRepo` docstring): a high-value aggregate
-must survive the traffic-log retention job, because it answers a fundamentally different
-question than the traffic log does. `tests/integration/test_quotas.py::
+default). A usage rollup stored as part of that pruned data would silently lose exactly the
+history an operator most wants to look back over — "how much has this key used this month" needs
+to survive well past 30 days. This is the same reasoning that keeps `admin_events` outside the
+pruned set (see `db/repo.py`'s `AdminEventRepo` docstring): a high-value aggregate must survive
+the traffic-log retention job, because it answers a fundamentally different question than the
+traffic log does.
+
+(Pre-Postgres-cutover this was a split between two SQLite files, `gateway.db` and `audit.db` —
+hence the framing in older comments. Post-cutover they are tables in one Postgres database and
+the distinction is which rows the retention job deletes, not which file they live in. The
+reasoning is unchanged.) `tests/integration/test_quotas.py::
 TestRollupsMatchAuditRows::test_rollups_survive_audit_db_retention_pruning` proves this by
 actually running the retention job against real data and asserting the rollup total is
 untouched — not just asserting the table lives in the right file.
@@ -104,9 +109,27 @@ budget control, and forwarding some calls over budget under a burst is the same 
 guards each bucket's consume) — a rate limiter's entire job is bounding bursts, so an
 un-atomic check there would defeat the feature's own purpose in a way that doesn't apply here.
 
+### Running more than one replica
+
+The overshoot above is bounded by **how many requests are in flight simultaneously** — not by
+how many replicas you run. Ten concurrent requests overshoot by the same amount whether they
+arrive at one replica or five. Replica count matters only because it raises the concurrency you
+can actually reach: expect the observed overage to grow roughly in proportion, and size a tight
+quota with that in mind.
+
+What does **not** happen is the multiplication that affects rate limiting. Both halves of the
+quota window live in Postgres, which every replica shares — the read is
+`UsageRepo.total_since`, and the write is a single atomic upsert
+(`calls = usage_rollups.calls + excluded.calls`, race-free across concurrent writers without a
+lock). There is no per-process quota state to diverge, so a quota configured at 1000/month is
+still 1000/month across the fleet.
+
+Rate limiting is the opposite case and needs a shared backend before you scale out, because its
+default state genuinely is per-process — see [rate limiting](rate-limiting.md).
+
 ## Fail-open, deliberately — and why this differs from secret-resolution's fail-closed default
 
-**If the quota check itself fails — a `gateway.db` read error, a corrupted row, anything short
+**If the quota check itself fails — a database read error, a corrupted row, anything short
 of a clean "yes, over budget" result — the call is forwarded anyway, with an `ERROR`-level log.**
 This is a deliberate reversal of the fail-closed default `docs/secrets.md` establishes for
 credential resolution, and the difference is load-bearing enough to spell out explicitly rather
@@ -119,7 +142,7 @@ than leave as an inconsistency between two enterprise features:
 - **Quota checking fails open** because the worst case of forwarding one call that was actually
   over budget is a business problem — a bill that runs slightly over what was configured, or a
   server takes a few extra calls it would otherwise have been refused — not a security boundary.
-  Quota is a budget control, not an authorization control; a `gateway.db` hiccup taking down the
+  Quota is a budget control, not an authorization control; a database hiccup taking down the
   entire data plane over a soft budget limit would be a wildly disproportionate failure mode for
   what this feature actually protects against.
 
@@ -147,7 +170,7 @@ automatically, since `period_start` changes.
 **Payload contains only the key's prefix, its operator-assigned name, and the percentage
 crossed — never the key's plaintext or its hash.** The key's plaintext is only ever available at
 creation time (show-once by design, same as every other API key in this system); its SHA-256
-hash never leaves `gateway.db` for any reason, webhook payloads included.
+hash never leaves the database for any reason, webhook payloads included.
 `tests/integration/test_quotas.py::TestThresholdWebhook::
 test_payload_never_contains_key_plaintext_or_hash` asserts this against the actual bytes that
 left the process, not a mock's recorded call.

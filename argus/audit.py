@@ -16,10 +16,13 @@ MAX_BATCH_SIZE = 200
 
 
 class AuditLogger(BackgroundLoop):
-    """Async queue -> batched INSERT into audit.db.
+    """Async queue -> batched INSERT into the audit_events table.
 
-    Callers enqueue events without blocking on disk; a background task flushes
+    Callers enqueue events without blocking on the write; a background task flushes
     on a fixed interval or when the batch grows large, whichever comes first.
+
+    (Pre-Postgres-cutover this wrote to a separate audit.db SQLite file, which some older
+    comments still reference. It is one table in the shared database now.)
     """
 
     _log_name = "audit flush task"
