@@ -5,6 +5,7 @@ import pytest
 from argus.rate_limiter import (
     InMemoryBackend,
     RateLimitBackend,
+    RateLimitBackendUnavailable,
     RateLimiterRegistry,
     parse_spec,
     server_key,
@@ -174,3 +175,75 @@ async def test_a_real_caller_can_be_pointed_at_a_different_backend():
     )
     assert blocked is None  # _FakeBackend.check() never blocks
     assert server_key("demo") in fake.checked or tool_key("demo", "echo") in fake.checked
+
+
+class _FakeAuditLogger:
+    """Minimal stand-in for AuditLogger — records the (decision, rule) pairs _refuse logs,
+    without touching a real Database."""
+
+    def __init__(self) -> None:
+        self.rows: list[dict] = []
+
+    async def log(self, **kwargs) -> None:
+        self.rows.append(kwargs)
+
+
+class _UnavailableBackend:
+    """A RateLimitBackend whose storage cannot be reached — the shape a Redis/Valkey backend
+    takes when its connection drops. check_all must raise RateLimitBackendUnavailable, per the
+    Protocol's contract, never return a bool."""
+
+    def register(self, key: str, spec: str) -> None:
+        pass
+
+    def ensure_current(self, key: str, spec: str) -> None:
+        pass
+
+    def unregister(self, key: str) -> None:
+        pass
+
+    def is_registered(self, key: str) -> bool:
+        return False
+
+    async def check(self, key: str) -> bool:
+        raise RateLimitBackendUnavailable("simulated backend outage")
+
+    async def check_all(self, keys: list[str]) -> bool:
+        raise RateLimitBackendUnavailable("simulated backend outage")
+
+
+async def test_rate_limiter_fails_closed_when_backend_is_unavailable():
+    """Issue #31's fail-open-vs-fail-closed decision, proven through the real code path.
+
+    A backend that cannot be reached must produce a BLOCKED response (429), not let the call
+    through — see RateLimitBackendUnavailable's docstring for why this is the correct trade for
+    a control whose entire job is resisting an adversary who controls the load."""
+    from db.models import ServerPolicy, ServerRecord
+
+    from argus.pipeline import Pipeline
+
+    server = ServerRecord(
+        id=1, slug="demo", name="Demo", upstream_url="http://example.test",
+        enabled=True, in_aggregate=True, created_at="2026-01-01", updated_at="2026-01-01",
+    )
+    policy = ServerPolicy(rate_limit="5/minute")
+
+    pipeline = Pipeline.__new__(Pipeline)
+    pipeline._rate_limiter = _UnavailableBackend()
+    audit = _FakeAuditLogger()
+    pipeline._audit = audit
+
+    response = await pipeline._check_rate_limits(
+        server, policy, "echo", api_key_id=None, rpc_id=1, start=0.0, client_ip=None,
+    )
+
+    assert response is not None, "backend-unavailable must block the call, not let it through"
+    assert response.status_code == 429
+
+    assert len(audit.rows) == 1
+    row = audit.rows[0]
+    assert row["decision"] == "BLOCKED"
+    # Own rule value, distinguishable from a genuine over-limit block ("rate_limit") — an
+    # operator seeing this in the audit trail needs a different response (check the backend)
+    # than seeing a real rate_limit block (the configured limit is doing its job).
+    assert row["rule"] == "rate_limit_backend_unavailable"
