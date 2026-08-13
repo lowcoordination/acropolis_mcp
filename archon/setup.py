@@ -189,26 +189,29 @@ def build_setup_router(
         # user_repo.get_by_username("admin") regardless of body.username (which didn't even
         # exist as a field) -- ANY locally-created operator/viewer user was silently checked
         # against the ADMIN's password hash and could never log in. Fixed to resolve by
-        # body.username. The legacy settings.admin_password_hash fallback is now scoped
-        # specifically to username == "admin" with no matching users-table row -- that's the
-        # exact partial-migration case 0007_users.sql's non-negotiable ("partial upgrade
-        # degrades to still works") is about, and it must NOT silently extend to every other
-        # username (a request for a NONEXISTENT non-admin username has no business succeeding
-        # against the admin's hash just because verify_against would otherwise be undefined).
+        # body.username.
+        #
+        # Issue #33 (R6): this used to also fall back to `stored_hash` directly when
+        # username == "admin" and no matching users row existed — the partial-migration case
+        # 0006_users.sql's non-negotiable ("partial upgrade degrades to still works") existed
+        # for. Retired alongside archon/admin_auth.py's matching acceptance path: the users
+        # migration seeds a `users` row from admin_password_hash in the SAME transaction that
+        # sets it (0006_users.sql), so `stored_hash is not None` already implies a matching
+        # `users` row exists — this fallback's condition (hash set, no matching row) could
+        # never actually occur. Issuing a user_id-less cookie for it was dead capability, not a
+        # safety net; removing it means this handler always resolves through the real users
+        # table, with no second credential-verification shape to keep in sync.
         user = await user_repo.get_by_username(body.username) if user_repo is not None else None
         if user is not None:
             verify_against = user.password_hash
-        elif body.username == "admin":
-            verify_against = stored_hash
         else:
             verify_against = None
 
         if verify_against is None:
-            # No such user AND not the legacy-fallback-eligible "admin" case. Still run a dummy
-            # verify_password call against a syntactically-valid-but-unrelated hash so this
-            # branch takes roughly the same time as a real failed check — a login endpoint that
-            # returns instantly for "unknown username" and slowly for "wrong password" leaks
-            # username validity via timing.
+            # No such user. Still run a dummy verify_password call against a
+            # syntactically-valid-but-unrelated hash so this branch takes roughly the same time
+            # as a real failed check — a login endpoint that returns instantly for "unknown
+            # username" and slowly for "wrong password" leaks username validity via timing.
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, verify_password, body.admin_password, _DUMMY_HASH_FOR_TIMING)
             raise HTTPException(status_code=401, detail="incorrect password")
@@ -219,7 +222,10 @@ def build_setup_router(
         password_ok = await loop.run_in_executor(None, verify_password, body.admin_password, verify_against)
         if not password_ok:
             raise HTTPException(status_code=401, detail="incorrect password")
-        if user is not None and not user.enabled:
+        # `user` is never None here: verify_against is only ever set from user.password_hash
+        # above (issue #33 retired the other source), so reaching a passing password check
+        # means `user` resolved to a real row.
+        if not user.enabled:
             raise HTTPException(status_code=401, detail="account disabled")
 
         session_secret = await settings_repo.get("session_secret")
@@ -231,14 +237,11 @@ def build_setup_router(
             raise HTTPException(status_code=500, detail="server misconfigured: no session secret")
 
         current_version = await _current_session_version(settings_repo)
-        if user is not None:
-            await user_repo.touch_last_login(user.id)
-            token = create_session_token(
-                session_secret, session_version=current_version,
-                user_id=user.id, user_session_version=user.session_version,
-            )
-        else:
-            token = create_session_token(session_secret, session_version=current_version)
+        await user_repo.touch_last_login(user.id)
+        token = create_session_token(
+            session_secret, session_version=current_version,
+            user_id=user.id, user_session_version=user.session_version,
+        )
         response.set_cookie(
             SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
             httponly=True, samesite="lax", secure=_request_is_https(request),

@@ -232,10 +232,13 @@ async def test_per_user_revocation_logs_out_one_user_not_all(app_and_transport):
             assert resp_b.status_code == 200, "user B's session must be UNAFFECTED by user A's revocation"
 
 
-async def test_legacy_admin_session_still_works_when_users_table_has_no_matching_row(tmp_path: Path):
-    """Partial-upgrade guard: a session cookie with no user_id (issued by, or surviving from, a
-    pre-identity-milestone code path) must still authenticate via the legacy settings-based
-    check, exercising archon/admin_auth.py's path 3 directly."""
+async def test_legacy_user_less_session_is_rejected_post_retirement(tmp_path: Path):
+    """Issue #33 (R6): the legacy user-less session fallback (archon/admin_auth.py's former
+    path 3) is retired. A session cookie with no user_id — the exact shape the retired path
+    used to accept — must now be REJECTED, even when signed with the correct session_secret and
+    session_version, even when admin_password_hash is set. This is the inverse of what this
+    test asserted before the retirement; see git history for the pre-retirement version, which
+    proved the fallback worked. This version proves it no longer exists."""
     settings = Settings(
         data_dir=str(tmp_path), auth_mode="keyed", health_poll_enabled=False, audit_retention_enabled=False,
     )
@@ -248,19 +251,22 @@ async def test_legacy_admin_session_still_works_when_users_table_has_no_matching
         "session_secret": "legacy-secret",
         "session_version": "0",
     })
-    # No `users` row created — simulating an app that wrote settings directly without ever
-    # calling UserRepo (or a genuinely empty users table for any other reason).
+    # No `users` row created — simulating a cookie signed correctly but carrying no user_id,
+    # the shape the retired fallback existed to accept.
     app = create_app(settings, db)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        legacy_token = create_session_token(
+        legacy_shaped_token = create_session_token(
             "legacy-secret", session_version=0, user_id=None, user_session_version=DEFAULT_SESSION_VERSION,
         )
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://argus.test", cookies={SESSION_COOKIE_NAME: legacy_token},
+            transport=transport, base_url="http://argus.test",
+            cookies={SESSION_COOKIE_NAME: legacy_shaped_token},
         ) as client:
             resp = await client.get("/api/v1/servers")
-            assert resp.status_code == 200, "user-less legacy token must still authenticate via fallback"
+            assert resp.status_code == 401, (
+                "a user-less session token must be rejected now that the legacy fallback is retired"
+            )
     await db.close()
 
 

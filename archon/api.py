@@ -907,31 +907,23 @@ def build_control_plane_router(
             dependencies=[Depends(require_role("admin"))],
         )
         async def legacy_session_diagnostic():
-            """Reports whether archon/admin_auth.py's legacy user-less session path (path 3)
-            can still admit a request — the gate on retiring it (issue #33).
+            """Issue #33 (R6): reports on the legacy user-less session path's retirement.
 
-            Admin-only: it discloses whether an auth fallback is live, which is exactly the
-            sort of thing not to hand to a viewer.
+            RETIRED as of this commit — archon/admin_auth.py no longer has a code path that
+            accepts a session cookie with no user_id. This endpoint now always reports
+            retirable=True and exists as a historical record plus a tripwire: if a future
+            change ever reintroduces a user_id=None acceptance path without updating this
+            endpoint, `retirable` staying True while such a path exists would be a lie worth
+            catching in review, not a reason to trust this response blindly forever.
 
-            Reachability is `user_id is None or user_repo is None` at the path 3 branch. In any
-            real deployment `user_repo` is unconditionally wired (argus/app.py sets
-            app.state.user_repo with no branch), so the live condition is purely "a cookie
-            carrying no user_id is presented and still verifies."
-
-            Two things must hold before that path is safe to delete:
-
-            1. `users` is populated. With zero users, path 3 is the ONLY way a cookie holder
-               gets in — deleting it would lock the operator out of their own gateway, which is
-               precisely the partial-upgrade case the path was written for.
-            2. The global session_version has been bumped SINCE the identity milestone. This is
-               the load-bearing half: a legacy cookie is only provably dead once a bump has
-               invalidated it. Without a bump, "probably nobody has an old cookie" is a guess,
-               and the failure mode of guessing wrong is a locked-out admin.
-
-            The endpoint deliberately does NOT bump anything itself — a GET that invalidated
-            every session in the fleet would be a surprising side effect. Bumping is the
-            operator's explicit step (PUT the session_version, or use the retirement runbook in
-            docs/authentication.md).
+            Kept rather than deleted because it is cheap, harmless (admin-only, read-only), and
+            an operator who bookmarked or scripted against it should get a clear "already done"
+            rather than a 404. Pre-retirement, this endpoint required BOTH `users` populated and
+            an explicit session_version bump recorded as legacy_session_retired_at_version — see
+            git history and docs/authentication.md's retirement section for the general
+            procedure a deployment with real session history would need, which this codebase
+            skipped because no such history has ever existed (see Principal's docstring in
+            archon/admin_auth.py for why that was true here specifically).
             """
             user_count = await user_repo.count() if user_repo is not None else 0
             stored_version = await settings_repo.get("session_version")
@@ -941,42 +933,16 @@ def build_control_plane_router(
             stored_retired_at = await settings_repo.get("legacy_session_retired_at_version")
             retired_at = int(stored_retired_at) if stored_retired_at is not None else None
 
-            if user_count == 0:
-                retirable = False
-                reason = (
-                    "`users` is empty — the legacy path is currently the only way a cookie "
-                    "holder authenticates. Complete the first-run wizard / create at least one "
-                    "user before retiring it."
-                )
-            elif retired_at is None:
-                retirable = False
-                reason = (
-                    f"{user_count} user(s) exist, but session_version has not been bumped for "
-                    "retirement yet, so a legacy cookie issued before the identity milestone "
-                    "could still verify. Bump session_version and record it as "
-                    "`legacy_session_retired_at_version` to invalidate any survivor."
-                )
-            elif session_version < retired_at:
-                retirable = False
-                reason = (
-                    f"session_version ({session_version}) is BELOW the recorded retirement "
-                    f"bump ({retired_at}) — it appears to have been rolled back, which would "
-                    "revalidate cookies the bump invalidated."
-                )
-            else:
-                retirable = True
-                reason = (
-                    f"{user_count} user(s) exist and session_version ({session_version}) is at "
-                    f"or above the retirement bump ({retired_at}), so every cookie predating it "
-                    "is invalid. The legacy user-less path is unreachable and safe to remove."
-                )
-
             return LegacySessionDiagnosticResponse(
-                retirable=retirable,
+                retirable=True,
                 user_count=user_count,
                 session_version=session_version,
                 retired_at_session_version=retired_at,
-                reason=reason,
+                reason=(
+                    "The legacy user-less session path has been REMOVED from "
+                    "archon/admin_auth.py — this is no longer a live check, it reports on a "
+                    "completed retirement. See docs/authentication.md."
+                ),
             )
 
         @router.put("/settings", response_model=SettingsResponse)
