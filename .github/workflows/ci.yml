@@ -22,8 +22,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Includes the 'distributed' extra so tests/integration/test_rate_limit_valkey.py actually
+      # RUNS here rather than importorskip-ing itself away. Those tests stand up their own
+      # ephemeral Valkey via docker (same pattern as the Postgres fixture, which already relies
+      # on docker being present on ubuntu-latest) — the atomicity guarantee that backend exists
+      # to provide is exactly the kind of claim that must be exercised in CI, not skipped.
       - name: Install package + dev dependencies
-        run: python -m pip install --no-cache-dir '.[dev]'
+        run: python -m pip install --no-cache-dir '.[dev,distributed]'
 
       # Step-level timeout narrower than the job's own, so a hang here specifically produces a
       # clear "Run pytest" timeout rather than a generic job-level one — easier to diagnose from
