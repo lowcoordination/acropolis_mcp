@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Protocol, runtime_checkable
 
 
 class TokenBucket:
@@ -58,7 +59,65 @@ def tool_key(slug: str, tool_name: str) -> str:
     return f"srv:{slug}:tool:{tool_name}"
 
 
-class RateLimiterRegistry:
+@runtime_checkable
+class RateLimitBackend(Protocol):
+    """Storage/enforcement seam for rate limiting (issue #31, step 1 of the distributed
+    rate-limiting fix).
+
+    Every method here is what argus/pipeline.py, archon/setup.py, and archon/api.py actually
+    call today against `RateLimiterRegistry` — this Protocol exists to let a future
+    Redis/Valkey-backed implementation (issue #31's later steps) stand in for
+    `InMemoryBackend` without touching any caller. `InMemoryBackend` below is that seam's only
+    implementation for now; the storage is process-local, so — like the class it replaces —
+    each replica still enforces its own independent copy of every limit. See deploy/k8s's
+    replica-count comment and issue #31 for the multi-replica gap this interface exists to
+    eventually close, and issue #28 for why replicas stay capped at 1 until it does.
+
+    A distributed implementation is NOT required to keep the exact `TokenBucket` refill
+    algorithm — only the check-then-consume ATOMICITY guarantee that `check`/`check_all`
+    depend on (see `TokenBucket.consume`'s `asyncio.Lock`; a Redis backend would need an
+    equivalent, e.g. a single atomic Lua script, not a separate read then write).
+    """
+
+    def register(self, key: str, spec: str) -> None:
+        """Builds a FRESH bucket, resetting any consumed-token state for `key`."""
+        ...
+
+    def ensure_current(self, key: str, spec: str) -> None:
+        """(Re)registers `key` only if `spec` differs from what it was last registered with,
+        or if it isn't registered at all. Must NOT touch existing consumed-token state when
+        the spec is unchanged — see RateLimiterRegistry's docstring history (issue F8) for why
+        that distinction is load-bearing, not incidental."""
+        ...
+
+    def unregister(self, key: str) -> None:
+        ...
+
+    def is_registered(self, key: str) -> bool:
+        ...
+
+    async def check(self, key: str) -> bool:
+        """Returns True if the call is allowed, False if rate-limited. A key with no
+        registered bucket is treated as unlimited."""
+        ...
+
+    async def check_all(self, keys: list[str]) -> bool:
+        """All-or-nothing check across several buckets (e.g. server + tool + api key)."""
+        ...
+
+
+class InMemoryBackend:
+    """Process-local `RateLimitBackend`: a dict of TokenBuckets, exactly as
+    `RateLimiterRegistry` behaved before the interface existed (issue #31).
+
+    This is the ONLY implementation of RateLimitBackend today. Its limitation is the entire
+    reason issue #31 exists: state lives in this process's memory, so N replicas each enforce
+    the full configured limit independently, multiplying the effective limit by N. Safe and
+    correct for the single-replica deployment this app currently requires (see deploy/k8s's
+    `replicas: 1` and issue #28); not safe to scale past that until a shared-state backend
+    (issue #31's later steps) replaces or supplements this one.
+    """
+
     def __init__(self) -> None:
         self._buckets: dict[str, TokenBucket] = {}
         # F8: tracks the spec string each key was last registered with, so ensure_current can
@@ -68,18 +127,10 @@ class RateLimiterRegistry:
         self._specs: dict[str, str] = {}
 
     def register(self, key: str, spec: str) -> None:
-        """Builds a FRESH bucket, resetting any consumed-token state for `key`. Call this when
-        the spec has genuinely changed (see ensure_current for the common "is it still the same
-        limit" case) or when a bucket is being registered for the first time."""
         self._buckets[key] = parse_spec(spec)
         self._specs[key] = spec
 
     def ensure_current(self, key: str, spec: str) -> None:
-        """(Re)registers `key` only if `spec` differs from what it was last registered with, or
-        if it isn't registered at all. A no-op — and critically, does NOT touch the existing
-        bucket's consumed-token state — when the policy hasn't changed since the last call.
-        This is what makes it safe to call on every request without defeating the limit by
-        resetting every caller to a fresh full bucket each time."""
         if self._specs.get(key) != spec:
             self.register(key, spec)
 
@@ -91,16 +142,22 @@ class RateLimiterRegistry:
         return key in self._buckets
 
     async def check(self, key: str) -> bool:
-        """Returns True if the call is allowed, False if rate-limited.
-        A key with no registered bucket is treated as unlimited."""
         bucket = self._buckets.get(key)
         if bucket is None:
             return True
         return await bucket.consume()
 
     async def check_all(self, keys: list[str]) -> bool:
-        """All-or-nothing check across several buckets (e.g. server + tool + api key)."""
         for key in keys:
             if not await self.check(key):
                 return False
         return True
+
+
+# Every existing caller (argus/app.py, argus/pipeline.py, archon/setup.py, archon/api.py) and
+# every existing test constructs/type-hints `RateLimiterRegistry` by name. Aliasing rather than
+# replacing it keeps all of that working unchanged — "in-memory remains default and
+# behaviourally unchanged" (issue #31's acceptance criteria) with the least motion. Revisit this
+# once a second backend exists and callers need to choose between them; a selection mechanism
+# ahead of having anything to select is speculative.
+RateLimiterRegistry = InMemoryBackend

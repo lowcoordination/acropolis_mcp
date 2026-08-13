@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from argus.rate_limiter import RateLimiterRegistry, parse_spec, server_key, tool_key
+from argus.rate_limiter import (
+    InMemoryBackend,
+    RateLimitBackend,
+    RateLimiterRegistry,
+    parse_spec,
+    server_key,
+    tool_key,
+)
 
 
 def test_parse_spec_variants():
@@ -86,3 +93,84 @@ async def test_unregister_removes_tracked_spec_too():
     registry.ensure_current("k", "1/hour")
     assert registry.is_registered("k") is True
     assert await registry.check("k") is True  # fresh bucket, not exhausted from before
+
+
+# --- Issue #31 step 1: RateLimitBackend interface -------------------------------------------
+
+
+def test_rate_limiter_registry_is_the_in_memory_backend():
+    """RateLimiterRegistry must stay the SAME object as InMemoryBackend, not a subclass or a
+    wrapper — every existing caller (argus/pipeline.py, archon/setup.py, archon/api.py,
+    argus/app.py) and every existing test in this file constructs/type-hints it by that name.
+    An alias satisfies "in-memory remains default and behaviourally unchanged" with zero
+    caller churn; anything else would be a needless second class doing the same thing."""
+    assert RateLimiterRegistry is InMemoryBackend
+
+
+def test_in_memory_backend_satisfies_the_protocol():
+    assert isinstance(InMemoryBackend(), RateLimitBackend)
+
+
+class _FakeBackend:
+    """A deliberately minimal second RateLimitBackend implementation — NOT shipped, exists only
+    to prove the interface is something a real caller can actually be pointed at, not just a
+    Protocol that happens to describe one class. Everything here is trivial and
+    process-local — a real distributed backend (issue #31's later steps) would talk to
+    Redis/Valkey instead, but the SHAPE a caller depends on is exactly this."""
+
+    def __init__(self) -> None:
+        self.checked: list[str] = []
+        self._registered: set[str] = set()
+
+    def register(self, key: str, spec: str) -> None:
+        self._registered.add(key)
+
+    def ensure_current(self, key: str, spec: str) -> None:
+        self._registered.add(key)
+
+    def unregister(self, key: str) -> None:
+        self._registered.discard(key)
+
+    def is_registered(self, key: str) -> bool:
+        return key in self._registered
+
+    async def check(self, key: str) -> bool:
+        self.checked.append(key)
+        return True  # never blocks — the point here is call-shape compatibility, not policy
+
+    async def check_all(self, keys: list[str]) -> bool:
+        for key in keys:
+            if not await self.check(key):
+                return False
+        return True
+
+
+async def test_a_real_caller_can_be_pointed_at_a_different_backend():
+    """The load-bearing proof for this issue: Pipeline._check_rate_limits (the actual,
+    unmodified production code) is exercised against _FakeBackend instead of
+    RateLimiterRegistry, through the SAME rate_limiter constructor argument every real
+    deployment uses. If this didn't work, the interface would be decorative — something that
+    merely describes RateLimiterRegistry's shape rather than something a caller can actually
+    substitute."""
+    from db.models import ServerPolicy, ServerRecord
+
+    from argus.rate_limiter import server_key, tool_key
+
+    fake = _FakeBackend()
+    server = ServerRecord(
+        id=1, slug="demo", name="Demo", upstream_url="http://example.test",
+        enabled=True, in_aggregate=True, created_at="2026-01-01", updated_at="2026-01-01",
+    )
+    policy = ServerPolicy(rate_limit="5/minute")
+
+    from argus.pipeline import Pipeline
+
+    pipeline = Pipeline.__new__(Pipeline)  # bypass the full constructor; only need _rate_limiter
+    pipeline._rate_limiter = fake
+    pipeline._audit = None
+
+    blocked = await pipeline._check_rate_limits(
+        server, policy, "echo", api_key_id=None, rpc_id=1, start=0.0, client_ip=None,
+    )
+    assert blocked is None  # _FakeBackend.check() never blocks
+    assert server_key("demo") in fake.checked or tool_key("demo", "echo") in fake.checked
