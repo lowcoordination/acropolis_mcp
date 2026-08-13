@@ -109,6 +109,35 @@ async def _pool_exhausted_handler(request: Request, exc: Exception) -> Response:
     )
 
 
+def _build_rate_limiter(settings: Settings):
+    """Select the rate-limit backend from settings (issue #31).
+
+    "memory" (the default) is InMemoryBackend — correct for the single-replica deployment
+    deploy/k8s enforces today. "valkey" shares token buckets across replicas and is required
+    before scaling past 1 replica; see issue #31 and issue #28's replica-count comment.
+
+    Both failure modes raise at BOOT rather than degrading at request time: an unknown backend
+    name, or "valkey" with no URL configured. The fail-closed posture makes that distinction
+    matter — a valkey backend that can't reach its server 429s every request, so an operator
+    who typo'd the setting needs to find out at startup, not from a support ticket.
+    """
+    backend = (settings.rate_limit_backend or "memory").strip().lower()
+    if backend == "memory":
+        return RateLimiterRegistry()
+    if backend == "valkey":
+        if not settings.rate_limit_backend_url:
+            raise ValueError(
+                "rate_limit_backend='valkey' requires rate_limit_backend_url "
+                "(e.g. redis://valkey:6379/0)"
+            )
+        from argus.rate_limit_valkey import build_valkey_backend
+
+        return build_valkey_backend(settings.rate_limit_backend_url)
+    raise ValueError(
+        f"unknown rate_limit_backend {backend!r} — expected 'memory' or 'valkey'"
+    )
+
+
 def create_app(
     settings: Settings,
     db: Database,
@@ -145,7 +174,10 @@ def create_app(
     usage_repo = UsageRepo(db)
 
     api_keys = ApiKeyService(api_key_repo)
-    rate_limiter = RateLimiterRegistry()
+    # Issue #31: selected once at startup, same "fail loudly at boot rather than mysteriously on
+    # the first request" reasoning as secret_provider below. A typo'd backend name or a valkey
+    # backend with no URL must not start and then 429 every request once traffic arrives.
+    rate_limiter = _build_rate_limiter(settings)
     audit = AuditLogger(audit_repo)
     # Selected once at startup from settings.secret_provider ("local" by default). Constructed
     # here — not lazily per-request — so a misconfigured key/Vault address

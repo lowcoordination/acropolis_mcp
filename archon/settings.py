@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     db_writer_pool_max: int = 5
     db_reader_pool_max: int = 10
 
+    # Rate-limit backend (issue #31). "memory" (default) keeps token buckets in this process,
+    # which is correct for the single-replica deployment deploy/k8s currently enforces but means
+    # N replicas would each enforce a full independent copy of every limit. "valkey" puts the
+    # buckets in one Valkey/Redis all replicas share — required before scaling past 1 replica.
+    # Needs the optional extra: pip install 'acropolis[distributed]'.
+    rate_limit_backend: str = "memory"
+    rate_limit_backend_url: str | None = None
+
     # "open" = no API key required (trusted LAN); "keyed" = Bearer key required on /mcp/*
     auth_mode: str = "keyed"
 

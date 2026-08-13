@@ -26,6 +26,25 @@ services:
       retries: 10
       start_period: 10s
 
+  # Issue #31: shared rate-limit state, only needed when running more than one replica. Commented
+  # out because this compose file runs a SINGLE acropolis container, where InMemoryBackend is
+  # correct and a Valkey server would be pure overhead. Uncomment this service AND the two
+  # ACROPOLIS_RATE_LIMIT_* vars on the acropolis service below if you scale this out.
+  #
+  # valkey:
+  #   image: valkey/valkey:8-alpine
+  #   container_name: acropolis-valkey
+  #   restart: unless-stopped
+  #   command: ["valkey-server", "--save", "", "--appendonly", "no"]
+  #   # Rate-limit buckets are ephemeral by design: losing them on restart means every bucket
+  #   # refills to full, which is a brief under-enforcement, not corruption. Persistence would
+  #   # buy nothing and cost disk I/O on the request hot path.
+  #   healthcheck:
+  #     test: ["CMD", "valkey-cli", "ping"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 10
+
   acropolis:
     build:
       context: ..
@@ -65,6 +84,11 @@ services:
       # "open" = no API key needed on /mcp/* (fine for a trusted LAN); "keyed" requires
       # a Bearer API key on every data-plane request. Also set from the first-run wizard.
       - ACROPOLIS_AUTH_MODE=${ACROPOLIS_AUTH_MODE:-keyed}
+      # Issue #31: uncomment BOTH of these (and the valkey service above) to share rate-limit
+      # state across replicas. Requires the image to be built with the 'distributed' extra.
+      # Leaving them unset keeps the process-local default, correct for a single container.
+      # - ACROPOLIS_RATE_LIMIT_BACKEND=valkey
+      # - ACROPOLIS_RATE_LIMIT_BACKEND_URL=redis://valkey:6379/0
 
 volumes:
   acropolis-data:

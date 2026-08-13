@@ -247,3 +247,38 @@ async def test_rate_limiter_fails_closed_when_backend_is_unavailable():
     # operator seeing this in the audit trail needs a different response (check the backend)
     # than seeing a real rate_limit block (the configured limit is doing its job).
     assert row["rule"] == "rate_limit_backend_unavailable"
+
+
+# --- Issue #31: backend selection in create_app ---------------------------------------------
+
+
+def test_default_backend_is_in_memory():
+    """The default must stay in-memory: a single-replica deployment (what deploy/k8s enforces)
+    should never be made to run a Valkey server it doesn't need."""
+    from archon.settings import Settings
+
+    from argus.app import _build_rate_limiter
+
+    assert isinstance(_build_rate_limiter(Settings(data_dir="/tmp/argus-test")), InMemoryBackend)
+
+
+def test_valkey_backend_requires_a_url():
+    """Boot-time failure, not request-time. With the fail-closed posture a misconfigured valkey
+    backend 429s every request, so an operator must find out at startup."""
+    from archon.settings import Settings
+
+    from argus.app import _build_rate_limiter
+
+    settings = Settings(data_dir="/tmp/argus-test", rate_limit_backend="valkey")
+    with pytest.raises(ValueError, match="requires rate_limit_backend_url"):
+        _build_rate_limiter(settings)
+
+
+def test_unknown_backend_name_fails_at_boot():
+    from archon.settings import Settings
+
+    from argus.app import _build_rate_limiter
+
+    settings = Settings(data_dir="/tmp/argus-test", rate_limit_backend="nope")
+    with pytest.raises(ValueError, match="unknown rate_limit_backend"):
+        _build_rate_limiter(settings)

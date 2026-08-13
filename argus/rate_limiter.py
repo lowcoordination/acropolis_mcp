@@ -30,8 +30,14 @@ class TokenBucket:
             return False
 
 
-def parse_spec(spec: str) -> TokenBucket:
-    """Parse '5/minute' | '30/hour' | '100/second' into a TokenBucket."""
+def parse_spec_parts(spec: str) -> tuple[int, float]:
+    """Parse '5/minute' | '30/hour' | '100/second' into (calls, period_seconds).
+
+    Split out from parse_spec so a backend that does NOT build a local TokenBucket (the Valkey
+    backend passes the raw numbers to a Lua script) shares this exact grammar rather than
+    reimplementing it — two parsers for one operator-facing spec string is how a '5/minute' that
+    means different things in different backends gets born.
+    """
     parts = spec.strip().split("/")
     if len(parts) != 2:
         raise ValueError(f"Invalid rate limit spec: {spec!r}. Use 'N/minute'.")
@@ -40,6 +46,12 @@ def parse_spec(spec: str) -> TokenBucket:
     period = {"second": 1.0, "minute": 60.0, "hour": 3600.0}.get(unit)
     if period is None:
         raise ValueError(f"Unknown period {unit!r}. Use second/minute/hour.")
+    return count, period
+
+
+def parse_spec(spec: str) -> TokenBucket:
+    """Parse '5/minute' | '30/hour' | '100/second' into a TokenBucket."""
+    count, period = parse_spec_parts(spec)
     return TokenBucket(count, period)
 
 
