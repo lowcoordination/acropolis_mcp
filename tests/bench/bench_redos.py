@@ -26,6 +26,9 @@ Scope note, same as bench_dlp.py's: this measures the POLICY-EVALUATION layer, n
 tools/call path — the forkserver spawn dominates the added cost, so a full-pipeline bench
 would measure the same number plus fixed overhead (auth/policy fetch/audit enqueue) that is
 identical on and off. The go/no-go decision only needs the delta, and this isolates it.
+
+Shares the stats/timing/argument machinery with the other benches via tests/bench/_harness.py
+(the epic's harness issue).
 """
 from __future__ import annotations
 
@@ -39,12 +42,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from argus.policy import evaluate  # noqa: E402
 from db.models import ParamRule, ServerPolicy  # noqa: E402
+from tests.bench._harness import (  # noqa: E402
+    iters, percentile, representative_arguments, time_call,
+)
 
-ITERATIONS = 100
-WARMUP_ITERATIONS = 15
+ITERATIONS = iters(100, 5)
+WARMUP_ITERATIONS = iters(15, 2)
 CONCURRENCY_LEVELS = (1, 8, 16, 24, 32, 64)
-CONCURRENCY_ITERATIONS = 30
-TIMEOUT_ITERATIONS = 8  # adversarial case is deliberately small — each run costs ~0.5s
+CONCURRENCY_ITERATIONS = iters(30, 3)
+TIMEOUT_ITERATIONS = iters(8, 1)  # adversarial case is deliberately small — each run costs ~0.5s
 
 NO_RULES_POLICY = ServerPolicy(mode="passthrough")
 
@@ -67,40 +73,17 @@ SLOW_PATTERN_POLICY = ServerPolicy(
 SLOW_ARGUMENT = {"query": "a" * 31 + "b"}
 
 
-def _representative_arguments(size_label: str) -> dict:
-    filler = (
-        "The quick brown fox jumps over the lazy dog. Lorem ipsum dolor sit amet, consectetur "
-        "adipiscing elit. "
-    )
-    if size_label == "small":
-        return {"query": "find all TODO comments in the repo", "limit": 20}
-    if size_label == "medium":
-        return {"message": filler * 10, "channel": "general"}
-    if size_label == "large":
-        return {"content": filler * 200, "path": "/tmp/report.txt"}
-    raise ValueError(size_label)
-
-
-def _percentile(samples: list[float], pct: float) -> float:
-    if len(samples) >= 100:
-        return statistics.quantiles(samples, n=100)[int(pct) - 1]
-    return max(samples)
-
-
 async def _time_evaluate(policy: ServerPolicy, arguments: dict, iterations: int) -> list[float]:
-    samples = []
-    for _ in range(iterations):
-        start = time.perf_counter()
-        await evaluate("bench_tool", arguments, "bench-server", policy)
-        samples.append((time.perf_counter() - start) * 1000)  # ms
-    return samples
+    return await time_call(
+        lambda: evaluate("bench_tool", arguments, "bench-server", policy), iterations
+    )
 
 
 async def _bench_single_match() -> dict:
     """Part 1: added per-match cost of one block_pattern vs. no rules, by argument size."""
     report = {"part": "single-match", "rows": []}
     for size_label in ("small", "medium", "large"):
-        arguments = _representative_arguments(size_label)
+        arguments = representative_arguments(size_label)
         arg_bytes = sum(len(str(v)) for v in arguments.values())
 
         # Warm up (forkserver's first spawn is meaningfully slower than steady state).
@@ -114,9 +97,9 @@ async def _bench_single_match() -> dict:
                 "size": size_label,
                 "arg_bytes": arg_bytes,
                 "no_rules_p50_ms": round(statistics.median(off), 3),
-                "no_rules_p99_ms": round(_percentile(off, 99), 3),
+                "no_rules_p99_ms": round(percentile(off, 99), 3),
                 "block_pattern_p50_ms": round(statistics.median(on), 3),
-                "block_pattern_p99_ms": round(_percentile(on, 99), 3),
+                "block_pattern_p99_ms": round(percentile(on, 99), 3),
                 "added_p50_ms": round(statistics.median(on) - statistics.median(off), 3),
             }
         )
@@ -132,7 +115,7 @@ async def _bench_concurrency() -> dict:
     latency. Fewer iterations than Part 1 because each match costs ~100ms here (the forkserver
     spawn) — 64 × 30 matches at 16-way parallelism is already ~12s of wall time."""
     report = {"part": "concurrency", "rows": []}
-    arguments = _representative_arguments("small")
+    arguments = representative_arguments("small")
     await _time_evaluate(WITH_BLOCK_PATTERN_POLICY, arguments, WARMUP_ITERATIONS)
 
     for n in CONCURRENCY_LEVELS:
@@ -155,7 +138,7 @@ async def _bench_concurrency() -> dict:
                 "wall_secs": round(wall_secs, 2),
                 "matches_per_sec": round(total_matches / wall_secs, 1),
                 "p50_ms": round(statistics.median(samples), 3),
-                "p99_ms": round(_percentile(samples, 99), 3),
+                "p99_ms": round(percentile(samples, 99), 3),
             }
         )
     return report
@@ -187,7 +170,7 @@ async def _bench_timeout_path() -> dict:
                 "matches": n * 2,
                 "wall_secs": round(wall_secs, 2),
                 "p50_ms": round(statistics.median(samples), 1),
-                "p99_ms": round(_percentile(samples, 99), 1),
+                "p99_ms": round(percentile(samples, 99), 1),
             }
         )
     return report
