@@ -76,6 +76,14 @@ def _wait_ready(url: str, timeout: float = 30.0) -> None:
 
 @pytest.fixture(scope="session")
 def valkey_url():
+    """A live Valkey. Same sourcing order as conftest.py's Postgres fixture.
+
+    In CI these tests MUST run, not skip: the atomicity guarantee this backend exists to
+    provide is exactly the kind of claim a silent skip would let rot. So when CI is detected
+    and no server can be obtained, fail loudly instead — matching conftest.py's own stated
+    principle that "a green run that silently tested nothing would be the single worst
+    outcome." Locally, skipping is the right courtesy for a developer without docker.
+    """
     preset = os.environ.get("ACROPOLIS_TEST_VALKEY_URL")
     if preset:
         _wait_ready(preset)
@@ -83,7 +91,15 @@ def valkey_url():
         return
 
     if not _docker_available():
-        pytest.skip("docker unavailable and ACROPOLIS_TEST_VALKEY_URL unset")
+        message = (
+            "no Valkey available: docker is unusable and ACROPOLIS_TEST_VALKEY_URL is unset"
+        )
+        if os.environ.get("CI"):
+            raise RuntimeError(
+                f"{message}. These tests must not skip in CI — add a valkey service container "
+                "or set ACROPOLIS_TEST_VALKEY_URL."
+            )
+        pytest.skip(message)
 
     url = _start_container()
     try:

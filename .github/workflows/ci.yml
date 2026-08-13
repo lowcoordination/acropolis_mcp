@@ -15,6 +15,22 @@ jobs:
     # Postgres container) without being so tight that ordinary day-to-day variance in shared
     # runner load starts producing false-positive timeouts.
     timeout-minutes: 20
+    # Issue #31: provided as a service container rather than left to the test fixture's own
+    # `docker run` fallback, so these tests are deterministically RUN here rather than skipped.
+    # The backend's whole value is an atomicity guarantee under concurrency — a claim that must
+    # be exercised in CI, not quietly importorskip-ed away.
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 63801:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      ACROPOLIS_TEST_VALKEY_URL: redis://127.0.0.1:63801/0
     steps:
       - uses: actions/checkout@v4
 
@@ -22,11 +38,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Includes the 'distributed' extra so tests/integration/test_rate_limit_valkey.py actually
-      # RUNS here rather than importorskip-ing itself away. Those tests stand up their own
-      # ephemeral Valkey via docker (same pattern as the Postgres fixture, which already relies
-      # on docker being present on ubuntu-latest) — the atomicity guarantee that backend exists
-      # to provide is exactly the kind of claim that must be exercised in CI, not skipped.
+      # The 'distributed' extra is required for tests/integration/test_rate_limit_valkey.py to
+      # import at all (it importorskips on `redis`). Paired with the valkey service container
+      # above, which supplies ACROPOLIS_TEST_VALKEY_URL — both are needed, and the fixture now
+      # raises rather than skips when CI is set and neither is available.
       - name: Install package + dev dependencies
         run: python -m pip install --no-cache-dir '.[dev,distributed]'
 
