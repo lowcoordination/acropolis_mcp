@@ -6,30 +6,32 @@ metadata:
   labels:
     app: acropolis
 spec:
-  # DO NOT raise this without reading the following.
+  # Raising this is SUPPORTED, but has a hard prerequisite — read docs/rate-limiting.md first.
   #
-  # Rate limiting is PROCESS-LOCAL: RateLimiterRegistry (argus/rate_limiter.py) holds its token
-  # buckets in an in-memory dict with no shared backing store. N replicas therefore enforce N
-  # INDEPENDENT copies of every configured limit, so a 100/minute policy becomes 100*N/minute in
-  # practice. That is a silent security-control bypass, not a performance footnote: nothing logs
-  # it, no metric shows it, and the policy page keeps displaying the configured value.
+  # REQUIRED before replicas > 1: set ACROPOLIS_RATE_LIMIT_BACKEND=valkey (plus
+  # ACROPOLIS_RATE_LIMIT_BACKEND_URL). The default rate-limit backend keeps token buckets in
+  # process memory, so N replicas would enforce N INDEPENDENT copies of every configured limit —
+  # a 100/minute policy becoming 100*N/minute in practice. That is a silent security-control
+  # bypass: nothing logs it, no metric shows it, and the policy page keeps displaying the
+  # configured value. The Valkey backend puts the buckets in one store all replicas share.
   #
-  # Postgres (enterprise #7, issue #8) did remove the single-writer constraint SQLite had, so
-  # there is no longer a DATABASE reason to cap this at 1 — but the rate limiter is an
-  # independent constraint that the cutover did not address, and it still stands.
+  # Left at 1 as the DEFAULT because that is correct for a deployment that hasn't configured
+  # Valkey — which is every deployment out of the box. This is a default, not a prohibition.
   #
-  # A shared rate-limit backend now EXISTS (Valkey/Redis — see docs/rate-limiting.md and set
-  # ACROPOLIS_RATE_LIMIT_BACKEND=valkey), which removes the blocker described above. The cap
-  # stays at 1 here until the remaining items on issue #31 are done — a multi-replica test
-  # proving a shared limit actually holds across processes, and re-reviewing the quota path's
-  # accepted TOCTOU overshoot under multi-replica assumptions (its "bounded overshoot"
-  # reasoning was justified for ONE process; N replicas multiply the bound).
+  # Also size for the replica count when you raise it:
+  #   - Postgres max_connections vs. N * (ACROPOLIS_DB_WRITER_POOL_MAX +
+  #     ACROPOLIS_DB_READER_POOL_MAX) — see docs/postgres.md
   #
-  # Until then, scale vertically (resources below), not horizontally.
+  # Two behaviours change with N replicas and are worth knowing about (neither blocks scaling;
+  # both are documented in docs/rate-limiting.md's "What changes when you run more than one
+  # replica"):
+  #   - Webhook debounce/threshold state is per-process (stoa/webhooks.py), so a threshold alert
+  #     can fire up to once PER REPLICA rather than exactly once.
+  #   - Every replica runs its own health poller (stoa/health.py), multiplying upstream probe
+  #     traffic by the replica count.
   #
-  # When #31 lands and this cap is lifted, also size Postgres's own max_connections and this
-  # app's ACROPOLIS_DB_WRITER_POOL_MAX / ACROPOLIS_DB_READER_POOL_MAX (docs/postgres.md) for the
-  # total replica count.
+  # Quota enforcement is NOT affected: both halves of its window live in shared Postgres — see
+  # docs/quotas.md's "Running more than one replica".
   replicas: 1
   # No `strategy:` override — RollingUpdate (the Deployment default) is safe now. Pre-cutover
   # this was pinned to `Recreate` because SQLite's single-writer model meant two pods briefly
