@@ -192,6 +192,57 @@ there. This was a deliberate design boundary from the start of this milestone (c
 two would break every existing MCP client integration) and is regression-tested explicitly in
 `tests/integration/test_identity.py`.
 
+## Retiring the legacy session path
+
+`archon/admin_auth.py` has four ways in, tried in order: the `admin_token` break-glass bearer,
+a session cookie carrying a `user_id`, a session cookie **without** one, and the
+"no admin configured yet" first-run window.
+
+The third — the legacy user-less cookie — exists so a partially-applied upgrade degrades to
+"still works" rather than "locked out". It accepts a cookie issued before the identity milestone
+(or while `users` was empty), verified against the global `session_secret`/`session_version`.
+
+It is the only one of the four that can ever be retired. The break-glass bearer and the
+first-run window are permanent by design, and the user-bearing path is the normal one.
+
+### Check whether it is still reachable
+
+```bash
+curl -s -b cookies.txt https://your-gateway/api/v1/diagnostics/legacy-session | jq
+```
+
+```json
+{
+  "retirable": false,
+  "user_count": 3,
+  "session_version": 0,
+  "retired_at_session_version": null,
+  "reason": "3 user(s) exist, but session_version has not been bumped for retirement yet..."
+}
+```
+
+Admin-only, and it never mutates anything — a GET that invalidated every session in the fleet
+would be a surprising side effect.
+
+### Making it retirable
+
+Two conditions, both required:
+
+1. **`users` must be populated.** With zero users the legacy path is the *only* way a cookie
+   holder authenticates; removing it would lock you out of your own gateway. This is exactly the
+   partial-upgrade case the path was written for.
+2. **`session_version` must be bumped, and the bump recorded.** This is the load-bearing half.
+   A legacy cookie is only *provably* dead once a bump has invalidated it — without one,
+   "probably nobody still holds an old cookie" is a guess, and the cost of guessing wrong is a
+   locked-out admin.
+
+Bumping invalidates **every** outstanding session, including your own — everyone signs in again.
+Record the same value as `legacy_session_retired_at_version` so the diagnostic can tell a real
+retirement bump apart from routine version churn, and can detect a later rollback.
+
+Once `retirable` is `true`, path 3 in `require_admin` can be deleted along with
+`_LEGACY_ADMIN_PRINCIPAL`'s use there (it is still needed for the first-run window).
+
 ## Known limitations
 
 - **No settings-API/UI for OIDC configuration.** The OIDC settings above are set via the
