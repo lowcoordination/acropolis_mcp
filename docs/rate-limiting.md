@@ -99,3 +99,42 @@ bucket, same cap, same consume-one-per-call. The Valkey backend runs that algori
 atomic server-side script rather than a read-then-write from the client, so concurrent callers
 across replicas cannot race past the limit between the read and the write. Switching backends
 changes where the state lives, not what a limit means.
+
+## What changes when you run more than one replica
+
+Once the Valkey backend is configured, rate limiting itself behaves the same at any replica
+count — that is the whole point of it. Two *other* behaviours do change, and neither is a
+blocker, but both are easier to plan for than to discover in production.
+
+### Webhook threshold alerts can fire once per replica
+
+`stoa/webhooks.py` keeps its debounce window, its per-period "already fired this threshold"
+tracker, and its rate cap in **process memory**. With N replicas, each has its own copy.
+
+A quota threshold crossing that fires exactly once on a single replica can therefore fire up to
+N times across the fleet — one per replica that happens to serve a crossing request. The
+`exactly once` guarantee (`tests/integration/test_quotas.py::TestThresholdWebhook::
+test_concurrent_burst_crossing_threshold_fires_webhook_exactly_once`) is a **per-process**
+guarantee and always was; single-replica deployments simply never had a way to notice.
+
+This is alert volume, not correctness: no event is lost and none is wrong. If duplicate alerts
+matter to you, deduplicate downstream (most alerting systems group on a key), or keep the
+notification path on a single replica.
+
+### Every replica runs its own health poller
+
+`stoa/health.py`'s poller probes every enabled server on its own interval, per process. N
+replicas means N× the probe traffic against each registered upstream, and N replicas writing the
+same `set_health` rows.
+
+The writes are idempotent so nothing corrupts, but the upstream load is real: a fleet of 8
+servers polled every 60s by 5 replicas is 40 probes/minute, not 8. Either raise
+`ACROPOLIS_HEALTH_POLL_INTERVAL_SECONDS` in proportion, or disable polling on all but one
+replica with `ACROPOLIS_HEALTH_POLL_ENABLED=false`.
+
+### What does not change
+
+**Quota enforcement.** Both halves of the quota window live in shared Postgres, so a quota of
+1000/month stays 1000/month across the fleet — see [quotas](quotas.md#running-more-than-one-replica).
+
+**The tools cache.** It is backed by database rows, not process memory, so replicas share it.

@@ -64,29 +64,47 @@ Then open `http://localhost:8000` and finish setup, same as the
 
 ## Replica count
 
-**Keep this at 1.** Rate limiting is process-local — `RateLimiterRegistry`
-(`argus/rate_limiter.py`) holds its token buckets in an in-memory dict with no shared backing
-store, so N replicas enforce N independent copies of every configured limit. A policy set to
-100/minute actually allows 100×N/minute across the deployment.
+Running more than one replica is supported, with **one hard prerequisite**.
 
-Nothing surfaces this when it happens: no log line, no metric, and the policy page still shows
-the configured value. It is a silent bypass of a security control, which is why the cap is worth
-keeping even though it costs you horizontal scaling.
+### Required first: a shared rate-limit backend
+
+Set `ACROPOLIS_RATE_LIMIT_BACKEND=valkey` (and `ACROPOLIS_RATE_LIMIT_BACKEND_URL`) before
+raising `replicas`. See [docs/rate-limiting.md](../../docs/rate-limiting.md).
+
+The default backend keeps token buckets in process memory, so N replicas would enforce N
+independent copies of every configured limit — a policy set to 100/minute actually allowing
+100×N/minute. Nothing surfaces that when it happens: no log line, no metric, and the policy page
+still shows the configured value. It is a silent bypass of a security control, which is why this
+prerequisite is not optional.
+
+`deployment.yaml` ships `replicas: 1` because that is the correct **default** for a deployment
+that hasn't configured Valkey — which is every deployment out of the box. It is a default, not a
+prohibition.
+
+### Also size for the replica count
+
+Keep `N × (ACROPOLIS_DB_WRITER_POOL_MAX + ACROPOLIS_DB_READER_POOL_MAX)` under Postgres's
+`max_connections` — see [docs/postgres.md](../../docs/postgres.md).
+
+### Two behaviours change (neither blocks scaling)
+
+- **Webhook threshold alerts can fire up to once per replica** rather than exactly once. The
+  debounce and threshold-fired state in `stoa/webhooks.py` is per-process.
+- **Every replica runs its own health poller**, multiplying upstream probe traffic by the
+  replica count.
+
+Both are covered in docs/rate-limiting.md's "What changes when you run more than one replica".
+
+**Quota enforcement is not affected** — both halves of its window live in shared Postgres, so a
+quota of 1000/month stays 1000/month across the fleet. See
+[docs/quotas.md](../../docs/quotas.md).
+
+### History
 
 Pre-Postgres-cutover this was capped at 1 for a *different* reason — SQLite's single-writer
 model, with `strategy: Recreate` guaranteeing one pod touched the on-disk files at a time.
-Postgres (enterprise #7, issue #8) removed **that** constraint; concurrent writers are now
-Postgres's job. The rate limiter is a separate constraint the cutover did not address, and it
-still applies.
-
-A shared rate-limit backend now exists — Valkey/Redis, see
-[docs/rate-limiting.md](../../docs/rate-limiting.md) — which removes the blocker described
-above. The cap stays at 1 until the remaining items on
-[issue #31](https://github.com/lowcoordination/acropolis_mcp/issues/31) are done: a
-multi-replica test proving a shared limit holds across processes, and re-reviewing the quota
-path's accepted overshoot under multi-replica assumptions.
-
-Until then, scale vertically via the resource limits in `deployment.yaml`.
+Postgres (enterprise #7, issue #8) removed that constraint; concurrent writers are now
+Postgres's job.
 
 When #31 lands, size Postgres's `max_connections` and this app's own pool settings for the
 replica count you want — see [docs/postgres.md](../../docs/postgres.md).
