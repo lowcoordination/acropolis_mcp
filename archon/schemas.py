@@ -664,3 +664,30 @@ class ProjectMemberUpsertRequest(BaseModel):
         if not is_valid_project_role(v):
             raise ValueError(f"role must be one of viewer, poweruser, admin, got {v!r}")
         return v
+
+
+class LegacySessionDiagnosticResponse(BaseModel):
+    """Whether the legacy user-less session auth path (archon/admin_auth.py's path 3) can still
+    admit a request — the gate on retiring it (issue #33).
+
+    That path exists so a partially-applied upgrade degrades to "still works" rather than
+    "locked out": it accepts a cookie carrying no `user_id`, verified against the global
+    session_secret/session_version. It can only be removed once no such cookie can still be
+    valid, which is a DATA condition, not a code one — hence this endpoint rather than a
+    judgement call.
+    """
+
+    # True when the path is provably unreachable and safe to delete.
+    retirable: bool
+    # Populated `users` table is the precondition: with zero users, path 3 is the ONLY way in
+    # for a cookie holder and removing it would lock the operator out.
+    user_count: int
+    # The global session_version. Bumping it invalidates every outstanding cookie, user-bearing
+    # or not — which is what makes any surviving legacy cookie provably dead rather than merely
+    # unlikely.
+    session_version: int
+    # Set when this was bumped as part of the retirement (settings key
+    # "legacy_session_retired_at_version"); None if retirement hasn't been started.
+    retired_at_session_version: Optional[int] = None
+    # Human-readable explanation of `retirable` — what still blocks it, or why it's clear.
+    reason: str
