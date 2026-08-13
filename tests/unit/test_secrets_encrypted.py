@@ -83,9 +83,20 @@ async def test_wrong_key_fails_cleanly_not_garbage():
 async def test_corrupted_ciphertext_fails_cleanly():
     provider = _provider()
     ref = await provider.store("ignored", "Bearer sk-abc123")
-    # Flip a character in the base64 payload to corrupt the GCM tag/ciphertext.
+    # Flip the LAST character of the base64 payload to corrupt the GCM tag/ciphertext.
+    #
+    # Issue #59: this used to inspect tail[-1] to pick the replacement but write it to tail[0]
+    # (`(...) + tail[1:]`). When tail[0] already equalled the chosen character the "corrupted"
+    # ciphertext was byte-identical to the original, GCM validated it fine, and the test failed
+    # with DID NOT RAISE — measured at a 1.567% no-op rate over 200k random payloads, i.e. rare
+    # enough to pass locally and fail in CI every so often.
     tail = ref[len(PREFIX):]
-    corrupted_tail = ("A" if tail[-1] != "A" else "B") + tail[1:]
+    corrupted_tail = tail[:-1] + ("A" if tail[-1] != "A" else "B")
+    # The assertion that keeps this honest: without it, any future mutation bug silently
+    # degrades this into a test that proves nothing (the same defect class as the
+    # sqlite3.connect() entry in the anti-patterns notes — an "assert this fails" test needs a
+    # paired check that the failure condition was actually created).
+    assert corrupted_tail != tail, "corruption was a no-op — this test would prove nothing"
     corrupted_ref = PREFIX + corrupted_tail
     with pytest.raises(SecretResolutionError):
         await provider.resolve(corrupted_ref)
