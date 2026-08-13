@@ -13,11 +13,14 @@ risk surface is "did the schema port faithfully", is worth the seconds it costs.
 test can ever be polluted by a predecessor's rows, matching the pre-cutover guarantee exactly.
 
 Where the server comes from:
-  - ACROPOLIS_TEST_DATABASE_URL, if set, points at an already-running Postgres (this is what CI
-    uses — the workflow's `postgres:` service container — and what a developer with a local
-    instance uses).
+  - ACROPOLIS_TEST_DATABASE_URL, if set, points at an already-running Postgres — a developer
+    with a local instance, or any environment that wants to supply its own.
   - Otherwise the suite starts one via `docker run postgres:17-alpine` and tears it down at the
-    end of the session.
+    end of the session. This is the path CI currently takes: .github/workflows/ci.yml has a
+    `services:` block, but it declares only valkey (issue #31's rate-limit backend) and sets
+    only ACROPOLIS_TEST_VALKEY_URL — there is no `postgres:` service and no
+    ACROPOLIS_TEST_DATABASE_URL, so the docker fallback below is what actually provisions
+    Postgres on the runner.
   - If neither is possible, collection fails loudly with an actionable message rather than
     skipping. There is no SQLite path left to silently fall back to, and a green run that
     silently tested nothing would be the single worst outcome of this cutover.
