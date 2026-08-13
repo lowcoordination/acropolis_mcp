@@ -59,6 +59,46 @@ def tool_key(slug: str, tool_name: str) -> str:
     return f"srv:{slug}:tool:{tool_name}"
 
 
+class RateLimitBackendUnavailable(Exception):
+    """A distributed RateLimitBackend implementation must raise this — never return True, never
+    silently degrade to unlimited — when it cannot reach its storage (Redis/Valkey down,
+    connection refused, timeout) and therefore cannot answer `check`/`check_all` at all.
+
+    Issue #31's fail-open-vs-fail-closed decision: rate limiting fails CLOSED on backend
+    unavailability. `check`/`check_all` must raise this rather than return a boolean; callers
+    (Pipeline._check_rate_limits) treat it as "rate limit exceeded" (429), not as "unlimited."
+
+    This is a deliberate departure from the quota path's fail-open default
+    (Pipeline._check_quota) and a deliberate alignment with block_pattern's fail-closed default
+    (argus/policy.py's MatchOutcome.UNDETERMINED). The reasoning that decides it, not just
+    which precedent looks more familiar:
+
+    A rate limiter's entire purpose is to survive an adversary generating load. If the backend
+    fails open, an adversary doesn't need to defeat the token-bucket logic at all — they only
+    need to make the shared backend unavailable (contend it into timeouts, partition the
+    network, exhaust its connections), and every replica falls open AT ONCE. That is a strictly
+    easier attack than anything the rate limiter is supposed to stop, and the volume required to
+    trigger it is exactly the resource an attacker trying to bypass a rate limit already has by
+    definition. block_pattern's docstring names this exact shape: "fail-open-on-timeout meant a
+    request could disable enforcement just by generating enough concurrent load." Same shape,
+    same answer.
+
+    The quota path's fail-open default does NOT generalize here, and its own docstring says so:
+    "the two features have different jobs and different correctness requirements... quota is a
+    soft budget control." Quota answers "how much, over a period" and accepts a bounded
+    overshoot as a business cost. Rate limiting answers "how fast" and exists specifically to
+    resist bursts — a rate limiter that goes unlimited under exactly the conditions an attacker
+    would create is a limiter in name only.
+
+    Availability cost, paid deliberately: a Redis/Valkey outage that would have been invisible
+    under fail-open instead surfaces as 429s across the fleet. That is the correct trade for a
+    control whose job is resisting an adversary who controls the load, and it is loud rather
+    than a silent bypass — the same trade block_pattern already made. `InMemoryBackend` cannot
+    hit this path (a local dict has no "unavailable"); it exists for the Redis/Valkey backend
+    issue #31 still needs to build.
+    """
+
+
 @runtime_checkable
 class RateLimitBackend(Protocol):
     """Storage/enforcement seam for rate limiting (issue #31, step 1 of the distributed
@@ -77,6 +117,10 @@ class RateLimitBackend(Protocol):
     algorithm — only the check-then-consume ATOMICITY guarantee that `check`/`check_all`
     depend on (see `TokenBucket.consume`'s `asyncio.Lock`; a Redis backend would need an
     equivalent, e.g. a single atomic Lua script, not a separate read then write).
+
+    FAIL-CLOSED on backend unavailability — see `RateLimitBackendUnavailable`'s docstring for
+    the full reasoning. `InMemoryBackend` never raises it (nothing to be unavailable); a future
+    distributed backend must.
     """
 
     def register(self, key: str, spec: str) -> None:
@@ -98,11 +142,18 @@ class RateLimitBackend(Protocol):
 
     async def check(self, key: str) -> bool:
         """Returns True if the call is allowed, False if rate-limited. A key with no
-        registered bucket is treated as unlimited."""
+        registered bucket is treated as unlimited.
+
+        Raises `RateLimitBackendUnavailable` if the backend cannot be reached — never returns
+        True to mean "couldn't check." See that exception's docstring for why this fails
+        closed."""
         ...
 
     async def check_all(self, keys: list[str]) -> bool:
-        """All-or-nothing check across several buckets (e.g. server + tool + api key)."""
+        """All-or-nothing check across several buckets (e.g. server + tool + api key).
+
+        Raises `RateLimitBackendUnavailable` under the same conditions as `check` — a partial
+        result (some buckets checked, one unreachable) must not be treated as a pass."""
         ...
 
 
@@ -116,6 +167,10 @@ class InMemoryBackend:
     correct for the single-replica deployment this app currently requires (see deploy/k8s's
     `replicas: 1` and issue #28); not safe to scale past that until a shared-state backend
     (issue #31's later steps) replaces or supplements this one.
+
+    Never raises `RateLimitBackendUnavailable` — a process-local dict has no "unavailable"
+    state to fail out of. That exception exists for the distributed backend this class does
+    not yet have.
     """
 
     def __init__(self) -> None:

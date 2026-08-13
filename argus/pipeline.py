@@ -31,7 +31,12 @@ from argus.headers import (
 from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
 from argus.policy import Decision, evaluate
 from argus.quotas import period_start
-from argus.rate_limiter import RateLimiterRegistry, server_key, tool_key
+from argus.rate_limiter import (
+    RateLimitBackendUnavailable,
+    RateLimiterRegistry,
+    server_key,
+    tool_key,
+)
 from argus.toolslist import ToolsCache
 from argus.tracing import TracingManager, _DisabledTracingManager
 from db.database import utcnow
@@ -704,7 +709,30 @@ class Pipeline:
 
         keys = [srv_key] if policy.rate_limit else []
         keys.append(tool_key(server.slug, tool_name))
-        if not await self._rate_limiter.check_all(keys):
+        try:
+            allowed = await self._rate_limiter.check_all(keys)
+        except RateLimitBackendUnavailable:
+            # Issue #31: fail CLOSED, deliberately — see RateLimitBackendUnavailable's
+            # docstring for the reasoning (an adversary trying to bypass a rate limit already
+            # controls the load needed to make a shared backend unavailable; fail-open there
+            # would hand them the bypass for free). Own `rule` value so this is distinguishable
+            # in the audit trail from a genuine over-limit block — an operator seeing a spike of
+            # `rate_limit_backend_unavailable` needs a different response (check the backend)
+            # than one seeing `rate_limit` (the configured limit is doing its job).
+            logger.error(
+                "rate limit backend unavailable for server=%s tool=%s — failing closed",
+                server.slug, tool_name,
+            )
+            return await self._refuse(
+                server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
+                message="Rate limit unavailable", status=429,
+                rule="rate_limit_backend_unavailable",
+                reason="rate limit backend unreachable; failing closed",
+                api_key_id=api_key_id, start=start, client_ip=client_ip,
+                endpoint="per-server", rpc_method="tools/call",
+                data={"tool": tool_name},
+            )
+        if not allowed:
             return await self._refuse(
                 server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
                 message="Rate limit exceeded", status=429, rule="rate_limit",
