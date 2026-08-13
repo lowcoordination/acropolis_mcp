@@ -8,6 +8,9 @@ Run directly (not via pytest — this is a measurement tool, not a correctness t
 The numbers this script prints are what docs/dlp.md's "Performance" section reports. Re-run
 and update that doc if argus/dlp.py's detector set or matching strategy changes materially.
 
+Shares the stats/timing/argument machinery with the other benches via tests/bench/_harness.py
+(the epic's harness issue).
+
 Scope note: this measures ARGUMENT scanning only, matching the PR's scope (see docs/dlp.md).
 The "extrapolated response-scanning cost" section applies the same per-KB scanning rate to
 response-sized payloads to produce the honest, documented finding behind the decision to defer
@@ -19,16 +22,18 @@ from __future__ import annotations
 import asyncio
 import statistics
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from argus.policy import evaluate  # noqa: E402
 from db.models import DlpCustomPattern, ServerPolicy  # noqa: E402
+from tests.bench._harness import (  # noqa: E402
+    iters, percentile, print_latency_table, representative_arguments, time_call,
+)
 
-ITERATIONS = 300
-WARMUP_ITERATIONS = 20
+ITERATIONS = iters(300, 5)
+WARMUP_ITERATIONS = iters(20, 2)
 
 NO_DLP_POLICY = ServerPolicy(mode="passthrough")
 
@@ -63,41 +68,14 @@ WITH_CUSTOM_PATTERN_POLICY = ServerPolicy(
 )
 
 
-def _representative_arguments(size_label: str) -> dict:
-    """Argument shapes meant to be representative of real tool calls, not adversarial —
-    ordinary text with no DLP matches at all, since that's the common case a false-positive-
-    averse feature must stay cheap for."""
-    filler = (
-        "The quick brown fox jumps over the lazy dog. Lorem ipsum dolor sit amet, consectetur "
-        "adipiscing elit. "
-    )
-    if size_label == "small":
-        # A typical short tool call — e.g. a file path or a short search query.
-        return {"query": "find all TODO comments in the repo", "limit": 20}
-    if size_label == "medium":
-        # A paragraph-sized argument — e.g. a code review comment or a chat message tool arg.
-        return {"message": filler * 10, "channel": "general"}  # ~730 chars
-    if size_label == "large":
-        # A large single argument — e.g. a full file being written or a long document.
-        return {"content": filler * 200, "path": "/tmp/report.txt"}  # ~14.6 KB
-    raise ValueError(size_label)
-
-
 async def _time_evaluate(policy: ServerPolicy, arguments: dict, iterations: int) -> list[float]:
-    samples = []
-    for _ in range(iterations):
-        start = time.perf_counter()
-        await evaluate("bench_tool", arguments, "bench-server", policy)
-        samples.append((time.perf_counter() - start) * 1000)  # ms
-    return samples
-
-
-def _percentile(samples: list[float], pct: float) -> float:
-    return statistics.quantiles(samples, n=100)[int(pct) - 1] if len(samples) >= 100 else max(samples)
+    return await time_call(
+        lambda: evaluate("bench_tool", arguments, "bench-server", policy), iterations
+    )
 
 
 async def _bench_one(size_label: str, policy: ServerPolicy) -> dict:
-    arguments = _representative_arguments(size_label)
+    arguments = representative_arguments(size_label)
     arg_bytes = sum(len(str(v)) for v in arguments.values())
 
     # Warm up (forkserver's first spawn is meaningfully slower than steady state — see
@@ -112,22 +90,10 @@ async def _bench_one(size_label: str, policy: ServerPolicy) -> dict:
         "size_label": size_label,
         "arg_bytes": arg_bytes,
         "off_p50": statistics.median(off_samples),
-        "off_p99": _percentile(off_samples, 99),
+        "off_p99": percentile(off_samples, 99),
         "on_p50": statistics.median(on_samples),
-        "on_p99": _percentile(on_samples, 99),
+        "on_p99": percentile(on_samples, 99),
     }
-
-
-def _print_table(label: str, results: list[dict]) -> None:
-    print(f"\n--- {label} ---")
-    print(f"{'size':<8} {'arg bytes':>10} {'off p50':>9} {'off p99':>9} {'on p50':>9} {'on p99':>9} {'added p50':>10} {'added p99':>10}")
-    for r in results:
-        added_p50 = r["on_p50"] - r["off_p50"]
-        added_p99 = r["on_p99"] - r["off_p99"]
-        print(
-            f"{r['size_label']:<8} {r['arg_bytes']:>10} {r['off_p50']:>8.3f}ms {r['off_p99']:>8.3f}ms "
-            f"{r['on_p50']:>8.3f}ms {r['on_p99']:>8.3f}ms {added_p50:>9.3f}ms {added_p99:>9.3f}ms"
-        )
 
 
 async def main() -> None:
@@ -139,12 +105,12 @@ async def main() -> None:
         builtin_results.append(await _bench_one(size_label, BUILTIN_DETECTORS_POLICY))
         custom_results.append(await _bench_one(size_label, WITH_CUSTOM_PATTERN_POLICY))
 
-    _print_table(
+    print_latency_table(
         f"{len(BUILTIN_DETECTORS_POLICY.dlp_detectors)} built-in detectors only (no custom_patterns — "
         "no forkserver spawn)",
         builtin_results,
     )
-    _print_table(
+    print_latency_table(
         f"built-ins + 1 custom_pattern (forkserver-routed, F2 ReDoS-safe path)",
         custom_results,
     )

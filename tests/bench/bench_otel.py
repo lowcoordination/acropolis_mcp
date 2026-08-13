@@ -11,6 +11,16 @@ The numbers this script prints are what docs/observability.md's "Overhead" secti
 Re-run and update that doc if argus/tracing.py's span points or export mechanism change
 materially.
 
+Requires the `otel` extra (`pip install -e '.[otel]'`) — OTel is deliberately optional in the
+base install (see pyproject.toml's otel group comment); this bench measures a code path that
+does not exist without it.
+
+Shares the stats/timing/argument machinery with the other benches via tests/bench/_harness.py
+(the epic's harness issue). One migration note: this bench previously built its app on the
+legacy SQLite Database(tmp_path) shape, which ceased to exist when the app went Postgres-only
+(enterprise #7) — it now provisions a real Postgres database via the harness, which is also
+what production runs.
+
 Scope note: this measures a FULL bridged tools/call request through the real Acropolis app (root
 span + policy.evaluate + bridge.handshake + upstream.forward — the shape a real 2026-generation
 client's call takes), against a real in-process FastMCP upstream, over httpx.ASGITransport (no
@@ -24,20 +34,22 @@ This conservative choice is deliberate and documented in docs/observability.md.
 from __future__ import annotations
 
 import asyncio
-import logging
 import statistics
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from tests.bench._harness import (  # noqa: E402
+    iters, percentile, postgres_url, print_latency_table, quiet_logging,
+    representative_arguments, stop_infra, time_call,
+)
+
 # Quiet every logger below WARNING — this benchmark drives thousands of real requests through
 # the app (audit logging, httpx request logging, FastMCP's own request logging all fire per
-# call), and the resulting console noise makes the actual results hard to find. Mirrors
-# bench_dlp.py's console output discipline of "print exactly the table, nothing else load-bearing".
-logging.basicConfig(level=logging.WARNING)
-for _name in ("argus", "archon", "stoa", "httpx", "httpcore", "mcp", "uvicorn"):
-    logging.getLogger(_name).setLevel(logging.WARNING)
+# call), and the resulting console noise makes the actual results hard to find. Must run
+# before httpx/mcp import so their loggers start already-quiet.
+quiet_logging()
 
 import httpx  # noqa: E402
 
@@ -48,32 +60,16 @@ from db.database import Database  # noqa: E402
 from db.repo import ServerRepo  # noqa: E402
 from tests.integration.fastmcp_fixture import run_fastmcp_server  # noqa: E402
 
-ITERATIONS = 500
-WARMUP_ITERATIONS = 50
+ITERATIONS = iters(500, 5)
+WARMUP_ITERATIONS = iters(50, 2)
 
 
-def _representative_arguments(size_label: str) -> dict:
-    """Identical argument shapes to bench_dlp.py's _representative_arguments — same sizes, same
-    filler text — so the two benchmarks' numbers are directly comparable at each size label."""
-    filler = (
-        "The quick brown fox jumps over the lazy dog. Lorem ipsum dolor sit amet, consectetur "
-        "adipiscing elit. "
-    )
-    if size_label == "small":
-        return {"query": "find all TODO comments in the repo", "limit": 20}
-    if size_label == "medium":
-        return {"message": filler * 10, "channel": "general"}  # ~730 chars
-    if size_label == "large":
-        return {"content": filler * 200, "path": "/tmp/report.txt"}  # ~14.6 KB
-    raise ValueError(size_label)
-
-
-async def _make_app(tmp_path: Path, upstream_url: str, tracing_active: bool):
+async def _make_app(tmp_path: Path, dsn: str, upstream_url: str, tracing_active: bool):
     settings = Settings(
         data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False,
         audit_retention_enabled=False,
     )
-    db = Database(tmp_path)
+    db = Database(dsn)
     await db.connect()
     server_repo = ServerRepo(db)
     await server_repo.create(slug="bench-server", name="Bench", upstream_url=f"{upstream_url}/mcp")
@@ -98,8 +94,6 @@ async def _make_app(tmp_path: Path, upstream_url: str, tracing_active: bool):
 
 
 async def _time_calls(app, arguments: dict, iterations: int) -> list[float]:
-    import time
-
     transport = httpx.ASGITransport(app=app)
     headers = {
         "Content-Type": "application/json", "Accept": "application/json",
@@ -109,22 +103,20 @@ async def _time_calls(app, arguments: dict, iterations: int) -> list[float]:
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "echo", "arguments": arguments},
     }
-    samples = []
+
+    # One client for the whole loop (keep-alive reuse), exactly as the pre-migration bench did —
+    # only the timing loop moved to the harness.
     async with httpx.AsyncClient(transport=transport, base_url="http://bench.test") as client:
-        for _ in range(iterations):
-            start = time.perf_counter()
+
+        async def _one() -> None:
             resp = await client.post("/mcp/bench-server", json=body, headers=headers)
-            samples.append((time.perf_counter() - start) * 1000)  # ms
             assert resp.status_code == 200, resp.text
-    return samples
 
-
-def _percentile(samples: list[float], pct: float) -> float:
-    return statistics.quantiles(samples, n=100)[int(pct) - 1] if len(samples) >= 100 else max(samples)
+        return await time_call(_one, iterations)
 
 
 async def _bench_one(tmp_path_root: Path, upstream_url: str, size_label: str) -> dict:
-    arguments = _representative_arguments(size_label)
+    arguments = representative_arguments(size_label)
     arg_bytes = sum(len(str(v)) for v in arguments.values())
 
     off_dir = tmp_path_root / f"off-{size_label}"
@@ -132,13 +124,16 @@ async def _bench_one(tmp_path_root: Path, upstream_url: str, size_label: str) ->
     off_dir.mkdir(parents=True, exist_ok=True)
     on_dir.mkdir(parents=True, exist_ok=True)
 
-    off_app, off_db = await _make_app(off_dir, upstream_url, tracing_active=False)
+    # One fresh database per app, mirroring conftest's per-instance isolation: both apps
+    # register the same "bench-server" slug, and only a per-app database keeps the second
+    # create from colliding with the first.
+    off_app, off_db = await _make_app(off_dir, await postgres_url(), upstream_url, tracing_active=False)
     async with off_app.router.lifespan_context(off_app):
         await _time_calls(off_app, arguments, WARMUP_ITERATIONS)
         off_samples = await _time_calls(off_app, arguments, ITERATIONS)
     await off_db.close()
 
-    on_app, on_db = await _make_app(on_dir, upstream_url, tracing_active=True)
+    on_app, on_db = await _make_app(on_dir, await postgres_url(), upstream_url, tracing_active=True)
     async with on_app.router.lifespan_context(on_app):
         await _time_calls(on_app, arguments, WARMUP_ITERATIONS)
         on_samples = await _time_calls(on_app, arguments, ITERATIONS)
@@ -148,22 +143,10 @@ async def _bench_one(tmp_path_root: Path, upstream_url: str, size_label: str) ->
         "size_label": size_label,
         "arg_bytes": arg_bytes,
         "off_p50": statistics.median(off_samples),
-        "off_p99": _percentile(off_samples, 99),
+        "off_p99": percentile(off_samples, 99),
         "on_p50": statistics.median(on_samples),
-        "on_p99": _percentile(on_samples, 99),
+        "on_p99": percentile(on_samples, 99),
     }
-
-
-def _print_table(label: str, results: list[dict]) -> None:
-    print(f"\n--- {label} ---")
-    print(f"{'size':<8} {'arg bytes':>10} {'off p50':>9} {'off p99':>9} {'on p50':>9} {'on p99':>9} {'added p50':>10} {'added p99':>10}")
-    for r in results:
-        added_p50 = r["on_p50"] - r["off_p50"]
-        added_p99 = r["on_p99"] - r["off_p99"]
-        print(
-            f"{r['size_label']:<8} {r['arg_bytes']:>10} {r['off_p50']:>8.3f}ms {r['off_p99']:>8.3f}ms "
-            f"{r['on_p50']:>8.3f}ms {r['on_p99']:>8.3f}ms {added_p50:>9.3f}ms {added_p99:>9.3f}ms"
-        )
 
 
 async def main() -> None:
@@ -174,14 +157,17 @@ async def main() -> None:
           "upstream.forward), tracing on (in-memory exporter, synchronous SimpleSpanProcessor — "
           "worst case) vs. off (fully disabled, byte-identical to pre-feature code path).\n")
 
-    async with run_fastmcp_server() as upstream:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path_root = Path(tmp_dir)
-            results = []
-            for size_label in ("small", "medium", "large"):
-                results.append(await _bench_one(tmp_path_root, upstream.url, size_label))
+    try:
+        async with run_fastmcp_server() as upstream:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path_root = Path(tmp_dir)
+                results = []
+                for size_label in ("small", "medium", "large"):
+                    results.append(await _bench_one(tmp_path_root, upstream.url, size_label))
+    finally:
+        await stop_infra()
 
-    _print_table("4 spans per call (request, policy.evaluate, bridge.handshake, upstream.forward)", results)
+    print_latency_table("4 spans per call (request, policy.evaluate, bridge.handshake, upstream.forward)", results)
 
 
 if __name__ == "__main__":
