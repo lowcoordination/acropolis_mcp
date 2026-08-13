@@ -79,9 +79,14 @@ Postgres (enterprise #7, issue #8) removed **that** constraint; concurrent write
 Postgres's job. The rate limiter is a separate constraint the cutover did not address, and it
 still applies.
 
-Scaling horizontally is safe only once rate limiting is backed by a shared store
-([issue #31](https://github.com/lowcoordination/acropolis_mcp/issues/31)). Until then, scale
-vertically via the resource limits in `deployment.yaml`.
+A shared rate-limit backend now exists — Valkey/Redis, see
+[docs/rate-limiting.md](../../docs/rate-limiting.md) — which removes the blocker described
+above. The cap stays at 1 until the remaining items on
+[issue #31](https://github.com/lowcoordination/acropolis_mcp/issues/31) are done: a
+multi-replica test proving a shared limit holds across processes, and re-reviewing the quota
+path's accepted overshoot under multi-replica assumptions.
+
+Until then, scale vertically via the resource limits in `deployment.yaml`.
 
 When #31 lands, size Postgres's `max_connections` and this app's own pool settings for the
 replica count you want — see [docs/postgres.md](../../docs/postgres.md).

@@ -23,6 +23,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Issue #31: the shared-state rate-limit backend needed to run more than one replica. Optional
+# on purpose — InMemoryBackend remains the default (argus/rate_limiter.py) and a single-replica
+# deployment must not be made to install a client for a server it will never talk to. Install
+# with `pip install acropolis[distributed]` when running multi-replica; argus/app.py raises a
+# clear configuration error if ACROPOLIS_RATE_LIMIT_BACKEND=valkey is set without it.
+#
+# redis-py, not valkey-py: it is the mature client and speaks the same wire protocol, so it
+# works unchanged against both Valkey and Redis servers. The image this project's compose and
+# tests use is valkey/valkey (BSD-licensed, the maintained fork post-2024) — the client library
+# choice does not constrain the server you point it at.
+distributed = [
+    "redis>=5.0.0",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",

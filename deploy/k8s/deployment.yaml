@@ -18,8 +18,14 @@ spec:
   # there is no longer a DATABASE reason to cap this at 1 — but the rate limiter is an
   # independent constraint that the cutover did not address, and it still stands.
   #
-  # Scaling past 1 replica is safe only once rate limiting is backed by a shared store
-  # (issue #31). Until then, scale vertically (resources below), not horizontally.
+  # A shared rate-limit backend now EXISTS (Valkey/Redis — see docs/rate-limiting.md and set
+  # ACROPOLIS_RATE_LIMIT_BACKEND=valkey), which removes the blocker described above. The cap
+  # stays at 1 here until the remaining items on issue #31 are done — a multi-replica test
+  # proving a shared limit actually holds across processes, and re-reviewing the quota path's
+  # accepted TOCTOU overshoot under multi-replica assumptions (its "bounded overshoot"
+  # reasoning was justified for ONE process; N replicas multiply the bound).
+  #
+  # Until then, scale vertically (resources below), not horizontally.
   #
   # When #31 lands and this cap is lifted, also size Postgres's own max_connections and this
   # app's ACROPOLIS_DB_WRITER_POOL_MAX / ACROPOLIS_DB_READER_POOL_MAX (docs/postgres.md) for the

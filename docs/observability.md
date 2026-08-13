@@ -354,9 +354,11 @@ database). Raise `ACROPOLIS_DB_READER_POOL_MAX` first — it is the pool on the 
 
 One caution if you run multiple replicas: each replica opens its own reader+writer pools, so
 total connections scale with replica count. Keep `N × (reader + writer)` under your Postgres
-`max_connections`, and prefer raising the pool size over adding replicas until the
-process-local rate limiter is replaced (see R4 / issue #31 in the remediation doc — replicas
-today multiply every configured rate limit by the replica count).
+`max_connections`.
+
+Also switch the rate limiter to its shared backend before adding replicas — the default
+in-memory backend gives each replica its own copy of every limit, multiplying the effective
+limit by the replica count. See [rate limiting](rate-limiting.md).
 
 ### Why there is no read-through cache for server/policy config
 
