@@ -109,6 +109,12 @@ budget control, and forwarding some calls over budget under a burst is the same 
 guards each bucket's consume) — a rate limiter's entire job is bounding bursts, so an
 un-atomic check there would defeat the feature's own purpose in a way that doesn't apply here.
 
+Measured (bench_quotas.py, Part 4 — see the Performance section below): against `quota_calls=5`,
+a 20-way burst allows **7-15 calls** (typical ~11), and 50-200-way bursts allow **5-13**
+(typical ~8). The overshoot stays ~2-3× the configured quota regardless of burst size past
+~50 — the event loop's serialization keeps the check-then-act window narrow. Bounded, small,
+and consistent with the soft-budget framing above.
+
 ### Running more than one replica
 
 The overshoot above is bounded by **how many requests are in flight simultaneously** — not by
@@ -243,6 +249,22 @@ layer — caught by the app's global exception handler (so never a crash or an i
 just an unnecessary 500 where a clean 422 belongs). The 1,000,000,000 cap sits comfortably under
 that column's own ceiling, so it stays valid without needing to change if the column type ever
 does. Fixed at the Pydantic layer, on both `POST /api/v1/keys` and `PATCH /api/v1/keys/{id}/quota`.
+
+## Performance
+
+Measured by `tests/bench/bench_quotas.py` (`python -m tests.bench.bench_quotas`); results in
+`tests/bench/results/quotas-2026-08-13.md`.
+
+- **Per-call tax ~0.17 ms total** — `increment` 0.091 ms and `total_since` 0.082 ms p50. The
+  quota feature (one read + one write per forwarded `tools/call`) is under 1% of a ~3 ms
+  bridged call.
+- **No row-lock bottleneck** — a 128-way burst on ONE (key, hour) bucket runs at the same
+  ~21k inc/s as 128 distinct buckets. The atomic upsert holds the row only for the UPDATE
+  itself; the ceiling is the writer pool and round-trips, not contention.
+- **`total_since` is flat with history** — 0.083 → 0.085 ms p50 from 24 to 720 hour buckets
+  (1 to 30 days). The keyed index keeps a month-period check constant.
+- **Overshoot is bounded and typically ~2-3× quota** — see the accepted-limitation section
+  above for the measured distribution behind that number.
 
 ## What this deliberately does not do
 
