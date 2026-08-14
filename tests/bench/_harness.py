@@ -145,6 +145,19 @@ def print_latency_table(label: str, results: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def markdown_table(headers: list[str], rows: list[list]) -> str:
+    """Render headers/rows as a GitHub-flavored markdown pipe table (for the results
+    files write_results produces). Cells are str()'d; the console print path uses the same
+    rendering so what the bench prints and what lands in the results file never drift."""
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines) + "\n"
+
+
 def _git_sha() -> str:
     try:
         return subprocess.run(
@@ -373,6 +386,18 @@ async def valkey_url() -> str:
     url = _start_valkey_container()
     await _wait_valkey_ready(url)
     return url
+
+
+def valkey_container_name() -> str | None:
+    """Name of the Valkey container THIS process started, or None when the bench is running
+    against an operator-provided server (ACROPOLIS_TEST_VALKEY_URL).
+
+    Lets a bench do container-level things (e.g. `docker pause` for a degraded-mode
+    measurement) only to infrastructure it owns — never to a server the operator supplied.
+    """
+    if _VALKEY_CONTAINER in _started_containers:
+        return _VALKEY_CONTAINER
+    return None
 
 
 async def stop_infra() -> None:

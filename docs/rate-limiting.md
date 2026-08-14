@@ -100,6 +100,28 @@ atomic server-side script rather than a read-then-write from the client, so conc
 across replicas cannot race past the limit between the read and the write. Switching backends
 changes where the state lives, not what a limit means.
 
+## Performance
+
+Measured by `tests/bench/bench_rate_limit.py` (`python -m tests.bench.bench_rate_limit`);
+results in `tests/bench/results/rate-limit-2026-08-13.md`.
+
+- **Switching backends costs ~0.05 ms per check** (p50; in-memory ~0.0004 ms, Valkey ~0.048 ms
+  on localhost). Against a ~3 ms bridged `tools/call` that is ~1.5% — shared-state correctness
+  is effectively free per request.
+- **In-memory ceiling ~1.8M checks/s** with flat p50 to 128-way concurrency; the per-bucket
+  lock is not a bottleneck at realistic rates.
+- **Valkey ceiling ~20-32k checks/s per process**, p50 ~4 ms at 128-way concurrency
+  (server-serialized Lua script). Comfortably above a gateway doing tens-hundreds of req/s.
+- **Fail-closed latency:** connection-refused fails in ~0.06 ms; a hung-but-connected server
+  costs the full 2 s socket budget per refusal (the app's `socket_timeout`).
+- **Atomicity holds as a number:** a `5/minute` bucket admits exactly 5 of 8/32/128 concurrent
+  callers on both backends, every trial.
+
+**Known ceiling (filed as [#97](https://github.com/lowcoordination/acropolis_mcp/issues/97)):**
+redis-py 8.x caps its async connection pool at 100 by default and `build_valkey_backend` does
+not override it. Past ~100 concurrent rate-limited requests per process, requests fail closed
+(`rule = rate_limit_backend_unavailable`) even when Valkey is healthy.
+
 ## What changes when you run more than one replica
 
 Once the Valkey backend is configured, rate limiting itself behaves the same at any replica
