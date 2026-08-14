@@ -117,10 +117,13 @@ results in `tests/bench/results/rate-limit-2026-08-13.md`.
 - **Atomicity holds as a number:** a `5/minute` bucket admits exactly 5 of 8/32/128 concurrent
   callers on both backends, every trial.
 
-**Known ceiling (filed as [#97](https://github.com/lowcoordination/acropolis_mcp/issues/97)):**
-redis-py 8.x caps its async connection pool at 100 by default and `build_valkey_backend` does
-not override it. Past ~100 concurrent rate-limited requests per process, requests fail closed
-(`rule = rate_limit_backend_unavailable`) even when Valkey is healthy.
+**Connection pool ceiling ([#97](https://github.com/lowcoordination/acropolis_mcp/issues/97)):**
+redis-py 8.x caps its async connection pool at 100 by default; `build_valkey_backend` now sets
+`max_connections=256`, roughly 2.5x the measured 100-connection failure point. Past that many
+concurrent rate-limited requests in one process, requests fail closed
+(`rule = rate_limit_backend_unavailable`) even when Valkey is healthy — raise `max_connections`
+further via `client_kwargs` if a single replica routinely exceeds ~250 concurrent
+rate-limited requests.
 
 ## What changes when you run more than one replica
 
