@@ -177,10 +177,19 @@ def build_valkey_backend(url: str, **client_kwargs: Any) -> ValkeyBackend:
     # posture means a hung connection would stall every request rather than erroring promptly —
     # a slow backend must degrade to a fast 429, not to a hang. Same reasoning as the shared
     # httpx client's connect/pool budgets in argus/app.py.
+    #
+    # max_connections is set explicitly (issue #97): redis-py 8.x's async ConnectionPool
+    # defaults to 100 (older redis-py effectively had no cap, 2**31). Past that many concurrent
+    # rate-limited requests in one process, the pool raises immediately rather than queueing —
+    # measured by bench_rate_limit.py Part 4c as a fast (~13ms) fail-closed 429
+    # (rule=rate_limit_backend_unavailable) that reads, from the audit log, indistinguishable
+    # from a real Valkey outage. 256 is roughly 2.5x the measured ceiling; the pool only opens
+    # connections on demand, so the headroom costs nothing until a process actually needs it.
     defaults: dict[str, Any] = {
         "socket_connect_timeout": 2.0,
         "socket_timeout": 2.0,
         "health_check_interval": 30,
+        "max_connections": 256,
     }
     defaults.update(client_kwargs)
     return ValkeyBackend(Redis.from_url(url, **defaults))
