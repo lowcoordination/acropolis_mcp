@@ -168,7 +168,7 @@ def _git_sha() -> str:
         return "unknown"
 
 
-def write_results(slug: str, tables_markdown: str, module: str | None = None) -> Path:
+def write_results(slug: str, tables_markdown: str, module: str | None = None) -> Path | None:
     """Write tests/bench/results/<slug>-<YYYY-MM-DD>.md and return its path.
 
     Stamps date, machine, Python version, the git SHA the numbers were measured against, and
@@ -181,10 +181,18 @@ def write_results(slug: str, tables_markdown: str, module: str | None = None) ->
     right for the common `bench_<slug>.py` naming; pass it explicitly otherwise, e.g.
     slug="pipeline-baseline" with module="bench_pipeline").
 
+    Under --smoke this is a no-op returning None: smoke asserts no numbers (see the --smoke
+    convention above) and CI runs it daily, so writing a real dated results file would 1) skip
+    the FileExistsError guard's whole point on a day a real run already checked one in for the
+    same slug, and 2) litter the results directory with placeholder-verdict files nobody wrote
+    a go/no-go for. Smoke's only job is proving the bench still runs.
+
     Raises FileExistsError if a results file for this slug+date already exists — a results
     file is a historical record, and silently overwriting one would destroy the evidence a
     decision was made on.
     """
+    if SMOKE:
+        return None
     if module is None:
         module = slug
     today = datetime.date.today().isoformat()

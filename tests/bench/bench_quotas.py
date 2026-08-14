@@ -265,7 +265,7 @@ async def main() -> None:
         md_parts.append(f"## {title}\n\n{markdown_table(headers, rows)}")
 
     path = write_results("quotas", "\n".join(md_parts), module="bench_quotas")
-    print(f"\nResults written to {path} — verdict section left for review")
+    print(f"\nResults written to {path} — verdict section left for review" if path else "\nSmoke mode: results not written (write_results is a no-op under --smoke)")
 
 
 if __name__ == "__main__":
