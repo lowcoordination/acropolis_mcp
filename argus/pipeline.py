@@ -461,10 +461,16 @@ class Pipeline:
         raw body bytes, the other translates protocol generations (see _forward vs bridge_call).
         """
         arguments = params.get("arguments") or {}
+        # latency_ms is NOT included here on purpose (issue #99): this dict is built once, at
+        # the top of enforcement, but the ALLOWED audit row below is logged after rate-limit,
+        # quota, and policy evaluation have all run. Folding a value computed here into that
+        # template freezes latency_ms at ~0 for every forwarded call — the elapsed time at this
+        # point is sub-millisecond, so int(...) truncates it away. Each log call below computes
+        # latency_ms fresh at its own call site instead, matching how _refuse/_error already do
+        # it.
         audit_common = dict(
             server_slug=server.slug, endpoint="per-server", rpc_method=rpc_method,
-            api_key_id=api_key_id, latency_ms=int((time.monotonic() - start) * 1000),
-            client_ip=client_ip, origin=origin,
+            api_key_id=api_key_id, client_ip=client_ip, origin=origin,
         )
         if bridged:
             audit_common["bridged"] = True
@@ -503,6 +509,7 @@ class Pipeline:
             args_summary=decision.args_summary, reason=decision.reason,
             dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
             dlp_match_count=decision.dlp_match_count,
+            latency_ms=int((time.monotonic() - start) * 1000),
             **audit_common,
         )
         await self._record_usage(server, tool_name, api_key_id)

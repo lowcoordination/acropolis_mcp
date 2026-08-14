@@ -13,14 +13,22 @@ call was slow" — that's what distributed tracing exists for.
 
 `docs/backup-and-upgrades.md` used to say per-upstream call latency "is not currently included —
 no latency sample is recorded anywhere in the request path today." **That specific claim is now
-out of date and has been corrected**: every audit row has carried a gateway-total `latency_ms`
-(`time.monotonic()`-based, wrapping the whole request) since the control-plane audit log shipped.
-What was actually missing — and what this feature closes — is two different things: a **per-stage
-breakdown** of that latency (policy eval vs. DLP scan vs. secret resolution vs. bridge handshake
-vs. the upstream call itself), and **trace context** (an incoming `traceparent` was neither
-honored nor propagated, making Acropolis a black hole in any client's existing distributed trace).
-`latency_ms` on the audit row is not replaced by any of this — it stays exactly as it was; traces
-are a complementary, request-shaped view of the same call, not a redundant one.
+out of date and has been corrected**: every audit row carries a gateway-total `latency_ms`
+(`time.monotonic()`-based, wrapping the whole request). This was NOT true for forwarded
+(ALLOWED) calls until issue #99's fix — `Pipeline._enforce` built the ALLOWED audit row's fields
+in a template computed before rate-limit, quota, and policy evaluation ran, so `latency_ms`
+truncated to 0 for every forwarded call (found by `tests/bench/bench_pipeline.py` Part 3, whose
+audit-vs-client latency cross-check exists to catch exactly this). BLOCKED/error rows were
+unaffected — those paths already computed `latency_ms` at their own log call site. What was
+actually missing beyond that fix is two different things: a **per-stage breakdown** of that
+latency (policy eval vs. DLP scan vs. secret resolution vs. bridge handshake vs. the upstream
+call itself), and **trace context** (an incoming `traceparent` was neither honored nor
+propagated, making Acropolis a black hole in any client's existing distributed trace).
+`latency_ms` on the audit row is not replaced by any of this; traces are a complementary,
+request-shaped view of the same call, not a redundant one. Note `latency_ms` is measured up to
+the audit-log call, which happens before the upstream forward completes (audit rows are written
+as part of the enforcement decision, not after the proxy returns) — expect it to run somewhat
+below true end-to-end client latency, not to match it exactly.
 
 ## Tracing: off by default, manual spans only
 
