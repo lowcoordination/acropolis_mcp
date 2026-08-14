@@ -88,3 +88,60 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+  # Epic #89: benches are `python -m` scripts outside pytest collection — nothing ran them in
+  # CI, so they rot invisibly (an import error, a drifted helper, and the first anyone knows is
+  # the next time the numbers are needed). The repo's own stated principle: "a green run that
+  # silently measured nothing would be the single worst outcome." This job is a RUNNABILITY
+  # gate, deliberately NOT a performance gate: every bench's --smoke mode floors its iteration
+  # counts, asserts no numbers, and exits 0. The numbers are human-reviewed artifacts (checked
+  # into tests/bench/results/) — shared runners are far too noisy for ms-level gates.
+  #
+  # Deliberately excluded: tests/bench/load/ — a multi-container compose load test on a shared
+  # runner is a flake farm; it is local/pre-release only (see that module's docstring).
+  bench-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      # Same sourcing the rate-limit bench's harness uses (ACROPOLIS_TEST_VALKEY_URL beats the
+      # docker fallback), on the harness's own bench port so a same-runner collision with the
+      # backend job's 63801 can't happen even if both jobs ever share a runner.
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 63802:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      ACROPOLIS_TEST_VALKEY_URL: redis://127.0.0.1:63802/0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 'otel' is required by bench_otel (its docstring says so; the backend job's pytest suite
+      # deliberately runs WITHOUT it to prove OTel absence degrades cleanly — benches measure
+      # the code path that only exists with it). 'distributed' is required by bench_rate_limit's
+      # redis client. Postgres needs no service: the harness docker-runs one, exactly as the
+      # backend job's pytest suite already provisions it on the runner (ci.yml has no postgres
+      # service; conftest.py's docker fallback is what supplies it there).
+      - name: Install package + dev/deps for benches
+        run: python -m pip install --no-cache-dir '.[dev,distributed,otel]'
+
+      # Step-level timeout narrower than the job's own, mirroring the "Run pytest" step's
+      # pattern — a hung bench must surface as a clear "Run benches --smoke" timeout.
+      # Healthy smoke runs take seconds per bench (~2-3 min total including PG provisioning).
+      - name: Run benches in --smoke mode
+        timeout-minutes: 8
+        run: |
+          python -m tests.bench.bench_dlp --smoke
+          python -m tests.bench.bench_redos --smoke
+          python -m tests.bench.bench_otel --smoke
+          python -m tests.bench.bench_rate_limit --smoke
+          python -m tests.bench.bench_quotas --smoke
+          python -m tests.bench.bench_pipeline --smoke
