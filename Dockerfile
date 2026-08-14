@@ -29,7 +29,13 @@ COPY db/ ./db/
 # why this isn't hash-locked), then the project itself with --no-deps so pip doesn't re-resolve
 # anything against pyproject.toml's looser ranges.
 RUN pip install --no-cache-dir -r requirements-lock.txt && \
-    pip install --no-cache-dir --no-deps .
+    pip install --no-cache-dir --no-deps . && \
+    # Issue #31: the 'distributed' extra (redis client) is needed by the Valkey rate-limit
+    # backend, which is the documented deployment for more than one replica (issue #86). The
+    # extra is deliberately optional in pyproject.toml (a single-replica memory deployment
+    # shouldn't have to carry it), but this IMAGE is the deployment artifact — a multi-replica
+    # rollout must not fail at boot because the client is missing.
+    pip install --no-cache-dir --no-deps 'redis>=5.0.0'
 
 COPY --from=web-build /web/dist ./web/dist
 

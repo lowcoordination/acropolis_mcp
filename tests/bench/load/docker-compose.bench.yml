@@ -1,0 +1,71 @@
+# Bench-only compose stack for the multi-replica load tier (epic #89, load issue).
+#
+# Two app replicas (app-a, app-b) share ONE Postgres and ONE Valkey — the exact topology the
+# replicas>1 documentation claim (issue #86) is about: with the shared rate-limit backend, the
+# AGGREGATE admission across both replicas must be the configured limit, not 2×.
+#
+# Deliberately a SEPARATE file from deploy/docker-compose.yml: this one is a measurement rig,
+# not a deployment. Distinct host ports from the pytest suite (55433/63801) and the harness
+# (55434/63802) so nothing collides: postgres 55435, valkey 63803, replicas 5591/5592.
+#
+# `host.docker.internal:host-gateway` lets the replicas reach the FastMCP upstream that the
+# bench runs IN-PROCESS on the host (see bench_load.py's seed step) — the upstream fixture
+# has no container image, and running it on the host keeps the bench's orchestration in one
+# place.
+name: acropolis-bench-load
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: acropolis
+      POSTGRES_PASSWORD: acropolis-bench
+      POSTGRES_DB: acropolis
+    ports:
+      - "55435:5432"
+    command: ["-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acropolis -d acropolis"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "63803:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Two NAMED services rather than `deploy.replicas`: compose cannot publish per-replica host
+  # ports, and the bench must address each replica independently to count aggregate admissions.
+  app-a: &app
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    environment: &app-env
+      ACROPOLIS_DATABASE_URL: postgresql://acropolis:acropolis-bench@postgres:5432/acropolis
+      ACROPOLIS_RATE_LIMIT_BACKEND: valkey
+      ACROPOLIS_RATE_LIMIT_BACKEND_URL: redis://valkey:6379/0
+      ACROPOLIS_AUTH_MODE: keyed
+      ACROPOLIS_HEALTH_POLL_ENABLED: "false"
+      ACROPOLIS_AUDIT_RETENTION_ENABLED: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "5591:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+
+  app-b:
+    <<: *app
+    environment:
+      <<: *app-env
+    ports:
+      - "5592:8000"
