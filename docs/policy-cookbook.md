@@ -79,20 +79,33 @@ you don't trust a blocklist, deny it outright instead.
 
 ### What happens if a pattern is slow
 
-Every `block_patterns` match runs with a hard 0.5s timeout in an isolated process, so a
-pathological regex (accidentally vulnerable to catastrophic backtracking, or just slow against
-unusually long input) can never hang a request or stall the event loop. If a match can't
-complete in time — whether because the pattern is genuinely slow or the gateway is under heavy
-concurrent load — **the call is blocked**, the same as an actual match. The audit log records
-this as `rule: block_pattern_undetermined` rather than `block_pattern`, so you can tell the two
-apart.
+Every `block_patterns` match runs with a hard 0.5s timeout (`ACROPOLIS_REGEX_MATCH_TIMEOUT_
+SECONDS`) in an isolated process, so a pathological regex (accidentally vulnerable to
+catastrophic backtracking, or just slow against unusually long input) can never hang a request
+or stall the event loop. If a match can't complete in time, **the call is blocked**, the same
+as an actual match. The audit log records this as `rule: block_pattern_undetermined` rather
+than `block_pattern`, so you can tell the two apart.
 
 This is a deliberate fail-*closed* choice: a rule you explicitly wrote should never silently
-stop enforcing just because the gateway is busy. If you see `block_pattern_undetermined`
-appearing regularly in the audit log, it usually means the pattern itself needs simplifying
-(anchor it more tightly, avoid nested quantifiers like `(a+)+`) rather than the gateway being
-overloaded — a well-formed pattern against realistic input completes in well under a
-millisecond.
+stop enforcing just because the gateway is busy or a worker couldn't start.
+
+Starting a match involves forking an isolated worker process first, then running the pattern in
+it — two different things can make that time out, and the gateway logs them differently because
+the fix for each is different:
+
+- **The match itself was slow** (logged as *"exceeded Ns — this pattern is likely vulnerable to
+  catastrophic backtracking"*): the worker started fine, but `pattern.search()` didn't finish in
+  time. This usually does mean the pattern needs simplifying — anchor it more tightly, avoid
+  nested quantifiers like `(a+)+`. A well-formed pattern against realistic input completes in
+  well under a millisecond once the worker is running.
+- **The worker never started in time** (logged as *"worker did not become ready"*): the pattern
+  was never the bottleneck — this host (or its forkserver) couldn't fork and bootstrap a worker
+  process fast enough, most often right after a restart (the forkserver helper itself hasn't
+  been spawned yet) or under heavy concurrent load. Rewriting the pattern will not help. If you
+  see this regularly, consider raising `ACROPOLIS_WORKER_READY_TIMEOUT_SECONDS` (default 5s) or
+  investigating host performance — the gateway logs a boot-time warning if a warm match already
+  eats a large share of the match budget on your hardware, which is a good early signal that
+  this budget is running tight before it starts causing spurious blocks.
 
 ## Recipe: deny a parameter outright (the SSRF case)
 
