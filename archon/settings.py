@@ -97,3 +97,17 @@ class Settings(BaseSettings):
     vault_role_id: str | None = None
     vault_secret_id: str | None = None
     vault_ttl_seconds: float = 60.0
+
+    # block_pattern / DLP custom-pattern regex matching (argus/policy.py, issue #106). Both
+    # budgets guard the SAME forkserver-isolated match, but measure different things and must
+    # stay separate:
+    #   - regex_match_timeout_seconds is the ReDoS budget: how long pattern.search() itself may
+    #     run once the worker is confirmed alive. Exceeding it means the PATTERN is suspect.
+    #   - worker_ready_timeout_seconds is an infrastructure budget: how long the forkserver may
+    #     take to fork + bootstrap a worker before it starts matching. Exceeding it means the
+    #     HOST/forkserver is the problem, not the pattern. Cold start (first call after process
+    #     start) has been measured at ~5x the warm per-call cost, hence the far larger default.
+    # Both fail closed (UNDETERMINED -> blocked) on timeout; these only change how much time
+    # is given before that happens, never whether a timeout blocks. See docs/policy-cookbook.md.
+    regex_match_timeout_seconds: float = 0.5
+    worker_ready_timeout_seconds: float = 5.0

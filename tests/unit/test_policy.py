@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from argus.policy import _finditer_spans_with_timeout, evaluate, summarize_args, tool_is_visible
+from argus.policy import (
+    MatchOutcome,
+    _finditer_spans_with_timeout,
+    evaluate,
+    summarize_args,
+    tool_is_visible,
+)
 from db.models import DlpCustomPattern, ParamRule, ServerPolicy
 
 
@@ -458,3 +464,113 @@ async def test_dlp_custom_pattern_redos_fails_closed_through_evaluate():
     assert elapsed < 2.0
     assert decision.blocked
     assert decision.dlp_detector == "evil"
+
+
+# ---------------------------------------------------------------------------
+# Issue #106 — the match deadline must measure only pattern.search(), never
+# forkserver spawn/bootstrap/IPC overhead. See tests/bench/results/r5-redos-2026-08-10.md
+# and the issue for the full measurement; these are the regression tests that would have
+# caught the original bug (a benign pattern spuriously timing out because the deadline
+# clock started at process.start() rather than once the worker confirmed it was running).
+# ---------------------------------------------------------------------------
+
+async def test_benign_match_leaves_most_of_the_timeout_budget_unused():
+    """The test that would have caught the original bug. Pre-fix, the deadline covered
+    fork + child bootstrap + IPC + the match, so a benign match on a slow/loaded host could
+    consume the (near-)entire _REGEX_MATCH_TIMEOUT_SECONDS budget on spawn overhead alone —
+    that's the whole issue #106 report. Post-fix, the deadline starts only once the worker
+    confirms it is running, so a benign, non-backtracking match should complete in a small
+    fraction of the budget on any reasonable host, regardless of how slow forkserver spawn is
+    on that host. Asserting a generous fraction (not a tight absolute bound) keeps this
+    portable across CI hardware while still failing if spawn overhead leaks back into the
+    deadline."""
+    import re
+    import time
+
+    from argus.policy import _REGEX_MATCH_TIMEOUT_SECONDS, _match_with_timeout
+
+    compiled = re.compile(r"rm\s+-rf", re.IGNORECASE)
+
+    # Warm the forkserver first so this measures steady-state, not the one-time cold-start
+    # helper spawn (covered separately by the cold-start measurements in the issue).
+    await _match_with_timeout(compiled, "warmup")
+
+    start = time.monotonic()
+    outcome = await _match_with_timeout(compiled, "after 0.1.1 upgrade")
+    elapsed = time.monotonic() - start
+
+    assert outcome is MatchOutcome.NOT_MATCHED
+    # Generous: half the budget is still >100x more than the match itself needs, but tight
+    # enough to fail if the fix regresses and spawn overhead leaks back into the deadline.
+    assert elapsed < (_REGEX_MATCH_TIMEOUT_SECONDS / 2), (
+        f"benign match took {elapsed:.3f}s, more than half the "
+        f"{_REGEX_MATCH_TIMEOUT_SECONDS}s match budget — spawn overhead may be leaking into "
+        f"the match deadline again (issue #106)"
+    )
+
+
+async def test_worker_never_ready_is_undetermined_and_attributed_to_infra_not_pattern():
+    """A worker that never confirms it's running (simulated here by a readiness timeout of
+    effectively zero, forcing the ready-wait to fail even though the worker WOULD have
+    matched instantly) must still fail closed to UNDETERMINED — but the caller-visible
+    behavior (block) must not depend on which of the two timeouts fired. This is the
+    'not_ready' path from _run_worker_with_timeout, which issue #106 reports as the actual
+    real-world failure mode (a benign pattern blocked because the HOST was slow, not because
+    the pattern was bad)."""
+    import re
+
+    from argus.policy import _run_worker_with_timeout, _regex_worker
+
+    compiled = re.compile(r"rm\s+-rf", re.IGNORECASE)
+
+    # A near-zero ready budget forces the readiness wait to fail even for a trivially fast
+    # worker — simulating a host too slow/loaded to fork+bootstrap a worker in time, without
+    # needing genuinely slow hardware in CI.
+    import argus.policy as policy_module
+
+    original_ready_timeout = policy_module._WORKER_READY_TIMEOUT_SECONDS
+    policy_module._WORKER_READY_TIMEOUT_SECONDS = 0.0
+    try:
+        result, log_reason = await _run_worker_with_timeout(
+            _regex_worker, compiled, "after 0.1.1 upgrade", "block_pattern match"
+        )
+    finally:
+        policy_module._WORKER_READY_TIMEOUT_SECONDS = original_ready_timeout
+
+    assert result is None
+    assert log_reason == "not_ready"
+
+
+async def test_genuine_redos_is_undetermined_and_attributed_to_match_not_infra():
+    """The case the naive same-queue-sentinel prototype got wrong: a worker that DOES become
+    ready and then hangs in a genuinely pathological match must be attributed to the match
+    timing out, not misreported as 'never became ready'. (An earlier prototype signaled
+    readiness by put()ing a token on the same result queue used for the match outcome —
+    mp.Queue.put() hands off to a background feeder THREAD in the child, which a
+    GIL-hogging pattern.search() immediately starves, so the sentinel never flushed and a
+    real ReDoS was misreported as an infra failure. The Event-based fix in _regex_worker
+    does not have this problem because Event.set() is synchronous and OS-level.)"""
+    import re
+
+    from argus.policy import _run_worker_with_timeout, _regex_worker
+
+    evil_pattern = re.compile(r"(a+)+$")
+    evil_input = "a" * 30 + "!"
+
+    result, log_reason = await _run_worker_with_timeout(
+        _regex_worker, evil_pattern, evil_input, "block_pattern match"
+    )
+
+    assert result is None
+    assert log_reason == "match_timeout"
+
+
+async def test_regex_match_timeout_and_worker_ready_timeout_are_configurable_via_settings():
+    """Issue #106 suggestion #2: an operator on slower hardware must be able to raise these
+    budgets without patching argus/policy.py. Confirms both fields exist on Settings with the
+    module's current defaults, so the module-level constants and Settings stay in sync."""
+    from archon.settings import Settings
+
+    settings = Settings()
+    assert settings.regex_match_timeout_seconds == 0.5
+    assert settings.worker_ready_timeout_seconds == 5.0

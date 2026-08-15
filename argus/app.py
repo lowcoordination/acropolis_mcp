@@ -21,6 +21,7 @@ from argus.audit import AuditLogger
 from argus.bridge import ProtocolBridge
 from argus.metrics import build_metrics_router
 from argus.pipeline import Pipeline
+from argus.policy import warm_forkserver
 from argus.rate_limiter import RateLimiterRegistry
 from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
@@ -279,6 +280,14 @@ def create_app(
         # than raising, since tracing is an observability nice-to-have, not a security control
         # the gateway should refuse to start without.
         tracing.init()
+        # Issue #106: spend the forkserver's one-time cold-start cost here (measured ~5x a warm
+        # match) rather than on whichever request happens to arrive first. Also logs a boot-time
+        # warning if even a warm match on this host already eats a large fraction of the
+        # block_pattern match budget — see policy.warm_forkserver's docstring. Best-effort and
+        # exception-swallowing by design: a forkserver that can't be warmed here still works
+        # (just slower on the first real request) via the identical code path, so this must
+        # never be able to fail app startup.
+        await warm_forkserver()
         audit.start()
         webhook_dispatcher.start()
         if enable_health_probing and settings.health_poll_enabled:
