@@ -17,10 +17,12 @@ Three measurements:
 2. **Concurrency sweep** — N concurrent evaluators each performing M matches, N in
    {1, 8, 16, 24, 32, 64}. This is where the semaphore's 16-way cap shows up: at N > 16,
    requests 17+ block on the semaphore, so **p50/p99 climb while throughput flattens**.
-3. **Adversarial worst case** — a genuinely catastrophic pattern (`(a+)+$` against crafted
-   input, the exact repro recorded in argus/policy.py's module comment) driven through the
-   real timeout path. Each such match costs the full 0.5s timeout plus spawn; this documents
-   the degraded mode a naive thread-based fix (already rejected in-code) would reintroduce.
+3. **Adversarial worst case** — a genuinely catastrophic pattern (`^(a*)*\1$` against crafted
+   input — chosen because re2 rejects the backreference, keeping this on the process/timeout
+   path; `(a+)+$` is now matched inline by re2, see the SLOW_PATTERN_POLICY comment) driven
+   through the real timeout path. Each such match costs the full 0.5s timeout plus spawn; this
+   documents the degraded mode a naive thread-based fix (already rejected in-code) would
+   reintroduce.
 
 Scope note, same as bench_dlp.py's: this measures the POLICY-EVALUATION layer, not the full
 tools/call path — the forkserver spawn dominates the added cost, so a full-pipeline bench
@@ -62,13 +64,15 @@ WITH_BLOCK_PATTERN_POLICY = ServerPolicy(
     param_rules={"bench_tool": {"query": ParamRule(block_patterns=[r"^[a-z0-9 _.-]+$"])}},
 )
 
-# The exact catastrophic-backtracking repro recorded in argus/policy.py's module comment:
-# "(a+)+$" against crafted input hangs Python's re for many seconds, comfortably under the
-# 200-char pattern cap. Driven through the real matcher, each evaluate() on this costs the
-# full _REGEX_MATCH_TIMEOUT_SECONDS (0.5s) and returns UNDETERMINED (fail-closed -> blocked).
+# #112: "(a+)+$" is now compiled to re2 and matched inline in microseconds (linear-time
+# guarantee), so the adversarial case must use a pattern re2 REJECTS — a backreference keeps
+# it on the process/timeout path, which is what Part 3 measures. Against crafted input this
+# hangs Python's re for many seconds, comfortably under the 200-char pattern cap. Driven
+# through the real matcher, each evaluate() on this costs the full
+# _REGEX_MATCH_TIMEOUT_SECONDS (0.5s) and returns UNDETERMINED (fail-closed -> blocked).
 SLOW_PATTERN_POLICY = ServerPolicy(
     mode="passthrough",
-    param_rules={"bench_tool": {"query": ParamRule(block_patterns=[r"(a+)+$"])}},
+    param_rules={"bench_tool": {"query": ParamRule(block_patterns=[r"^(a*)*\1$"])}},
 )
 SLOW_ARGUMENT = {"query": "a" * 31 + "b"}
 
@@ -194,7 +198,7 @@ def _print_report(report: dict) -> None:
                 f"{r['p50_ms']:>10}{r['p99_ms']:>10}"
             )
     elif report["part"] == "adversarial-timeout":
-        print(f"\nPart 3 — adversarial timeout path ((a+)+$ vs crafted input, 0.5s budget)")
+        print(f"\nPart 3 — adversarial timeout path (backref pattern vs crafted input, 0.5s budget)")
         print(f"{'concurrency':>12}{'wall s':>9}{'p50 ms':>10}{'p99 ms':>10}")
         for r in report["rows"]:
             print(

@@ -279,8 +279,8 @@ async def test_pathological_custom_pattern_hits_redos_timeout_and_fails_closed()
     """The security-critical case, mirroring argus/policy.py's own F2 test: a pathological
     custom DLP pattern must not hang the scan, and an UNDETERMINED (timed-out) match is treated
     as a match — fail CLOSED, matching F2's precedent — not silently skipped."""
-    spec = CustomPatternSpec(name="evil", pattern=r"(a+)+$", action="block")
-    evil_input = "a" * 30 + "!"
+    spec = CustomPatternSpec(name="evil", pattern=r"^(a*)*\1$", action="block")
+    evil_input = "a" * 30 + "b"
 
     start = time.monotonic()
     result = await scan_value(evil_input, {}, [spec])
@@ -295,8 +295,8 @@ async def test_pathological_custom_pattern_redact_action_fails_closed_too():
     """Same ReDoS case but with action=redact — a timed-out match still can't be trusted to
     have found nothing, so it must be treated as a full-value match (redacted, not passed
     through untouched)."""
-    spec = CustomPatternSpec(name="evil", pattern=r"(a+)+$", action="redact")
-    evil_input = "a" * 30 + "!"
+    spec = CustomPatternSpec(name="evil", pattern=r"^(a*)*\1$", action="redact")
+    evil_input = "a" * 30 + "b"
 
     result = await scan_value(evil_input, {}, [spec])
     assert result.action == "redact"

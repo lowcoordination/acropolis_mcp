@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from argus.policy import _finditer_spans_with_timeout
-from db.models import ServerPolicy
+from db.models import ServerPolicy, compile_pattern
 
 logger = logging.getLogger("argus.dlp")
 
@@ -241,7 +241,13 @@ async def _scan_value_with_custom_pattern(text: str, spec: CustomPatternSpec) ->
     kind of position-dependent backtracking blowup a ReDoS pattern is built from), so bounding
     only the first match and then trusting finditer for the rest would leave a real gap."""
     try:
-        compiled = re.compile(spec.pattern, re.IGNORECASE)
+        # #112: compile_pattern prefers re2, whose linear-time guarantee lets the ENTIRE
+        # span-recovery finditer() run inline on the event loop with no process (see
+        # _finditer_spans_with_timeout). Patterns re2 rejects fall back to `re` here, and the
+        # forkserver path below still bounds those at match time. The only exception that can
+        # escape is re.error from that fallback (re2 compile failures are caught inside
+        # compile_pattern), so the guard below is unchanged in meaning.
+        compiled = compile_pattern(spec.pattern)
     except re.error:
         logger.warning("dlp custom_pattern %r for %r failed to compile — skipping", spec.pattern, spec.name)
         return []

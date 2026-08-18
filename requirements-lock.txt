@@ -27,6 +27,7 @@ cffi==2.1.0
 click==8.4.2
 cryptography==50.0.0
 fastapi==0.141.1
+google-re2==1.1.20251105
 h11==0.16.0
 httpcore==1.0.9
 httpcore2==2.9.1

@@ -53,7 +53,12 @@ def test_compiled_patterns_returns_equivalent_patterns():
     rule = ParamRule(block_patterns=["/etc/.*", "secret"])
     compiled = rule.compiled_patterns()
     assert [c.pattern for c in compiled] == ["/etc/.*", "secret"]
-    assert all(isinstance(c, re.Pattern) for c in compiled)
+    # #112: simple patterns re2 accepts are compiled to the re2 engine (inline fast path,
+    # no timeout process); re2-incompatible ones fall back to re.Pattern. Either way the
+    # compiled object exposes .pattern/.search/.finditer — only the engine differs.
+    from db.models import is_re2_pattern
+
+    assert all(is_re2_pattern(c) or isinstance(c, re.Pattern) for c in compiled)
 
 
 def test_compiled_patterns_is_cached_not_recompiled_each_call():

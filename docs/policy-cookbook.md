@@ -89,6 +89,14 @@ than `block_pattern`, so you can tell the two apart.
 This is a deliberate fail-*closed* choice: a rule you explicitly wrote should never silently
 stop enforcing just because the gateway is busy or a worker couldn't start.
 
+**Most patterns never touch the process path at all.** Since the re2 fast path (issue #112),
+any pattern re2 accepts is matched inline on the event loop in microseconds — re2 is linear
+time by construction, so there is nothing to time out. Only patterns re2 rejects
+(backreferences, lookarounds, ...) fall back to the timeout-guarded worker process described
+below, and the fail-closed `block_pattern_undetermined` outcome applies to those. "The match
+itself was slow" below is therefore about the fallback path; a pattern on the re2 path cannot
+be slow against any input.
+
 Starting a match involves forking an isolated worker process first, then running the pattern in
 it — two different things can make that time out, and the gateway logs them differently because
 the fix for each is different:

@@ -186,6 +186,12 @@ async def test_catastrophic_backtracking_pattern_times_out_instead_of_hanging():
     that "(a+)+$" against 31 chars of crafted input hangs Python's `re` for >5s uninterrupted
     — well past what any request should wait. This test proves the fix bounds it.
 
+    The pattern here is deliberately re2-INCOMPATIBLE (a backreference, `\1`): with the #112
+    re2 fast path, any pattern re2 accepts (including the classic "(a+)+$") is matched inline
+    in linear time and needs no timeout at all. The process/timeout path still exists for the
+    patterns re2 rejects, and this is the test that exercises it — the backreference keeps the
+    pattern on that path while still being able to hang Python's `re`.
+
     F2 fix (2026-08-04 review): a timed-out match is now UNDETERMINED, and _check_param treats
     UNDETERMINED on an operator-authored block_pattern rule as a match — i.e. BLOCKED, not
     allowed. The original fail-open design here was found to be silently defeatable under
@@ -195,9 +201,9 @@ async def test_catastrophic_backtracking_pattern_times_out_instead_of_hanging():
 
     policy = ServerPolicy(
         mode="passthrough",
-        param_rules={"tool": {"value": ParamRule(block_patterns=[r"(a+)+$"])}},
+        param_rules={"tool": {"value": ParamRule(block_patterns=[r"^(a*)*\1$"])}},
     )
-    evil_input = "a" * 30 + "!"
+    evil_input = "a" * 30 + "b"
 
     start = time.monotonic()
     decision = await evaluate("tool", {"value": evil_input}, "srv", policy)
@@ -224,9 +230,9 @@ async def test_concurrent_backtracking_patterns_do_not_serialize():
 
     policy = ServerPolicy(
         mode="passthrough",
-        param_rules={"tool": {"value": ParamRule(block_patterns=[r"(a+)+$"])}},
+        param_rules={"tool": {"value": ParamRule(block_patterns=[r"^(a*)*\1$"])}},
     )
-    evil_input = "a" * 30 + "!"
+    evil_input = "a" * 30 + "b"
 
     start = time.monotonic()
     decisions = await asyncio.gather(
@@ -258,13 +264,13 @@ async def test_policy_engine_does_not_fail_open_under_concurrent_redos_flood():
 
     flood_policy = ServerPolicy(
         mode="passthrough",
-        param_rules={"tool": {"value": ParamRule(block_patterns=[r"(a+)+$"])}},
+        param_rules={"tool": {"value": ParamRule(block_patterns=[r"^(a*)*\1$"])}},
     )
     victim_policy = ServerPolicy(
         mode="passthrough",
         param_rules={"tool": {"value": ParamRule(block_patterns=[r"^BLOCK_ME$"])}},
     )
-    evil_input = "a" * 30 + "!"
+    evil_input = "a" * 30 + "b"
 
     async def flood_request():
         return await evaluate("tool", {"value": evil_input}, "flood-server", flood_policy)
@@ -453,9 +459,9 @@ async def test_dlp_custom_pattern_redos_fails_closed_through_evaluate():
 
     policy = ServerPolicy(
         mode="passthrough",
-        dlp_custom_patterns=[DlpCustomPattern(name="evil", pattern=r"(a+)+$", action="block")],
+        dlp_custom_patterns=[DlpCustomPattern(name="evil", pattern=r"^(a*)*\1$", action="block")],
     )
-    evil_input = "a" * 30 + "!"
+    evil_input = "a" * 30 + "b"
 
     start = time.monotonic()
     decision = await evaluate("tool", {"value": evil_input}, "srv", policy)
@@ -464,6 +470,54 @@ async def test_dlp_custom_pattern_redos_fails_closed_through_evaluate():
     assert elapsed < 2.0
     assert decision.blocked
     assert decision.dlp_detector == "evil"
+
+
+# ---------------------------------------------------------------------------
+# #112 — re2 fast path: patterns re2 accepts are matched inline on the event loop with
+# no timeout process (linear-time guarantee), so the ~85-109ms forkserver overhead measured
+# in r5-redos-2026-08-10.md disappears for the common operator-pattern case. Only patterns
+# re2 rejects (backreferences, lookarounds) keep the process path above.
+# ---------------------------------------------------------------------------
+
+async def test_re2_fast_path_engages_for_patterns_re_would_hang_on():
+    """The classic catastrophic-backtracking shape "(a+)+$" is ACCEPTED by re2 — RE2 just
+    matches it in linear time. So through the model (compile_pattern), it must compile to the
+    re2 engine and evaluate inline in microseconds, where Python's `re` would take >5s on the
+    same adversarial input. Proves engine selection works and the fast path actually fires."""
+    import time
+
+    from db.models import is_re2_pattern
+
+    rule = ParamRule(block_patterns=[r"(a+)+$"])
+    compiled = rule.compiled_patterns()[0]
+    assert is_re2_pattern(compiled), "block_pattern compiled to re, expected re2 fast path"
+
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": rule}},
+    )
+    evil_input = "a" * 30 + "!"
+
+    start = time.monotonic()
+    decision = await evaluate("tool", {"value": evil_input}, "srv", policy)
+    elapsed = time.monotonic() - start
+
+    # "(a+)+$" does not match input ending in '!', so the decision is allow — the assertion
+    # that matters is the elapsed time. Sub-millisecond inline; 50ms is a huge margin over
+    # inline while staying far below the ~85ms process-spawn floor the old path paid.
+    assert not decision.blocked
+    assert elapsed < 0.05, f"re2 fast path took {elapsed:.3f}s — engine selection may be broken"
+
+
+async def test_re2_fast_path_recovers_finditer_spans():
+    """The DLP span-recovery primitive on an re2-compiled pattern must return spans inline,
+    with no process involvement — same contract as the process path's well-behaved case."""
+    from db.models import compile_pattern, is_re2_pattern
+
+    compiled = compile_pattern(r"\d+")
+    assert is_re2_pattern(compiled)
+    spans = await _finditer_spans_with_timeout(compiled, "a1 b22 c333")
+    assert spans == [(1, 2), (4, 6), (8, 11)]
 
 
 # ---------------------------------------------------------------------------

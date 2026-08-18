@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from archon.settings import Settings
-from db.models import ParamRule, ServerPolicy
+from db.models import ParamRule, ServerPolicy, is_re2_pattern
 
 logger = logging.getLogger("argus.policy")
 
@@ -30,6 +30,16 @@ logger = logging.getLogger("argus.policy")
 # The fix that actually works: run the match in a separate PROCESS and forcibly terminate it
 # if it doesn't finish in time. A process can be killed regardless of what it's doing
 # internally; a thread cannot.
+#
+# #112 (re2 fast path): the process machinery below is now the FALLBACK. db/models.py's
+# compile_pattern compiles every operator pattern with re2 when it can (google-re2, linear
+# time by construction), and _match_with_timeout/_finditer_spans_with_timeout dispatch on the
+# engine: re2 patterns match inline on the event loop in microseconds — nothing to time out,
+# nothing to kill, the whole machinery below never runs for them. Only patterns re2 rejects
+# (backreferences, lookarounds) take this process path, where the fail-closed UNDETERMINED
+# semantics still apply. Benchmarked in tests/bench/bench_redos.py: the re2 path is ~0.005ms
+# per match vs ~85-109ms for the process round trip (r5-redos-2026-08-10.md), and the old
+# ~126 matches/s concurrency ceiling is gone (see the #112 result note in that file).
 #
 # Context choice: "forkserver", not "fork". Argus is always multi-threaded by the time this
 # runs (asyncio + any library-internal threads), and Python's own multiprocessing docs warn
@@ -255,15 +265,31 @@ async def _run_worker_with_timeout(worker_fn, compiled, value: str, log_label: s
 
 
 async def _match_with_timeout(compiled, value: str) -> MatchOutcome:
-    """Runs compiled.search(value) in a forked child process with a hard wall-clock timeout that
-    starts only once the worker has confirmed (via a readiness Event, not process.start()
-    returning) that it is actually running and about to match — see _run_worker_with_timeout
-    and _wait_for_worker for why process.start() returning is not sufficient. If the match
-    doesn't finish in time, the child is forcibly terminated (SIGTERM, then SIGKILL if it
-    doesn't die promptly) — the part a thread-based approach cannot do. Returns
-    MatchOutcome.UNDETERMINED on timeout (either kind) or infra failure; the caller
-    (_check_param) decides what that means for the block/allow decision, so an undetermined
-    result is never silently folded into "did not match"."""
+    """Runs compiled.search(value) with a hard wall-clock timeout, unless the pattern is an
+    re2 pattern (#112).
+
+    re2 fast path: is_re2_pattern(compiled) means the pattern came from db.models'
+    compile_pattern re2 branch — RE2 is linear-time by construction, so it cannot
+    catastrophically backtrack and there is nothing to time out or kill. The match runs
+    inline on the event loop in microseconds, with no semaphore, executor, readiness
+    handshake, or process spawn. This is the common case for operator patterns (simple
+    charsets/quantifiers/literals) and removes the ~85-109ms forkserver overhead measured in
+    tests/bench/results/r5-redos-2026-08-10.md, whose 90-95% was fork/bootstrap/IPC, not
+    match time.
+
+    Fallback (re.Pattern): spawn a forkserver child running the match with a hard wall-clock
+    timeout that starts only once the worker has confirmed (via a readiness Event, not
+    process.start() returning) that it is actually running and about to match — see
+    _run_worker_with_timeout and _wait_for_worker for why process.start() returning is not
+    sufficient. If the match doesn't finish in time, the child is forcibly terminated
+    (SIGTERM, then SIGKILL if it doesn't die promptly) — the part a thread-based approach
+    cannot do. Returns MatchOutcome.UNDETERMINED on timeout (either kind) or infra failure;
+    the caller (_check_param) decides what that means for the block/allow decision, so an
+    undetermined result is never silently folded into "did not match".
+    """
+    if is_re2_pattern(compiled):
+        return MatchOutcome.MATCHED if compiled.search(value) else MatchOutcome.NOT_MATCHED
+
     matched, _ = await _run_worker_with_timeout(_regex_worker, compiled, value, "block_pattern match")
     if matched is None:
         return MatchOutcome.UNDETERMINED
@@ -279,7 +305,16 @@ async def _finditer_spans_with_timeout(compiled, value: str) -> Optional[list[tu
     readiness/timeout/kill handling) so the two stay behaviorally identical on the timeout/kill
     path; only the worker function and result shape differ. Returns None on timeout (either
     kind) or infra failure — the caller must treat that as UNDETERMINED and fail closed,
-    exactly as MatchOutcome.UNDETERMINED does for _match_with_timeout."""
+    exactly as MatchOutcome.UNDETERMINED does for _match_with_timeout.
+
+    re2 fast path (#112): same inline dispatch as _match_with_timeout — an re2 pattern
+    cannot backtrack catastrophically, so the whole finditer() span recovery runs on the
+    event loop with no process; the linear-time guarantee covers every restart of matching
+    that finditer performs, closing the position-dependent-blowup gap the process path
+    exists for."""
+    if is_re2_pattern(compiled):
+        return [(m.start(), m.end()) for m in compiled.finditer(value)]
+
     spans, _ = await _run_worker_with_timeout(
         _finditer_spans_worker, compiled, value, "dlp custom pattern finditer"
     )

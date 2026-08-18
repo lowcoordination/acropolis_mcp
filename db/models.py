@@ -5,6 +5,56 @@ from typing import Optional
 
 from pydantic import BaseModel, PrivateAttr, field_validator
 
+# #112: re2 fast path for operator patterns. re2 (google-re2) guarantees linear-time matching —
+# a pattern it accepts CANNOT catastrophically backtrack — so argus/policy.py matches those
+# inline on the event loop with no timeout process. Patterns re2 rejects at compile
+# (backreferences, lookarounds, atomic groups, ...) fall back to `re` and keep the existing
+# forkserver/timeout path, preserving fail-closed UNDETERMINED semantics unchanged.
+#
+# Engine choice is decided HERE, at compile-on-write (model construction / policy save), never
+# at request time, so a given pattern string is deterministically the same engine on every
+# replica and every request. google-re2 is a hard dependency (#112) — this import guard only
+# covers a partially-installed environment (e.g. a running process from before a deploy).
+try:
+    import re2 as _re2
+
+    # Options mirror the flags every caller in this module historically compiled with
+    # (re.IGNORECASE only): case-insensitive matching, and log_errors off so a pattern that
+    # re2 rejects and we fall back to `re` doesn't spam stderr with RE2's parse diagnostics.
+    _RE2_OPTIONS = _re2.Options()
+    _RE2_OPTIONS.case_sensitive = False
+    _RE2_OPTIONS.log_errors = False
+except ImportError:  # pragma: no cover — hard dependency; guard is for partial installs
+    _re2 = None
+    _RE2_OPTIONS = None
+
+
+def compile_pattern(pattern: str):
+    """Compile an operator-supplied pattern for MATCHING, preferring re2 when it accepts the
+    syntax (see the module header for why). Returns a re2 pattern (matched inline, no timeout
+    process) or a re.Pattern (matched via the forkserver path in argus/policy.py).
+
+    Case-insensitive, matching the `re.IGNORECASE` every historical caller used. re2 rejects
+    some syntax Python `re` accepts (backreferences, lookarounds); those fall through to `re`,
+    and the process path still bounds them at match time.
+    """
+    if _re2 is not None:
+        try:
+            return _re2.compile(pattern, options=_RE2_OPTIONS)
+        except Exception:
+            # re2-incompatible syntax — fall through to re; policy.py's process path keeps the
+            # ReDoS bound. Not a security concern: the fallback is the pre-#112 behavior.
+            pass
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def is_re2_pattern(compiled) -> bool:
+    """Whether `compiled` came from compile_pattern's re2 path — i.e. matching it inline is
+    safe with NO timeout process, because re2's linear-time guarantee makes catastrophic
+    backtracking impossible for anything it compiled."""
+    return _re2 is not None and type(compiled).__module__ == _re2.__name__
+
+
 SLUG_RE = re.compile(r"^[a-z0-9-]+$")
 
 
@@ -29,16 +79,23 @@ class ParamRule(BaseModel):
                 raise ValueError(f"invalid regex {p!r}: {e}") from e
         return patterns
 
-    _compiled_cache: Optional[list[re.Pattern]] = PrivateAttr(default=None)
+    _compiled_cache: Optional[list] = PrivateAttr(default=None)
+    # ^ list of re.Pattern | re2._Regexp (see compile_pattern) — bare `list` annotation because
+    # the re2 type is only importable when the module is installed; the engine of each element
+    # is discoverable via is_re2_pattern.
 
-    def compiled_patterns(self) -> list[re.Pattern]:
+    def compiled_patterns(self) -> list:
         # F26 fix (review 2026-08-04): this recompiled every pattern from scratch on every call,
         # and it's on the tools/call hot path (argus/policy.py's _check_param runs it per param
         # per request). block_patterns is validated (and thus fixed) at construction time and
         # never mutated afterward — see the field_validator above — so it's safe to compile once
         # and cache on the instance.
+        #
+        # #112: compilation goes through compile_pattern, so every pattern re2 accepts lands on
+        # the inline fast path (is_re2_pattern(...) is True) and only re2-incompatible patterns
+        # keep using the forkserver machinery at match time.
         if self._compiled_cache is None:
-            self._compiled_cache = [re.compile(p, re.IGNORECASE) for p in self.block_patterns]
+            self._compiled_cache = [compile_pattern(p) for p in self.block_patterns]
         return self._compiled_cache
 
 

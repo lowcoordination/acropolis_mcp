@@ -135,11 +135,15 @@ existing exclusion of `args_summary` from every webhook payload.
 `dlp_custom_patterns` are operator-supplied regex — untrusted input, exactly the attack surface
 the F2 security fix (`argus/policy.py`'s `_match_with_timeout`) was built for. Every custom
 pattern match, including span recovery for `redact` (which needs match *positions*, not just a
-yes/no), runs inside the same forkserver-isolated, wall-clock-bounded process F2 uses for
-`block_patterns`. A pathological pattern — `(a+)+$` against a crafted input, hangs Python's `re`
-engine for many seconds uninterrupted — times out and is treated as **UNDETERMINED, which fails
-closed**: the entire argument value is treated as a match (and blocked, or redacted to a single
-placeholder), never silently passed through.
+yes/no), is bounded against catastrophic backtracking. Since the re2 fast path (issue #112),
+patterns re2 accepts are matched inline in linear time — re2 cannot catastrophically
+backtrack, so the whole scan (including every `finditer()` restart) runs directly on the event
+loop in microseconds. Patterns re2 rejects (backreferences, lookarounds, ...) fall back to the
+forkserver-isolated, wall-clock-bounded process F2 uses for `block_patterns`. A pathological
+pattern on that fallback path — `^(a*)*\1$` (a backreference, hence re2-rejected) against a
+crafted input, hangs Python's `re` engine for many seconds uninterrupted — times out and is
+treated as **UNDETERMINED, which fails closed**: the entire argument value is treated as a
+match (and blocked, or redacted to a single placeholder), never silently passed through.
 
 One subtlety worth calling out explicitly: bounding only the *first* `search()` call is not
 enough. `re.finditer()` restarts matching from each match's end position, and a pattern whose

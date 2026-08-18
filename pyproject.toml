@@ -20,6 +20,12 @@ dependencies = [
     # (archon/secrets/encrypted.py). No other module in this codebase does cryptography of its
     # own — password hashing (archon/passwords.py) and API key hashing use stdlib hashlib.
     "cryptography>=42.0.0",
+    # #112: re2 fast path for operator regexes (block_patterns, DLP custom patterns). re2
+    # guarantees linear-time matching, so any pattern it accepts is matched inline on the event
+    # loop with no timeout process; the forkserver machinery in argus/policy.py remains as the
+    # fallback for patterns re2 rejects (backreferences/lookarounds), keeping fail-closed
+    # UNDETERMINED semantics unchanged. Ships cp312/cp314 manylinux wheels (verified 1.1.2025).
+    "google-re2>=1.1.2024",
 ]
 
 [project.optional-dependencies]
