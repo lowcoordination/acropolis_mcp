@@ -40,7 +40,7 @@ from argus.rate_limiter import (
 from argus.toolslist import ToolsCache
 from argus.tracing import TracingManager, _DisabledTracingManager
 from db.database import utcnow
-from db.models import ServerPolicy, ServerRecord
+from db.models import ApiKeyRecord, ServerPolicy, ServerRecord
 from db.repo import ServerRepo, SettingsRepo, UsageRepo
 
 if TYPE_CHECKING:
@@ -136,6 +136,8 @@ class Pipeline:
         self, request: Request, slug: str, path: str, body_override: Optional[bytes] = None,
         force_generation: Optional[ClientGeneration] = None,
         skip_api_key_auth: bool = False, origin: Optional[str] = None,
+        pre_authenticated: Optional[ApiKeyRecord] = None,
+        resolved_server: Optional[ServerRecord] = None,
     ) -> Response:
         """`body_override` lets a caller (the aggregate pipeline) substitute a rewritten body
         — e.g. a de-namespaced tool name — without touching Starlette's internal body cache.
@@ -154,6 +156,18 @@ class Pipeline:
         authenticated as admin) and tags its audit row `origin='test'` so it never pollutes
         /stats or looks like real client traffic. Only the control plane's test-call route may
         set these; nothing on the data plane ever does.
+
+        `pre_authenticated` + `resolved_server` exist for the aggregate re-dispatch (#111):
+        the aggregate endpoint has ALREADY verified the bearer key (hash-verify + enabled
+        check) and already fetched the target server before it routes a namespaced tools/call
+        here, and re-running either is pure duplicate DB work inside the same request. The
+        record/server are handed in so this method skips those two reads — but the two SCOPE
+        checks (`key_permits_server` + the project-agreement invariant) are still enforced
+        here, because they are pure Python over the record and server and `authenticate_no_scope`
+        deliberately skipped them at the aggregate layer. This is NOT the `skip_api_key_auth`
+        path: that one nulls the key entirely (control-plane Try-it only, no quota attribution),
+        while this one threads the verified record through so rate limits, quota, policy, and
+        usage attribution all apply identically to a direct per-server call.
         """
         start = time.monotonic()
         server: Optional[ServerRecord] = None
@@ -171,16 +185,26 @@ class Pipeline:
             parent_context=parent_ctx,
         ) as root_span:
             try:
-                server = await self._resolve_server(slug)
-                api_key_id = (
-                    None if skip_api_key_auth else await self._authenticate(request, slug, server)
-                )
+                if resolved_server is not None:
+                    server = resolved_server
+                else:
+                    server = await self._resolve_server(slug)
+                if skip_api_key_auth:
+                    key_record: Optional[ApiKeyRecord] = None
+                elif pre_authenticated is not None:
+                    # Aggregate re-dispatch — the key was verified once already this request;
+                    # only the per-server scope checks still need to run (see docstring).
+                    self._check_key_scope(pre_authenticated, slug, server)
+                    key_record = pre_authenticated
+                else:
+                    key_record = await self._authenticate(request, slug, server)
+                api_key_id = key_record.id if key_record is not None else None
                 body_bytes = (
                     self._guard_body_size(body_override) if body_override is not None
                     else await self._read_body_guarded(request)
                 )
                 response = await self._process(
-                    request, server, path, body_bytes, api_key_id,
+                    request, server, path, body_bytes, key_record,
                     force_generation=force_generation, origin=origin,
                 )
                 root_span.set_attribute("http.status_code", response.status_code)
@@ -218,12 +242,17 @@ class Pipeline:
                 return stored
         return self._settings.auth_mode
 
-    async def authenticate_no_scope(self, request: Request) -> Optional[int]:
+    async def authenticate_no_scope(self, request: Request) -> Optional[ApiKeyRecord]:
         """Auth check with no per-server scope requirement — for entry points that aren't
         about one specific server (the aggregate endpoint's tools/list and server/discover,
         which span every registered server). Still fully respects auth_mode and requires a
         valid, enabled key when auth_mode is 'keyed'; just skips the scope check that
-        _authenticate does for a single-server request."""
+        _authenticate does for a single-server request.
+
+        Returns the verified ApiKeyRecord (or None in open auth mode) so callers can reuse
+        it instead of re-fetching the row by id (#111) — the aggregate passes it on to
+        _caller_project_id and, for tools/call, back into Pipeline.handle as
+        pre_authenticated."""
         if await self._current_auth_mode() == "open":
             return None
         auth_header = request.headers.get("authorization", "")
@@ -233,9 +262,11 @@ class Pipeline:
         record = await self._api_keys.verify(plaintext)
         if record is None:
             raise RoutingError(401, rpc_error(None, "invalid or disabled api key"))
-        return record.id
+        return record
 
-    async def _authenticate(self, request: Request, slug: str, server: ServerRecord) -> Optional[int]:
+    async def _authenticate(
+        self, request: Request, slug: str, server: ServerRecord,
+    ) -> Optional[ApiKeyRecord]:
         if await self._current_auth_mode() == "open":
             return None
 
@@ -246,31 +277,42 @@ class Pipeline:
         record = await self._api_keys.verify(plaintext)
         if record is None:
             raise RoutingError(401, rpc_error(None, "invalid or disabled api key"))
+        # The two per-server scope checks live in _check_key_scope, shared verbatim with the
+        # aggregate re-dispatch path — see that method's docstring for the full reasoning on
+        # why each check exists and why both must pass.
+        self._check_key_scope(record, slug, server)
+        return record
+
+    def _check_key_scope(self, record: ApiKeyRecord, slug: str, server: ServerRecord) -> None:
+        """The two per-server scope checks, shared by _authenticate (after a fresh verify)
+        and handle()'s pre_authenticated re-dispatch (#111), where the aggregate has already
+        verified the key this request and only these checks still need to run. Both are pure
+        Python over the record and the server — no DB — so the pre-authenticated path pays
+        nothing for keeping them.
+
+        The first check is key_permits_server — server_scopes is an operator-configured
+        allowlist of slugs (may be None = "any server"). The second is the project-agreement
+        invariant that must hold regardless: a key minted in project A must never reach a
+        server in project B, even if server_scopes was (mis)configured to name that server by
+        slug. The two checks COMPOSE (both must pass), neither replaces the other. Deliberately
+        does NOT consult any notion of "global admin" — there is no Principal/session on the
+        data plane, only a key; the global-admin-superset rule is a CONTROL-plane
+        (session-based) concept in archon/project_rbac.py and must never leak into this purely
+        key-vs-server check.
+
+        Explicit `is None` check rather than relying on `!=` alone: `None != None` is False
+        in Python, so a bare `record.project_id != server.project_id` would treat a
+        project-less KEY and a project-less SERVER as matching. Currently unreachable
+        (0010_projects.sql backfills every existing row to 'default', and both
+        ApiKeyRepo.create/ServerRepo.create resolve an explicit project_id at write time —
+        see that migration's header), but this is the one project-boundary check in the
+        codebase that must fail closed on NULL the way archon/project_rbac.py's resolvers
+        all deliberately do, even if that invariant is ever violated by a future code path.
+        """
         if not self._api_keys.key_permits_server(record, slug):
             raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
-        # A SEPARATE check from key_permits_server above — server_scopes is an
-        # operator-configured allowlist of slugs (may be None = "any server"), while this is
-        # the project-agreement invariant that must hold regardless: a key minted in project A
-        # must never reach a server in project B, even if server_scopes was (mis)configured to
-        # name that server by slug. The two checks COMPOSE (both must pass), neither replaces
-        # the other. Deliberately does NOT consult any notion of "global admin" — there is no
-        # Principal/session on the data plane, only a key; the global-admin-superset rule is a
-        # CONTROL-plane (session-based) concept in archon/project_rbac.py and must never leak
-        # into this purely key-vs-server check. `server` is the SAME record _resolve_server
-        # already fetched in handle() above — reused here rather than re-querying by slug,
-        # since this method now runs strictly after that resolution on every real call path.
-        #
-        # Explicit `is None` check rather than relying on `!=` alone: `None != None` is False
-        # in Python, so a bare `record.project_id != server.project_id` would treat a
-        # project-less KEY and a project-less SERVER as matching. Currently unreachable
-        # (0010_projects.sql backfills every existing row to 'default', and both
-        # ApiKeyRepo.create/ServerRepo.create resolve an explicit project_id at write time —
-        # see that migration's header), but this is the one project-boundary check in the
-        # codebase that must fail closed on NULL the way archon/project_rbac.py's resolvers
-        # all deliberately do, even if that invariant is ever violated by a future code path.
         if record.project_id is None or record.project_id != server.project_id:
             raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
-        return record.id
 
     async def _read_body_guarded(self, request: Request) -> bytes:
         content_length = request.headers.get("content-length")
@@ -296,11 +338,15 @@ class Pipeline:
         server: ServerRecord,
         path: str,
         body_bytes: bytes,
-        api_key_id: Optional[int],
+        key_record: Optional[ApiKeyRecord],
         force_generation: Optional[ClientGeneration] = None,
         origin: Optional[str] = None,
     ) -> Response:
         start = time.monotonic()
+        # api_key_id is derived once here for the audit/usage call sites; the record itself
+        # rides along for _enforce/_check_quota so the row is never re-fetched by id within
+        # the same request (#111).
+        api_key_id = key_record.id if key_record is not None else None
         rpc_id: Any = None
         rpc_method: str = ""
         tool_name: Optional[str] = None
@@ -367,7 +413,7 @@ class Pipeline:
                 if generation == ClientGeneration.GEN_2026 and self._bridge is not None:
                     return await self._handle_bridged(
                         server, rpc_method, rpc_id, params, body_json.get("_meta"),
-                        api_key_id, start, client_ip, origin=origin,
+                        key_record, start, client_ip, origin=origin,
                     )
 
                 if rpc_method == "tools/call":
@@ -376,7 +422,7 @@ class Pipeline:
                     # is only one place the params-can-be-None case is guarded.
                     tool_name = params.get("name")
                     outcome = await self._enforce(
-                        server, rpc_method, rpc_id, params, tool_name, api_key_id,
+                        server, rpc_method, rpc_id, params, tool_name, key_record,
                         start, client_ip, origin=origin,
                     )
                     if outcome.blocked_response is not None:
@@ -444,7 +490,7 @@ class Pipeline:
 
     async def _enforce(
         self, server: ServerRecord, rpc_method: str, rpc_id: Any, params: dict,
-        tool_name: Optional[str], api_key_id: Optional[int], start: float,
+        tool_name: Optional[str], key_record: Optional[ApiKeyRecord], start: float,
         client_ip: Optional[str], origin: Optional[str] = None, *, bridged: bool = False,
     ) -> _EnforcementOutcome:
         """The enforcement prelude shared by _process (passthrough) and _handle_bridged (issue
@@ -468,6 +514,7 @@ class Pipeline:
         # point is sub-millisecond, so int(...) truncates it away. Each log call below computes
         # latency_ms fresh at its own call site instead, matching how _refuse/_error already do
         # it.
+        api_key_id = key_record.id if key_record is not None else None
         audit_common = dict(
             server_slug=server.slug, endpoint="per-server", rpc_method=rpc_method,
             api_key_id=api_key_id, client_ip=client_ip, origin=origin,
@@ -495,7 +542,7 @@ class Pipeline:
             return _EnforcementOutcome(blocked_response=blocked_response)
 
         quota_response = await self._check_quota(
-            server, tool_name, api_key_id, rpc_id, start, client_ip
+            server, tool_name, key_record, rpc_id, start, client_ip
         )
         if quota_response is not None:
             await self._record_usage(server, tool_name, api_key_id)
@@ -608,13 +655,14 @@ class Pipeline:
 
     async def _handle_bridged(
         self, server: ServerRecord, rpc_method: str, rpc_id: Any, params: dict,
-        meta: Optional[dict], api_key_id: Optional[int], start: float,
+        meta: Optional[dict], key_record: Optional[ApiKeyRecord], start: float,
         client_ip: Optional[str] = None, origin: Optional[str] = None,
     ) -> Response:
+        api_key_id = key_record.id if key_record is not None else None
         if rpc_method == "tools/call":
             tool_name = params.get("name")
             outcome = await self._enforce(
-                server, rpc_method, rpc_id, params, tool_name, api_key_id,
+                server, rpc_method, rpc_id, params, tool_name, key_record,
                 start, client_ip, origin=origin, bridged=True,
             )
             if outcome.blocked_response is not None:
@@ -750,7 +798,7 @@ class Pipeline:
         return None
 
     async def _check_quota(
-        self, server: ServerRecord, tool_name: str, api_key_id: Optional[int],
+        self, server: ServerRecord, tool_name: str, key_record: Optional[ApiKeyRecord],
         rpc_id: Any, start: float, client_ip: Optional[str] = None,
     ) -> Optional[Response]:
         """Call-count budget over a billing period, enforced AFTER auth and AFTER the rate
@@ -764,7 +812,8 @@ class Pipeline:
         _resolve_credential for the fail-closed precedent this deliberately departs from, and
         docs/quotas.md for the full rationale written out). If self._usage is None (no
         UsageRepo wired — every pre-feature call site and test), if the key has no quota
-        configured, or if the quota check ITSELF fails (a DB error reading total_since), the
+        configured, or if the quota check ITSELF fails (a DB error reading total_since — the
+        key row itself is never re-read here, see the code comment), the
         call proceeds exactly as if no quota existed. The only way this method blocks a call is
         a clean, successful read that shows the caller genuinely over budget.
 
@@ -783,14 +832,17 @@ class Pipeline:
         limiter exists to prevent — the two features have different jobs and different
         correctness requirements as a result. Worth being explicit about rather than silent.
         """
-        if self._usage is None or api_key_id is None:
+        if self._usage is None or key_record is None:
+            return None
+        # #111: `key_record` is the SAME row _authenticate/authenticate_no_scope already
+        # verified this request — it is passed through rather than re-fetched by id. The old
+        # api_keys.get() here was a second get_by_id of an identical, request-scoped record.
+        key = key_record
+        if key.quota_calls is None or key.quota_period is None:
             return None
         try:
-            key = await self._api_keys.get(api_key_id)
-            if key is None or key.quota_calls is None or key.quota_period is None:
-                return None
             since = period_start(key.quota_period).isoformat()
-            used = await self._usage.total_since(api_key_id=api_key_id, since_iso=since)
+            used = await self._usage.total_since(api_key_id=key.id, since_iso=since)
         except Exception:
             # Fail open — see docstring. A DB hiccup on the quota check must never take down
             # the data plane; the worst case of forwarding anyway is one call slightly over a
@@ -798,7 +850,7 @@ class Pipeline:
             # failing open could leak a request to an upstream expecting credentials).
             logger.error(
                 "quota check failed for api_key_id=%s server=%s tool=%s — failing open",
-                api_key_id, server.slug, tool_name, exc_info=True,
+                key_record.id, server.slug, tool_name, exc_info=True,
             )
             return None
 
@@ -810,7 +862,7 @@ class Pipeline:
             server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
             message="Quota exceeded", status=429, rule="quota",
             reason=f"Quota exceeded: {used}/{key.quota_calls} calls this {key.quota_period}",
-            api_key_id=api_key_id, start=start, client_ip=client_ip,
+            api_key_id=key.id, start=start, client_ip=client_ip,
             endpoint="per-server", rpc_method="tools/call",
             data={"tool": tool_name, "quota_period": key.quota_period},
         )

@@ -16,6 +16,7 @@ from argus.discover import synthesize_gateway_discover
 from argus.generation import ClientGeneration
 from argus.jsonrpc import rpc_error, sanitize_rpc_id
 from argus.pipeline import Pipeline, RoutingError, _client_ip
+from db.models import ApiKeyRecord
 from db.repo import ServerNotFoundError, ServerRepo, SettingsRepo
 
 logger = logging.getLogger("argus.aggregate_pipeline")
@@ -70,7 +71,11 @@ class AggregatePipeline:
         # and would otherwise skip authentication entirely regardless of auth_mode. Check
         # up front, before even parsing the body, so every method on this endpoint is gated.
         try:
-            api_key_id = await self._per_server.authenticate_no_scope(request)
+            # The VERIFIED record is kept, not just its id (#111): it feeds _caller_project_id
+            # (no re-fetch of the key row) and, for tools/call, Pipeline.handle's
+            # pre_authenticated re-dispatch (no second hash-verify/get_by_hash within the same
+            # request). Pipeline.handle still runs the per-server scope checks on it.
+            key_record = await self._per_server.authenticate_no_scope(request)
         except RoutingError as e:
             return await self._per_server._error(
                 server_slug=None, tool=None, status=e.status_code,
@@ -116,11 +121,11 @@ class AggregatePipeline:
         params = body_json.get("params", {}) or {}
 
         if rpc_method == "tools/list":
-            return await self._handle_tools_list(rpc_id, start, client_ip, api_key_id)
+            return await self._handle_tools_list(rpc_id, start, client_ip, key_record)
         if rpc_method == "tools/call":
-            return await self._handle_tools_call(request, body_json, rpc_id, params)
+            return await self._handle_tools_call(request, body_json, rpc_id, params, key_record)
         if rpc_method == "server/discover":
-            return await self._handle_discover(rpc_id, api_key_id)
+            return await self._handle_discover(rpc_id, key_record)
 
         return await self._per_server._error(
             server_slug=None, tool=None, status=501,
@@ -130,7 +135,7 @@ class AggregatePipeline:
             rpc_method=rpc_method,
         )
 
-    async def _caller_project_id(self, api_key_id: Optional[int]) -> Optional[int]:
+    async def _caller_project_id(self, key_record: Optional[ApiKeyRecord]) -> Optional[int]:
         """Resolves which project the aggregate view should be scoped to (multi-tenancy).
 
         `None` (open auth_mode, no key at all) means "no project filter" —
@@ -141,14 +146,17 @@ class AggregatePipeline:
         registered server regardless of which key called it; now it spans only that key's
         project's servers. There is no global-admin-superset concept on the data plane (see
         Pipeline._authenticate's own comment on why) — a key's project is a property of the KEY
-        row, full stop, regardless of what global/project role its owner happens to hold."""
-        if api_key_id is None:
-            return None
-        key = await self._api_keys.get(api_key_id)
-        return key.project_id if key is not None else None
+        row, full stop, regardless of what global/project role its owner happens to hold.
 
-    async def _handle_discover(self, rpc_id: Any, api_key_id: Optional[int] = None) -> Response:
-        project_id = await self._caller_project_id(api_key_id)
+        #111: reads project_id straight off the ApiKeyRecord authenticate_no_scope already
+        returned — that method fetched (and verified) the row earlier in this same request, so
+        re-fetching it by id here was a pure duplicate query."""
+        if key_record is None:
+            return None
+        return key_record.project_id
+
+    async def _handle_discover(self, rpc_id: Any, key_record: Optional[ApiKeyRecord] = None) -> Response:
+        project_id = await self._caller_project_id(key_record)
         servers = await self._servers.list(project_id=project_id)
         result = synthesize_gateway_discover(servers)
         return Response(
@@ -193,7 +201,8 @@ class AggregatePipeline:
         return namespaced_tools
 
     async def _handle_tools_list(
-        self, rpc_id: Any, start: float, client_ip=None, api_key_id: Optional[int] = None,
+        self, rpc_id: Any, start: float, client_ip=None,
+        key_record: Optional[ApiKeyRecord] = None,
     ) -> Response:
         # Servers are fetched CONCURRENTLY (the gather below), never in a sequential loop: each
         # server's cost is a full upstream handshake plus a tools/list round-trip on a cache
@@ -204,7 +213,7 @@ class AggregatePipeline:
         # project_id=None (open auth_mode) means unfiltered; a real key scopes to its own
         # project — see _caller_project_id's docstring for why that is a deliberate behavior
         # change.
-        project_id = await self._caller_project_id(api_key_id)
+        project_id = await self._caller_project_id(key_record)
         servers = [
             s for s in (await self._servers.list(project_id=project_id)) if s.enabled and s.in_aggregate
         ]
@@ -227,7 +236,8 @@ class AggregatePipeline:
         )
 
     async def _handle_tools_call(
-        self, request: Request, body_json: dict, rpc_id: Any, params: dict
+        self, request: Request, body_json: dict, rpc_id: Any, params: dict,
+        key_record: Optional[ApiKeyRecord] = None,
     ) -> Response:
         namespaced_name = params.get("name")
         if not namespaced_name or not isinstance(namespaced_name, str):
@@ -264,10 +274,17 @@ class AggregatePipeline:
         # the normal per-server pipeline, so auth/rate-limit/policy/audit all apply identically
         # to a direct /mcp/{slug} call — the aggregate is a routing layer, not a parallel path.
         # Passed as body_override rather than mutating Starlette's internal body cache.
+        #
+        # #111: the verified key_record and the server row fetched just above are handed to
+        # Pipeline.handle (pre_authenticated/resolved_server) instead of being re-verified and
+        # re-fetched inside the same request — a second get_by_hash + SHA-256 and a second
+        # servers.get(slug). Pipeline.handle still enforces the per-server scope checks on the
+        # record; those are pure Python and were deliberately skipped by authenticate_no_scope.
         rewritten_body = dict(body_json)
         rewritten_body["params"] = {**params, "name": tool_name}
 
         return await self._per_server.handle(
             request, slug, "", body_override=json.dumps(rewritten_body).encode(),
             force_generation=ClientGeneration.GEN_2026,
+            pre_authenticated=key_record, resolved_server=server,
         )
