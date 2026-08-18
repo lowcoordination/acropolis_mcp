@@ -10,7 +10,13 @@ import httpx
 from archon.background import BackgroundLoop
 from archon.secrets import SecretProvider, SecretResolutionError
 from archon.secrets.local import LocalSecretProvider
-from argus.upstream import CLIENT_INFO, UpstreamHandshakeCache, UpstreamHandshakeError, parse_sse_body
+from argus.upstream import (
+    CLIENT_INFO,
+    MCP_2026_VERSION,
+    UpstreamHandshakeCache,
+    UpstreamHandshakeError,
+    parse_sse_body,
+)
 from db.models import ServerRecord
 from db.repo import ServerNotFoundError, ServerRepo
 from stoa.webhooks import WebhookDispatcher
@@ -48,7 +54,16 @@ async def probe_server(
     source of truth for whether THIS was a secrets problem.
     """
     secrets = secret_provider or LocalSecretProvider()
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        # Advertise the modern era so 2026-generation upstreams answer `server/discover`
+        # directly; 2025-generation upstreams ignore/4xx it and use the initialize fallback.
+        "MCP-Protocol-Version": MCP_2026_VERSION,
+        # 2026 spec: the modern transport validates that the request's method appears in
+        # both the body and this header (HEADER_MISMATCH otherwise).
+        "mcp-method": "server/discover",
+    }
     # A server with a configured upstream credential needs it on the health probe too, or every
     # registered server requiring auth would show permanently unhealthy regardless of whether
     # tools/call itself works.
@@ -69,7 +84,18 @@ async def probe_server(
         headers["Authorization"] = resolved_auth_header
     discover_body = {
         "jsonrpc": "2.0", "id": "acropolis-discover", "method": "server/discover",
-        "params": {"clientInfo": CLIENT_INFO},
+        # Modern (2026-07-28) discovery: the server advertises supportedVersions/capabilities
+        # via `server/discover`; the request must carry the per-request envelope in `_meta`
+        # (protocolVersion + clientCapabilities) and the matching `MCP-Protocol-Version` and
+        # `mcp-method` headers, per the 2026 spec. 2025-generation upstreams answer this with
+        # a method-not-found / session error and fall through to the initialize handshake below.
+        "params": {
+            "clientInfo": CLIENT_INFO,
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MCP_2026_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        },
     }
 
     try:
