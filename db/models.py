@@ -41,9 +41,15 @@ def compile_pattern(pattern: str):
     if _re2 is not None:
         try:
             return _re2.compile(pattern, options=_RE2_OPTIONS)
-        except Exception:
-            # re2-incompatible syntax — fall through to re; policy.py's process path keeps the
-            # ReDoS bound. Not a security concern: the fallback is the pre-#112 behavior.
+        except (_re2.error, ValueError, TypeError):
+            # re2-incompatible SYNTAX (backreference/lookaround/...) — the documented
+            # fallback to `re`, bounded at match time by policy.py's process path. Not a
+            # security concern: the fallback is the pre-#112 behavior.
+            #
+            # Deliberately NARROW (#112 review remediation): any OTHER exception from the
+            # binding (a defect, not a syntax incompatibility) must propagate and surface
+            # loudly, not be silently misread as "re2 didn't accept this pattern". The
+            # re.compile below still raises re.error for genuinely invalid patterns.
             pass
     return re.compile(pattern, re.IGNORECASE)
 

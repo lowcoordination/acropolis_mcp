@@ -168,7 +168,19 @@ class Pipeline:
         path: that one nulls the key entirely (control-plane Try-it only, no quota attribution),
         while this one threads the verified record through so rate limits, quota, policy, and
         usage attribution all apply identically to a direct per-server call.
+
+        `skip_api_key_auth` and `pre_authenticated` are MUTUALLY EXCLUSIVE auth modes — one
+        means "no key at all" (control-plane Try-it), the other means "this key was already
+        verified, enforce it." Passing both is a caller bug, not a state this method can
+        meaningfully resolve; it is asserted below rather than silently letting one win.
         """
+        # Precondition on the caller (the aggregate pipeline is the only one that passes these):
+        # the two bypass modes are contradictory, and silently picking a precedence here would
+        # either drop an authenticated key or skip the scope checks on a control-plane call.
+        assert not (skip_api_key_auth and pre_authenticated is not None), (
+            "Pipeline.handle: skip_api_key_auth (control-plane Try-it, no key) and "
+            "pre_authenticated (aggregate re-dispatch, verified key) are mutually exclusive"
+        )
         start = time.monotonic()
         server: Optional[ServerRecord] = None
         # The root span parents under the CALLER's own inbound traceparent (if any), so a trace
