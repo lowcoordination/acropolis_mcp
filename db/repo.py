@@ -182,6 +182,96 @@ class _PoolAccess:
         return acquire_with_timeout(self._db.writer, self._db.POOL_ACQUIRE_TIMEOUT)
 
 
+class _Where:
+    """Parameterized WHERE-clause builder shared by this module's query methods.
+
+    Replaces the per-method `clauses, params = [], []` + nested `def _p(value)` closure
+    that was copied (with slight variations) into AuditRepo.query / count_since,
+    UsageRepo.query, AdminEventRepo.query and ProposalRepo.list. The closure's one job —
+    bind a value and return its positional placeholder — is easy to get subtly wrong when
+    re-derived per method (a `$N` miscount silently shifts every parameter), and the
+    conventions that must stay consistent across methods (None means "don't filter", an
+    EMPTY list means "match nothing" via 1=0, every caller-supplied VALUE is a bound
+    parameter) are now expressed once, in one place.
+
+    Deliberately tiny: it knows no table or column, only the shapes every WHERE in this
+    module actually needs (`column = $n`, `column >= $n`, `column = ANY($n)`), plus a
+    raw-clause escape hatch for the few conditions that fit neither (the LIKE-triple in
+    AuditRepo.query, the fixed `origin IS NULL` in count_since) and a `bind()` for values
+    that appear in a non-filter position (LIMIT) or want one parameter referenced several
+    times (AuditRepo.query's LIKE triple binds the same value once and reuses the
+    placeholder in all three branches, instead of three identical parameters).
+    """
+
+    def __init__(self) -> None:
+        self._clauses: list[str] = []
+        self._params: list = []
+
+    def eq(self, column: str, value) -> "_Where":
+        """`column = $n` — skipped when value is None (None means "don't filter", the
+        module-wide convention; it is never a legitimate filter value)."""
+        if value is not None:
+            self._clauses.append(f"{column} = {self._bind(value)}")
+        return self
+
+    def ge(self, column: str, value) -> "_Where":
+        """`column >= $n` — the inclusive-lower-bound shape used for `since` filters."""
+        if value is not None:
+            self._clauses.append(f"{column} >= {self._bind(value)}")
+        return self
+
+    def le(self, column: str, value) -> "_Where":
+        """`column <= $n` — the inclusive-upper-bound shape used for `until` filters."""
+        if value is not None:
+            self._clauses.append(f"{column} <= {self._bind(value)}")
+        return self
+
+    def lt(self, column: str, value) -> "_Where":
+        """`column < $n` — the exclusive-upper-bound shape (audit keyset pagination)."""
+        if value is not None:
+            self._clauses.append(f"{column} < {self._bind(value)}")
+        return self
+
+    def any_of(self, column: str, values) -> "_Where":
+        """`column = ANY($n)` with the list bound as one array parameter. An EMPTY list
+        becomes `1=0` — "no possible rows" — the convention AuditRepo.query/count_since
+        already used for a project with zero servers (an empty IN-list must match nothing,
+        not everything)."""
+        if not values:
+            self._clauses.append("1=0")
+        else:
+            self._clauses.append(f"{column} = ANY({self._bind(values)})")
+        return self
+
+    def is_null(self, column: str) -> "_Where":
+        """`column IS NULL` — for filters where NULL is a meaningful value (audit origin)."""
+        self._clauses.append(f"{column} IS NULL")
+        return self
+
+    def raw(self, clause: str) -> "_Where":
+        """Add a pre-built clause with no parameters of its own (e.g. `origin IS NULL`)."""
+        self._clauses.append(clause)
+        return self
+
+    def bind(self, value) -> str:
+        """Bind a value OUTSIDE a clause and return its placeholder — for values that
+        appear in a non-filter position (LIMIT) or in a hand-written clause that wants the
+        same parameter bound once and referenced several times."""
+        return self._bind(value)
+
+    def where_sql(self) -> str:
+        """The full `WHERE ...` fragment, or "" when there are no clauses."""
+        return f"WHERE {' AND '.join(self._clauses)}" if self._clauses else ""
+
+    @property
+    def params(self) -> list:
+        return self._params
+
+    def _bind(self, value) -> str:
+        self._params.append(value)
+        return f"${len(self._params)}"
+
+
 class ServerRepo(_PoolAccess):
     """CRUD for `servers` + their attached `server_policies` / `tool_policies` / `param_rules`.
 
@@ -399,48 +489,18 @@ class ServerRepo(_PoolAccess):
             )
 
     async def get_policy(self, server_id: int) -> ServerPolicy:
-        # All three reads share ONE pooled connection. Under SQLite they shared the single
-        # long-lived reader connection by construction; holding one connection for the method
-        # keeps that property (and keeps the three reads on a consistent view of the database
-        # under Postgres' default READ COMMITTED, rather than potentially spanning a concurrent
-        # set_policy commit if each read grabbed a different pooled connection).
-        async with self._read() as conn:
-            row = await conn.fetchrow(
-                "SELECT mode, rate_limit, dlp_config FROM server_policies WHERE server_id = $1",
-                server_id,
-            )
-            mode = row["mode"] if row else "passthrough"
-            rate_limit = row["rate_limit"] if row else None
-            dlp_detectors, dlp_custom_patterns = _decode_dlp_config(
-                row["dlp_config"] if row else None
-            )
+        """Policy for ONE server — a thin delegation to the batched get_policies_for, so
+        policy assembly (DLP decode, allowed/denied split, param_rules construction) has a
+        single implementation instead of two copies that could drift on enforcement data.
 
-            rows = await conn.fetch(
-                "SELECT tool_name, action FROM tool_policies WHERE server_id = $1", server_id
-            )
-            allowed = [r["tool_name"] for r in rows if r["action"] == "allow"]
-            denied = [r["tool_name"] for r in rows if r["action"] == "deny"]
-
-            rows = await conn.fetch(
-                """SELECT tool_name, param_name, max_length, max_value, min_value, denied,
-                          block_patterns
-                   FROM param_rules WHERE server_id = $1""",
-                server_id,
-            )
-        param_rules: dict[str, dict[str, ParamRule]] = {}
-        for r in rows:
-            param_rules.setdefault(r["tool_name"], {})[r["param_name"]] = ParamRule(
-                max_length=r["max_length"],
-                max_value=r["max_value"],
-                min_value=r["min_value"],
-                denied=bool(r["denied"]),
-                block_patterns=json.loads(r["block_patterns"]) if r["block_patterns"] else [],
-            )
-
-        return ServerPolicy(
-            mode=mode, rate_limit=rate_limit, allowed=allowed, denied=denied, param_rules=param_rules,
-            dlp_detectors=dlp_detectors, dlp_custom_patterns=dlp_custom_patterns,
-        )
+        Keeps the properties callers relied on from the standalone version: the three reads
+        (server_policies, tool_policies, param_rules) run on one pooled connection — a
+        consistent view under Postgres' default READ COMMITTED — and a server with no
+        policy row gets the same passthrough/no-rate-limit default get_policies_for
+        returns. The single-element array binds to the same `= ANY($1)` statement the
+        batched path uses, so this shares one prepared-statement plan with aggregate calls
+        rather than a second, scalar-parameter one."""
+        return (await self.get_policies_for([server_id]))[server_id]
 
     async def get_policies_for(self, server_ids: list[int]) -> dict[int, ServerPolicy]:
         """Batched version of get_policy for the aggregate endpoint: one query per table with
@@ -774,35 +834,16 @@ class AuditRepo(_PoolAccess):
         forced this design is not mistaken for a live one."""
         # Placeholders are numbered as clauses are appended. Every caller-supplied VALUE is a
         # bound parameter; only fixed column-name/operator text is ever interpolated.
-        clauses, params = [], []
-
-        def _p(value) -> str:
-            params.append(value)
-            return f"${len(params)}"
-
-        if server_slug:
-            clauses.append(f"server_slug = {_p(server_slug)}")
+        w = _Where()
+        w.eq("server_slug", server_slug or None)
         if server_slug_in is not None:
-            if not server_slug_in:
-                # Zero servers in this project -> zero possible audit rows. `1=0` short-circuits
-                # without needing special-case Python-side handling of an empty result set.
-                clauses.append("1=0")
-            else:
-                # `= ANY($n)` with the list bound as one array parameter, replacing the
-                # f-string-built `?,?,?` run.
-                clauses.append(f"server_slug = ANY({_p(server_slug_in)})")
-        if decision:
-            clauses.append(f"decision = {_p(decision)}")
-        if tool:
-            clauses.append(f"tool = {_p(tool)}")
-        if before_id is not None:
-            clauses.append(f"id < {_p(before_id)}")
-        if api_key_id is not None:
-            clauses.append(f"api_key_id = {_p(api_key_id)}")
-        if after:
-            clauses.append(f"ts >= {_p(after)}")
-        if before:
-            clauses.append(f"ts <= {_p(before)}")
+            w.any_of("server_slug", server_slug_in)
+        w.eq("decision", decision or None)
+        w.eq("tool", tool or None)
+        w.lt("id", before_id)
+        w.eq("api_key_id", api_key_id)
+        w.ge("ts", after or None)
+        w.le("ts", before or None)
         if search:
             # `%`/`_` in the term are escaped so a literal search (e.g. "100%") isn't interpreted
             # as a LIKE wildcard. The ESCAPE character is written as a doubled backslash in the
@@ -811,21 +852,25 @@ class AuditRepo(_PoolAccess):
             # carrying it over verbatim would have made every escaped search silently wrong.
             escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             like = f"%{escaped}%"
-            clauses.append(
-                f"(reason LIKE {_p(like)} ESCAPE '\\' "
-                f"OR args_summary LIKE {_p(like)} ESCAPE '\\' "
-                f"OR matched LIKE {_p(like)} ESCAPE '\\')"
+            # Bound ONCE and referenced in all three branches — the placeholder is a string, so
+            # one parameter can appear multiple times (the old per-clause `_p` bound it three
+            # times as three identical parameters).
+            like_ph = w.bind(like)
+            w.raw(
+                f"(reason LIKE {like_ph} ESCAPE '\\' "
+                f"OR args_summary LIKE {like_ph} ESCAPE '\\' "
+                f"OR matched LIKE {like_ph} ESCAPE '\\')"
             )
         if origin is not _UNSET:
             if origin is None:
-                clauses.append("origin IS NULL")
+                w.is_null("origin")
             else:
-                clauses.append(f"origin = {_p(origin)}")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        limit_ph = _p(limit)
+                w.eq("origin", origin)
+        limit_ph = w.bind(limit)
         async with self._read() as conn:
             rows = await conn.fetch(
-                f"SELECT * FROM audit_events {where} ORDER BY id DESC LIMIT {limit_ph}", *params
+                f"SELECT * FROM audit_events {w.where_sql()} ORDER BY id DESC LIMIT {limit_ph}",
+                *w.params,
             )
         return [dict(r) for r in rows]
 
@@ -835,23 +880,15 @@ class AuditRepo(_PoolAccess):
     ) -> int:
         # Always excludes origin='test' (Try-it calls) — this backs /stats, and a dashboard
         # counter that moves every time an operator tests their own policy would be useless.
-        params: list = [since_iso]
-
-        def _p(value) -> str:
-            params.append(value)
-            return f"${len(params)}"
-
-        clauses = ["ts >= $1", "origin IS NULL"]
-        if decision:
-            clauses.append(f"decision = {_p(decision)}")
+        w = _Where()
+        w.ge("ts", since_iso)
+        w.raw("origin IS NULL")
+        w.eq("decision", decision or None)
         if server_slug_in is not None:
-            if not server_slug_in:
-                clauses.append("1=0")
-            else:
-                clauses.append(f"server_slug = ANY({_p(server_slug_in)})")
+            w.any_of("server_slug", server_slug_in)
         async with self._read() as conn:
             count = await conn.fetchval(
-                f"SELECT COUNT(*) FROM audit_events WHERE {' AND '.join(clauses)}", *params
+                f"SELECT COUNT(*) FROM audit_events {w.where_sql()}", *w.params
             )
         return count or 0
 
@@ -1046,30 +1083,18 @@ class UsageRepo(_PoolAccess):
         at increment-time and by 0011_projects.sql's backfill) — unlike AuditRepo, usage_rollups
         lives in gateway.db alongside servers/projects, so this can be a real column filter
         rather than needing a slug-set IN-list."""
-        clauses, params = [], []
-
-        def _p(value) -> str:
-            params.append(value)
-            return f"${len(params)}"
-
-        if api_key_id is not None:
-            clauses.append(f"api_key_id = {_p(api_key_id)}")
-        if server_id is not None:
-            clauses.append(f"server_id = {_p(server_id)}")
-        if tool is not None:
-            clauses.append(f"tool = {_p(tool)}")
-        if since_iso is not None:
-            clauses.append(f"period_start >= {_p(since_iso)}")
-        if until_iso is not None:
-            clauses.append(f"period_start <= {_p(until_iso)}")
-        if project_id is not None:
-            clauses.append(f"project_id = {_p(project_id)}")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        w = _Where()
+        w.eq("api_key_id", api_key_id)
+        w.eq("server_id", server_id)
+        w.eq("tool", tool)
+        w.ge("period_start", since_iso)
+        w.le("period_start", until_iso)
+        w.eq("project_id", project_id)
         async with self._read() as conn:
             rows = await conn.fetch(
                 f"""SELECT period_start, api_key_id, server_id, tool, calls
-                    FROM usage_rollups {where} ORDER BY period_start DESC""",
-                *params,
+                    FROM usage_rollups {w.where_sql()} ORDER BY period_start DESC""",
+                *w.params,
             )
         return [dict(r) for r in rows]
 
@@ -1167,33 +1192,21 @@ class AdminEventRepo(_PoolAccess):
         limit: int = 500,
     ) -> list[AdminEventRecord]:
         """Query admin events with optional filters. Follows AuditRepo.query conventions."""
-        clauses = []
-        params: list = []
-
-        def _p(value) -> str:
-            params.append(value)
-            return f"${len(params)}"
-
-        if action is not None:
-            clauses.append(f"action = {_p(action)}")
-        if target_type is not None:
-            clauses.append(f"target_type = {_p(target_type)}")
-        if since is not None:
-            clauses.append(f"ts >= {_p(since)}")
-
-        where = " AND ".join(clauses) if clauses else "1=1"
+        w = _Where()
+        w.eq("action", action)
+        w.eq("target_type", target_type)
+        w.ge("ts", since)
         limit = min(limit, 500)
-        limit_ph = _p(limit)
+        limit_ph = w.bind(limit)
 
         async with self._read() as conn:
             rows = await conn.fetch(
                 f"""SELECT id, ts, actor, action, target_type, target_id, before, after,
                            client_ip, summary
-                    FROM admin_events
-                    WHERE {where}
+                    FROM admin_events {w.where_sql()}
                     ORDER BY ts DESC
                     LIMIT {limit_ph}""",
-                *params,
+                *w.params,
             )
         return [
             AdminEventRecord(
@@ -1623,23 +1636,15 @@ class ProposalRepo(_PoolAccess):
         global-admin default), NOT "only proposals with no project" — a caller who wants only
         the instance-wide config_import proposals has no query-param spelling for that today,
         since nothing has needed it yet."""
-        clauses: list[str] = []
-        params: list = []
-
-        def _p(value) -> str:
-            params.append(value)
-            return f"${len(params)}"
-
-        if state is not None:
-            clauses.append(f"state = {_p(state)}")
-        if project_id is not None:
-            clauses.append(f"project_id = {_p(project_id)}")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        limit_ph = _p(limit)
+        w = _Where()
+        w.eq("state", state)
+        w.eq("project_id", project_id)
+        limit_ph = w.bind(limit)
         async with self._read() as conn:
             rows = await conn.fetch(
-                f"SELECT * FROM proposals {where} ORDER BY created_at DESC, id DESC LIMIT {limit_ph}",
-                *params,
+                f"SELECT * FROM proposals {w.where_sql()} "
+                f"ORDER BY created_at DESC, id DESC LIMIT {limit_ph}",
+                *w.params,
             )
         return [_row_to_proposal(r) for r in rows]
 
