@@ -410,14 +410,19 @@ class ServerHealthSummary(BaseModel):
 
 
 class StatsResponse(BaseModel):
-    requests_24h: int
-    blocked_24h: int
-    allowed_24h: int
+    # Issue #109: requests_24h/blocked_24h/allowed_24h/recent_blocked are audit-store reads and
+    # are nullable — when the audit store is unavailable, /stats degrades them ALL-OR-NOTHING
+    # to null (the frontend renders "unavailable") instead of 500ing the whole payload. The
+    # server-derived fields (servers_total/healthy/unhealthy, server_health[]) are config-store
+    # reads and are always present.
+    requests_24h: Optional[int] = None
+    blocked_24h: Optional[int] = None
+    allowed_24h: Optional[int] = None
     servers_total: int
     servers_healthy: int
     servers_unhealthy: int
     server_health: list[ServerHealthSummary]
-    recent_blocked: list[dict]
+    recent_blocked: Optional[list[dict]] = None
 
 
 class AuditEventResponse(BaseModel):

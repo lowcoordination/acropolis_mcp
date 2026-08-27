@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import secrets
 import uuid
 from typing import Optional, Union
@@ -118,6 +119,8 @@ from db.repo import (
 )
 from stoa.health import PROBE_TIMEOUT_SECONDS, HealthPoller
 from stoa.webhooks import VALID_EVENTS, WebhookDispatcher
+
+logger = logging.getLogger("archon.api")
 
 # Settings keys + defaults, applied when a key is absent from the settings table.
 _SETTINGS_DEFAULTS = {
@@ -1276,14 +1279,39 @@ def build_control_plane_router(
             servers = await server_repo.list(project_id=project_id)
             server_slug_in = [s.slug for s in servers] if project_id is not None else None
 
-            requests_24h = await audit_repo.count_since(since, server_slug_in=server_slug_in)
-            blocked_24h = await audit_repo.count_since(since, decision="BLOCKED", server_slug_in=server_slug_in)
-            allowed_24h = await audit_repo.count_since(since, decision="ALLOWED", server_slug_in=server_slug_in)
-            # Excludes origin='test' for the same reason count_since does — the dashboard
-            # shouldn't surface an operator's own Try-it calls as if they were real traffic.
-            recent_blocked = await audit_repo.query(
-                decision="BLOCKED", limit=10, origin=None, server_slug_in=server_slug_in,
-            )
+            # Issue #109: the audit reads below are the only audit-store-touching calls in this
+            # handler — everything else is config-store data already in hand (servers list,
+            # health statuses). Once the audit log can live on a separate database (#108), the
+            # two stores can fail independently, and an audit outage must NOT 500 the whole
+            # dashboard payload. Degrade the audit-derived fields to null instead; the frontend
+            # renders those tiles "unavailable" while servers_total/healthy/unhealthy and
+            # server_health[] keep working.
+            #
+            # The degradation is ALL-OR-NOTHING, matching /metrics: if any audit read fails, all
+            # four audit-derived fields are nulled together. A mixed response (a real
+            # requests_24h next to a null allowed_24h) would let a viewer misread "unavailable"
+            # as "zero".
+            requests_24h: Optional[int] = None
+            blocked_24h: Optional[int] = None
+            allowed_24h: Optional[int] = None
+            recent_blocked: Optional[list[dict]] = None
+            try:
+                requests_24h = await audit_repo.count_since(since, server_slug_in=server_slug_in)
+                blocked_24h = await audit_repo.count_since(since, decision="BLOCKED", server_slug_in=server_slug_in)
+                allowed_24h = await audit_repo.count_since(since, decision="ALLOWED", server_slug_in=server_slug_in)
+                # Excludes origin='test' for the same reason count_since does — the dashboard
+                # shouldn't surface an operator's own Try-it calls as if they were real traffic.
+                recent_blocked = await audit_repo.query(
+                    decision="BLOCKED", limit=10, origin=None, server_slug_in=server_slug_in,
+                )
+            except Exception:  # noqa: BLE001 — a dashboard summary must never 500 on a store outage
+                # If ANY call failed, null the whole set — do not keep partial values from the
+                # calls that succeeded before the failure (see the all-or-nothing note above).
+                requests_24h = blocked_24h = allowed_24h = None
+                recent_blocked = None
+                logger.warning(
+                    "audit store unavailable; /stats returning config-derived data only", exc_info=True
+                )
 
             healthy = sum(1 for s in servers if s.health_status == "healthy")
             unhealthy = sum(1 for s in servers if s.health_status == "unhealthy")

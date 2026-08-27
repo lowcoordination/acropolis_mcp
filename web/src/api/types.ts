@@ -181,14 +181,14 @@ export interface ServerHealthSummary {
 }
 
 export interface StatsResponse {
-  requests_24h: number
-  blocked_24h: number
-  allowed_24h: number
+  requests_24h: number | null
+  blocked_24h: number | null
+  allowed_24h: number | null
   servers_total: number
   servers_healthy: number
   servers_unhealthy: number
   server_health: ServerHealthSummary[]
-  recent_blocked: AuditEvent[]
+  recent_blocked: AuditEvent[] | null
 }
 
 export interface AuditEvent {

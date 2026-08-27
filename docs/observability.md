@@ -11,6 +11,27 @@ config-drift gauge. It answers "how many calls were blocked in the last day" and
 healthy right now." It does **not** answer "where did THIS call spend its time" or "which upstream
 call was slow" — that's what distributed tracing exists for.
 
+### Degraded audit store (issue #109)
+
+The audit-derived counters (`acropolis_audit_events_total`) and the server/config-derived
+gauges (`acropolis_registered_servers`, `acropolis_server_health`, `acropolis_config_drift`)
+come from independent stores once the audit log can live on its own database (#108). If the
+audit store is down, `/metrics` degrades the audit part only: it omits the
+`acropolis_audit_events_total` family entirely (a missing series is visibly missing — a `0`
+would be indistinguishable from "no traffic in 24h" and would silently corrupt `rate()` and
+alert thresholds) and emits `acropolis_audit_store_up 0` so the outage is directly alertable.
+The config-sourced gauges keep rendering normally, because the whole point of a scrape is
+"is the gateway up, are my upstreams healthy" — an audit-storage problem must not black those
+out. `acropolis_audit_store_up 1` is emitted on the healthy path.
+
+`GET /api/v1/stats` follows the same policy: an audit-store failure nulls the audit-derived
+fields (`requests_24h`, `blocked_24h`, `allowed_24h`, `recent_blocked` — the dashboard renders
+them "unavailable") while `servers_total`/`servers_healthy`/`servers_unhealthy` and
+`server_health[]` keep working. The nulling is all-or-nothing, matching `/metrics`: if any
+audit read fails, the whole audit-derived set degrades together, so the response can never mix
+real and unavailable counters. Both endpoints log one WARNING (with the exception) per request
+on degradation.
+
 `docs/backup-and-upgrades.md` used to say per-upstream call latency "is not currently included —
 no latency sample is recorded anywhere in the request path today." **That specific claim is now
 out of date and has been corrected**: every audit row carries a gateway-total `latency_ms`

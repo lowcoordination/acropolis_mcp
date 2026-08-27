@@ -21,9 +21,19 @@ export function Dashboard() {
       <h1 className="text-xl font-semibold">Dashboard</h1>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-        <StatTile label="Requests (24h)" value={stats.requests_24h} />
-        <StatTile label="Blocked (24h)" value={stats.blocked_24h} accent={stats.blocked_24h > 0 ? 'danger' : 'default'} />
-        <StatTile label="Allowed (24h)" value={stats.allowed_24h} />
+        <StatTile
+          label="Requests (24h)"
+          value={stats.requests_24h === null ? 'unavailable' : stats.requests_24h}
+        />
+        <StatTile
+          label="Blocked (24h)"
+          value={stats.blocked_24h === null ? 'unavailable' : stats.blocked_24h}
+          accent={stats.blocked_24h !== null && stats.blocked_24h > 0 ? 'danger' : 'default'}
+        />
+        <StatTile
+          label="Allowed (24h)"
+          value={stats.allowed_24h === null ? 'unavailable' : stats.allowed_24h}
+        />
         <StatTile
           label="Servers"
           value={`${stats.servers_healthy}/${stats.servers_total}`}
@@ -74,7 +84,11 @@ export function Dashboard() {
             View audit log →
           </Link>
         </div>
-        {stats.recent_blocked.length === 0 ? (
+        {stats.recent_blocked === null ? (
+          <p className="p-4 text-sm" style={{ color: 'var(--text-muted)' }}>
+            Recently-blocked events unavailable (audit store down).
+          </p>
+        ) : stats.recent_blocked.length === 0 ? (
           <p className="p-4 text-sm" style={{ color: 'var(--text-muted)' }}>
             Nothing blocked recently.
           </p>
