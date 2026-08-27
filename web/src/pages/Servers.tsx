@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
-import { useCreateServer, useServers } from '../lib/useServers'
+import { useCreateServer, useDeleteServer, useServers } from '../lib/useServers'
 import { useSettings } from '../lib/useSettings'
 import { useActiveProject } from '../lib/ProjectContext'
 import { useProjects } from '../lib/useProjects'
@@ -193,11 +193,55 @@ function AddServerModal({ onClose, defaultProjectSlug }: { onClose: () => void; 
   )
 }
 
+function DeleteServerModal({ slug, onClose }: { slug: string; onClose: () => void }) {
+  const [error, setError] = useState<string | null>(null)
+  const del = useDeleteServer()
+
+  function handleDelete() {
+    setError(null)
+    del.mutate(slug, {
+      onSuccess: onClose,
+      onError: (err) => setError(err instanceof ApiError ? err.message : 'Something went wrong'),
+    })
+  }
+
+  return (
+    <Modal title={`Remove server "${slug}"?`} onClose={onClose}>
+      <div className="space-y-4">
+        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+          Deletes the server and its policy, tools cache, and parameter rules. Audit and usage
+          history for the server are preserved. This cannot be undone.
+        </p>
+        {error && (
+          <p className="text-sm" style={{ color: 'var(--danger)' }}>
+            {error}
+          </p>
+        )}
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="btn-secondary rounded-md px-4 py-2 text-sm font-medium">
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleDelete}
+            className="rounded-md px-4 py-2 text-sm font-medium disabled:opacity-60"
+            style={{ background: 'var(--danger)', color: 'var(--bg)' }}
+            disabled={del.isPending}
+          >
+            {del.isPending ? 'Removing…' : 'Remove server'}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
 export function Servers() {
   const { activeProjectId } = useActiveProject()
   const { data: projects } = useProjects()
   const { data: servers, isLoading, isError } = useServers(activeProjectId)
   const [showAdd, setShowAdd] = useState(false)
+  const [deleteSlug, setDeleteSlug] = useState<string | null>(null)
   const showProjectColumn = !!projects && projects.length > 1
   const activeProject = projects?.find((p) => p.id === activeProjectId)
 
@@ -251,6 +295,9 @@ export function Servers() {
                 <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
                   Enabled
                 </th>
+                <th className="px-4 py-2 font-medium" style={{ color: 'var(--text-muted)' }}>
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -289,6 +336,16 @@ export function Servers() {
                     />
                   </td>
                   <td className="px-4 py-3">{server.enabled ? 'Yes' : 'No'}</td>
+                  <td className="px-4 py-3">
+                    <button
+                      type="button"
+                      onClick={() => setDeleteSlug(server.slug)}
+                      className="text-xs font-medium hover:underline"
+                      style={{ color: 'var(--danger)' }}
+                    >
+                      Remove
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -298,6 +355,9 @@ export function Servers() {
 
       {showAdd && (
         <AddServerModal onClose={() => setShowAdd(false)} defaultProjectSlug={activeProject?.slug} />
+      )}
+      {deleteSlug && (
+        <DeleteServerModal slug={deleteSlug} onClose={() => setDeleteSlug(null)} />
       )}
     </div>
   )
