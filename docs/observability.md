@@ -27,7 +27,9 @@ out. `acropolis_audit_store_up 1` is emitted on the healthy path.
 `GET /api/v1/stats` follows the same policy: an audit-store failure nulls the audit-derived
 fields (`requests_24h`, `blocked_24h`, `allowed_24h`, `recent_blocked` — the dashboard renders
 them "unavailable") while `servers_total`/`servers_healthy`/`servers_unhealthy` and
-`server_health[]` keep working. Both endpoints log one WARNING (with the exception) per request
+`server_health[]` keep working. The nulling is all-or-nothing, matching `/metrics`: if any
+audit read fails, the whole audit-derived set degrades together, so the response can never mix
+real and unavailable counters. Both endpoints log one WARNING (with the exception) per request
 on degradation.
 
 `docs/backup-and-upgrades.md` used to say per-upstream call latency "is not currently included —

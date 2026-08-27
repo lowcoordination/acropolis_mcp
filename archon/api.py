@@ -1286,6 +1286,11 @@ def build_control_plane_router(
             # dashboard payload. Degrade the audit-derived fields to null instead; the frontend
             # renders those tiles "unavailable" while servers_total/healthy/unhealthy and
             # server_health[] keep working.
+            #
+            # The degradation is ALL-OR-NOTHING, matching /metrics: if any audit read fails, all
+            # four audit-derived fields are nulled together. A mixed response (a real
+            # requests_24h next to a null allowed_24h) would let a viewer misread "unavailable"
+            # as "zero".
             requests_24h: Optional[int] = None
             blocked_24h: Optional[int] = None
             allowed_24h: Optional[int] = None
@@ -1300,6 +1305,10 @@ def build_control_plane_router(
                     decision="BLOCKED", limit=10, origin=None, server_slug_in=server_slug_in,
                 )
             except Exception:  # noqa: BLE001 — a dashboard summary must never 500 on a store outage
+                # If ANY call failed, null the whole set — do not keep partial values from the
+                # calls that succeeded before the failure (see the all-or-nothing note above).
+                requests_24h = blocked_24h = allowed_24h = None
+                recent_blocked = None
                 logger.warning(
                     "audit store unavailable; /stats returning config-derived data only", exc_info=True
                 )

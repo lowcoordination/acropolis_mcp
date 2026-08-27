@@ -149,3 +149,34 @@ class TestStatsDegradesWhenAuditStoreDown:
         assert body["servers_healthy"] == 0
         assert body["servers_unhealthy"] == 0
         assert [s["slug"] for s in body["server_health"]] == ["stats-down"]
+
+    async def test_partial_audit_failure_nulls_all_audit_fields(self, app_client, monkeypatch):
+        """A failure on the SECOND count_since call (after the first succeeded) must null the
+        WHOLE audit-derived set, not just the failed field. A mixed response (a real
+        requests_24h next to a null allowed_24h) would let a viewer misread "unavailable" as
+        "zero" — the same all-or-nothing guarantee /metrics gives the counter family, so the
+        two endpoints can't disagree about what an audit outage looks like."""
+        client, db = app_client
+        server_repo = ServerRepo(db)
+        await server_repo.create(slug="stats-flaky", name="Flaky", upstream_url="http://127.0.0.1:1/mcp")
+        calls = {"n": 0}
+
+        async def flaky_count_since(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RuntimeError("simulated audit store outage (issue #109)")
+            return 7
+
+        monkeypatch.setattr(AuditRepo, "count_since", flaky_count_since)
+        resp = await client.get("/api/v1/stats")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        # Even though the first count_since succeeded, the whole set is nulled.
+        assert body["requests_24h"] is None
+        assert body["blocked_24h"] is None
+        assert body["allowed_24h"] is None
+        assert body["recent_blocked"] is None
+        # Config-sourced fields are untouched.
+        assert body["servers_total"] == 1
+        assert [s["slug"] for s in body["server_health"]] == ["stats-flaky"]
