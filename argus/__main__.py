@@ -29,6 +29,8 @@ def _make_db(settings: Settings) -> Database:
         settings.database_url,
         writer_pool_max=settings.db_writer_pool_max,
         reader_pool_max=settings.db_reader_pool_max,
+        audit_dsn=settings.audit_database_url,
+        reader_dsn=settings.reader_url,
     )
 
 

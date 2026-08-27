@@ -32,6 +32,63 @@ If it's unset (or the app can't reach it), you'll see `DatabaseNotConfiguredErro
 that's the intended fail-loud behavior (see `db/database.py`'s docstring): a misconfigured data
 store must not present as an empty-but-working gateway.
 
+## Splitting the workload across databases (issue #108)
+
+Both options below are **opt-in** — unset, everything shares `ACROPOLIS_DATABASE_URL` exactly as
+before, byte-for-byte.
+
+### `ACROPOLIS_AUDIT_DATABASE_URL` — a separate audit store
+
+The audit log (`audit_events`) is the one genuinely high-churn table: a row per proxied call,
+plus periodic batched retention `DELETE`s. Pointing it at its own Postgres database lets you put
+it on storage sized for churn while keeping the config store small and heavily backed up, keeps
+retention pruning's I/O off the instance serving policy lookups on the request path, and lets the
+two be backed up on different schedules (a config dump is small and precious; the audit log is
+large and time-boxed by `audit_retention_days`). This is the opt-in revival of the pre-cutover
+split, where `gateway.db` and `audit.db` were separate SQLite files (see `db/migrations/0001_init.sql`'s
+header for the history and the one-database decision this option restores the choice about).
+
+How it works:
+
+- On startup, Acropolis runs a small, dedicated migration sequence on the audit database
+  (`db/migrations/audit/0001_audit_init.sql`), creating `audit_events` and its indexes with their
+  own `schema_migrations` bookkeeping — the same forward-only, advisory-lock-protected runner the
+  config database uses. The audit database needs no other schema.
+- Every audit read and write routes through `AuditRepo` (the `AuditLogger` queue-flush, `/stats`,
+  `/metrics`, the Audit page, and the retention job), which targets the audit store when it's
+  split. No SQL crosses the two stores — project-scoped audit queries resolve their slug set in
+  Python and pass it as an IN-list.
+- If the audit store is down, `/metrics` and `/stats` degrade gracefully (issue #109): the
+  audit-derived counters/fields are omitted or nulled while the config-sourced gauges keep
+  rendering, and the request path is unaffected (audit logging is queued and non-blocking).
+
+**For a NEW deployment**: point `ACROPOLIS_AUDIT_DATABASE_URL` at a fresh database and the audit
+schema is created there on first boot. Done.
+
+**For an EXISTING deployment with audit history**: the switch moves the audit log wholesale —
+from the moment the env var is set, new rows land in the new database and the config store's old
+`audit_events` table (still created by migration 0001, now inert) is no longer queried. To keep
+history, `pg_dump -t audit_events` from the old database and `pg_restore` it into the new audit
+database **before** switching, then flip the env var. This change deliberately does not automate
+the move — a data migration between live databases is an operator decision, not something an env
+var should trigger implicitly.
+
+### `ACROPOLIS_READER_URL` — a read replica
+
+The reader/writer pool split (see pool sizing below) always had a seam for pointing `reader` at a
+read replica; this env var is that seam made real. The reader pool (which serves every read on the
+request path — key lookup, policy fetch, audit queries, `/stats`, `/metrics`) connects to this DSN
+instead of the primary when set; all writes stay on the primary.
+
+The control-plane write paths that RETURN the row they just wrote use read-your-writes semantics
+(`db/repo.py`'s `_fetch_written_row`): they read the fresh row back from the write connection, so
+a replica lagging behind the primary can never make a just-created/updated record look missing or
+stale. The replica must have the schema — a real replica replicates DDL from the primary
+automatically; if you're testing with a manually-provisioned replica, point the migration runner
+at it once first. Reads that happen much later than the write (the `/stats`, `/metrics`, audit
+page queries) can see replica lag by nature; that is the point of a replica, and the tradeoff
+that lets read traffic off the primary.
+
 ## Minimum Postgres version
 
 **Postgres 12+.** The schema uses `GENERATED ALWAYS AS IDENTITY` (standard since PG 10) and a
