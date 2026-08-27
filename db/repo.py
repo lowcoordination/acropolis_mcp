@@ -181,6 +181,22 @@ class _PoolAccess:
         assert self._db.writer is not None, "Database.connect() not awaited"
         return acquire_with_timeout(self._db.writer, self._db.POOL_ACQUIRE_TIMEOUT)
 
+    async def _fetch_written_row(
+        self, conn: asyncpg.Connection, table: str, row_id: int
+    ) -> asyncpg.Record:
+        """Read a row back from the SAME connection that just wrote it (read-your-writes).
+
+        Control-plane write paths that RETURN the row they just wrote used to re-read it via
+        the reader pool. That is correct against a single database, but with reader_dsn pointing
+        at a read replica (#108) a replica can lag behind the write and the re-read could miss
+        the row (or return a stale version) — `ServerRepo.create` failed outright on a just-
+        written row under the split-reader test. Reading from the write connection is the
+        classic read-your-writes fix: it is correct under any replication lag, one round-trip
+        cheaper, and closes the write-then-read race even with no replica. `table` is always a
+        hardcoded literal at the call site — never caller input.
+        """
+        return await conn.fetchrow(f"SELECT * FROM {table} WHERE id = $1", row_id)
+
 
 class _Where:
     """Parameterized WHERE-clause builder shared by this module's query methods.
@@ -382,7 +398,11 @@ class ServerRepo(_PoolAccess):
                     "VALUES ($1, 'passthrough', $2)",
                     server_id, now,
                 )
-        return await self.get(slug)
+                # Read-your-writes (#108): return the row from THIS write connection rather
+                # than a second reader-pool read — with reader_dsn at a read replica, a
+                # separate read could hit a replica that hasn't replicated the row yet.
+                row = await self._fetch_written_row(conn, "servers", server_id)
+        return _row_to_server(row)
 
     async def update(
         self,
@@ -431,7 +451,13 @@ class ServerRepo(_PoolAccess):
             await conn.execute(
                 f"UPDATE servers SET {', '.join(fields)} WHERE id = ${len(values)}", *values
             )
-        return await self.get(slug)
+            row = await self._fetch_written_row(conn, "servers", current.id)
+        if row is None:
+            # The row vanished between the get() above and this UPDATE (a concurrent delete) —
+            # same typed error the old post-write get() raised, which the delete/update race
+            # test depends on. Anything else would be an "unexpected" exception there.
+            raise ServerNotFoundError(slug)
+        return _row_to_server(row)
 
     async def delete(self, slug: str) -> None:
         current = await self.get(slug)
@@ -456,7 +482,10 @@ class ServerRepo(_PoolAccess):
                 "UPDATE servers SET project_id = $1, updated_at = $2 WHERE id = $3",
                 project_id, utcnow(), current.id,
             )
-        return await self.get(slug)
+            row = await self._fetch_written_row(conn, "servers", current.id)
+        if row is None:
+            raise ServerNotFoundError(slug)
+        return _row_to_server(row)
 
     async def set_health(
         self, slug: str, health_status: str, upstream_protocol: Optional[str] = None,
@@ -674,7 +703,8 @@ class ApiKeyRepo(_PoolAccess):
                     json.dumps(server_scopes) if server_scopes else None, now,
                     quota_calls, quota_period, project_id,
                 )
-        return await self.get_by_id(key_id)
+                row = await self._fetch_written_row(conn, "api_keys", key_id)
+        return self._row_to_record(row)
 
     async def get_by_id(self, key_id: int) -> ApiKeyRecord:
         async with self._read() as conn:
@@ -761,7 +791,26 @@ class AuditRepo(_PoolAccess):
 
     Post-cutover this is a TABLE in the main database rather than its own audit.db file, so it
     uses the same reader/writer pools as every other repo instead of the third dedicated
-    connection it used to hold. See 0001_init.sql's header for the one-database decision."""
+    connection it used to hold. See 0001_init.sql's header for the one-database decision.
+
+    Issue #108 restores the split as an OPTION: when the Database has a dedicated audit pool
+    (Database(audit_dsn=...)), this repo routes every read and write to it — AuditLogger
+    (insert_many), /stats and /metrics (count_since/query), the Audit page (query), and the
+    retention job (prune_older_than) all flow through these two accessors, so this override is
+    the single point that separates the audit store from the config store. Cross-store queries
+    don't exist and never need to: AuditRepo.query/count_since take a Python-resolved
+    server_slug_in list (see query's docstring), so no SQL crosses the store boundary.
+    """
+
+    def _read(self):
+        pool = self._db.audit if self._db.audit is not None else self._db.reader
+        assert pool is not None, "Database.connect() not awaited"
+        return acquire_with_timeout(pool, self._db.POOL_ACQUIRE_TIMEOUT)
+
+    def _write(self):
+        pool = self._db.audit if self._db.audit is not None else self._db.writer
+        assert pool is not None, "Database.connect() not awaited"
+        return acquire_with_timeout(pool, self._db.POOL_ACQUIRE_TIMEOUT)
 
     async def insert_many(self, events: list[dict]) -> None:
         if not events:
@@ -1323,20 +1372,27 @@ class UserRepo(_PoolAccess):
                     )
                 except asyncpg.UniqueViolationError as e:
                     raise UsernameConflictError(username) from e
-        return await self.get_by_id(new_id)
+                row = await self._fetch_written_row(conn, "users", new_id)
+        return _row_to_user(row)
 
     async def update_role(self, user_id: int, role: str) -> UserRecord:
         # [SINGLE-STATEMENT] replaces gateway_write_lock.
         async with self._write() as conn:
             await conn.execute("UPDATE users SET role = $1 WHERE id = $2", role, user_id)
-        return await self.get_by_id(user_id)
+            row = await self._fetch_written_row(conn, "users", user_id)
+        if row is None:
+            raise UserNotFoundError(str(user_id))
+        return _row_to_user(row)
 
     async def set_enabled(self, user_id: int, enabled: bool) -> UserRecord:
         # [SINGLE-STATEMENT] replaces gateway_write_lock. `enabled` is a real BOOLEAN column
         # now, so the int() coercion the SQLite schema needed is gone.
         async with self._write() as conn:
             await conn.execute("UPDATE users SET enabled = $1 WHERE id = $2", enabled, user_id)
-        return await self.get_by_id(user_id)
+            row = await self._fetch_written_row(conn, "users", user_id)
+        if row is None:
+            raise UserNotFoundError(str(user_id))
+        return _row_to_user(row)
 
     async def set_password_hash(self, user_id: int, password_hash: str) -> UserRecord:
         # [SINGLE-STATEMENT] replaces gateway_write_lock.
@@ -1344,7 +1400,10 @@ class UserRepo(_PoolAccess):
             await conn.execute(
                 "UPDATE users SET password_hash = $1 WHERE id = $2", password_hash, user_id
             )
-        return await self.get_by_id(user_id)
+            row = await self._fetch_written_row(conn, "users", user_id)
+        if row is None:
+            raise UserNotFoundError(str(user_id))
+        return _row_to_user(row)
 
     async def touch_last_login(self, user_id: int) -> None:
         # [SINGLE-STATEMENT] replaces gateway_write_lock.
@@ -1475,7 +1534,8 @@ class ProjectRepo(_PoolAccess):
                     )
                 except asyncpg.UniqueViolationError as e:
                     raise ProjectSlugConflictError(slug) from e
-        return await self.get_by_id(project_id)
+                row = await self._fetch_written_row(conn, "projects", project_id)
+        return _row_to_project(row)
 
     async def delete(self, slug: str) -> None:
         # ON DELETE CASCADE on project_members handles membership cleanup. Servers/keys are NOT

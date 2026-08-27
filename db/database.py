@@ -33,6 +33,17 @@ MIGRATIONS = [
     "0012_proposals_project_scope.sql",
 ]
 
+# Issue #108: when the audit log is pointed at its own database (Database(audit_dsn=...)), it
+# runs this forward-only sequence instead — the audit schema (audit_events + indexes) folded
+# from the config sequence's 0001/0003/0004/0007, bookkept in the audit database's own
+# schema_migrations table. The config database's MIGRATIONS above are unchanged either way:
+# a split deployment still applies 0001 there (which creates an audit_events table that then
+# sits inert — every audit read/write routes through AuditRepo to the audit pool), and a
+# single-database deployment is byte-identical to before this option existed.
+AUDIT_MIGRATIONS = [
+    "audit/0001_audit_init.sql",
+]
+
 
 # Fixed application-wide id for the migration advisory lock (see _apply_migrations). Arbitrary
 # but must never change: it is the rendezvous point two concurrently-starting instances use to
@@ -89,7 +100,10 @@ async def acquire_with_timeout(pool: asyncpg.Pool, timeout: float) -> AsyncItera
 
 
 def _version_from_filename(filename: str) -> int:
-    m = re.match(r"^(\d+)_", filename)
+    # Basename only: the audit sequence lives in a subdirectory (audit/0001_audit_init.sql)
+    # while the config sequence sits flat in migrations/ — the version prefix is the same
+    # leading-number convention either way.
+    m = re.match(r"^(\d+)_", filename.rsplit("/", 1)[-1])
     if not m:
         raise ValueError(f"migration filename must start with a numeric version: {filename}")
     return int(m.group(1))
@@ -189,17 +203,24 @@ async def _apply_migrations(
 
 
 class Database:
-    """Owns the asyncpg connection pools for the single Acropolis Postgres database.
+    """Owns the asyncpg connection pools for the Acropolis Postgres database(s).
 
-    Two pools, deliberately: a small WRITER pool (writes are short and the control plane is
-    low-volume) and a larger READER pool (every data-plane request does at least one read —
-    key lookup, policy fetch). Under SQLite the reader/writer split was load-bearing for
-    correctness: a reader sharing the writer's connection could observe an uncommitted
-    DELETE-then-reinsert mid-gap and transiently see an empty denylist. Under Postgres, MVCC
-    makes that impossible on ANY connection, so the split is now a resource-isolation choice,
-    not a correctness crutch. It bounds how many connections write traffic can consume so a
-    burst of data-plane writes cannot starve the control plane's reads, and it leaves a seam
-    for pointing `reader` at a read replica later without touching a single repo method.
+    Two pools on the primary database, deliberately: a small WRITER pool (writes are short and
+    the control plane is low-volume) and a larger READER pool (every data-plane request does at
+    least one read — key lookup, policy fetch). Under SQLite the reader/writer split was
+    load-bearing for correctness: a reader sharing the writer's connection could observe an
+    uncommitted DELETE-then-reinsert mid-gap and transiently see an empty denylist. Under
+    Postgres, MVCC makes that impossible on ANY connection, so the split is now a
+    resource-isolation choice, not a correctness crutch. It bounds how many connections write
+    traffic can consume so a burst of data-plane writes cannot starve the control plane's
+    reads, and it leaves a seam for pointing `reader` at a read replica later without touching
+    a single repo method — which issue #108 now exposes as the optional `reader_dsn`.
+
+    Issue #108 also restores the optional separate AUDIT database: `audit_dsn` points the
+    high-churn traffic log (audit_events, via AuditRepo) at its own Postgres database, the
+    opt-in revival of the pre-cutover gateway.db/audit.db split that the Postgres cutover
+    collapsed (see 0001_init.sql's header). When unset — the default — audit traffic uses the
+    primary database exactly as before, and this class owns no third pool.
 
     There is deliberately NO per-process write lock. The old `gateway_write_lock` existed to
     work around SQLite's single-writer model — and being per-PROCESS, a second replica would
@@ -208,9 +229,6 @@ class Database:
     database, where they hold across processes. The multi-statement read-modify-write call
     sites that genuinely need protection use a transaction or SELECT ... FOR UPDATE instead
     (see db/repo.py).
-
-    audit_events is not a separate database — it is a table in this one (see 0001_init.sql's
-    header for that decision).
     """
 
     # Pool sizing. Deliberately modest defaults: the writer pool is small because writes are
@@ -240,6 +258,8 @@ class Database:
         self,
         dsn: Optional[str] = None,
         *,
+        audit_dsn: Optional[str] = None,
+        reader_dsn: Optional[str] = None,
         writer_pool_max: int = DEFAULT_WRITER_POOL_MAX,
         reader_pool_max: int = DEFAULT_READER_POOL_MAX,
     ):
@@ -251,10 +271,16 @@ class Database:
                 "See docs/postgres.md."
             )
         self.dsn = dsn
+        # Issue #108: opt-in separate stores, both defaulting to "same database as today".
+        # reader_dsn points the READER pool at a read replica; audit_dsn points the audit log
+        # (AuditRepo) at its own database. Neither changes behaviour when unset.
+        self.audit_dsn = audit_dsn
+        self.reader_dsn = reader_dsn or dsn
         self._writer_pool_max = writer_pool_max
         self._reader_pool_max = reader_pool_max
         self.writer: asyncpg.Pool | None = None
         self.reader: asyncpg.Pool | None = None
+        self.audit: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
         self.writer = await asyncpg.create_pool(
@@ -264,7 +290,7 @@ class Database:
             init=_init_connection,
         )
         self.reader = await asyncpg.create_pool(
-            self.dsn,
+            self.reader_dsn,
             min_size=self.DEFAULT_READER_POOL_MIN,
             max_size=self._reader_pool_max,
             init=_init_connection,
@@ -273,13 +299,29 @@ class Database:
         # concurrently-starting instances cannot race to apply the same file.
         async with acquire_with_timeout(self.writer, self.POOL_ACQUIRE_TIMEOUT) as conn:
             await _apply_migrations(conn)
+        # A split audit store runs its own migration sequence on its own pool. The advisory
+        # lock serializes per database (it is session-scoped on a connection to THAT database),
+        # so concurrent instances race-safely migrate both stores independently.
+        if self.audit_dsn:
+            self.audit = await asyncpg.create_pool(
+                self.audit_dsn,
+                min_size=self.DEFAULT_WRITER_POOL_MIN,
+                max_size=self._writer_pool_max,
+                init=_init_connection,
+            )
+            async with acquire_with_timeout(self.audit, self.POOL_ACQUIRE_TIMEOUT) as conn:
+                await _apply_migrations(conn, AUDIT_MIGRATIONS)
 
     async def close(self) -> None:
-        # Close both pools even if the first raises — a half-closed Database would leak
-        # connections for the remaining pool's lifetime.
+        # Close every pool even if one raises — a half-closed Database would leak connections
+        # for the remaining pools' lifetimes.
         try:
             if self.writer is not None:
                 await self.writer.close()
         finally:
-            if self.reader is not None:
-                await self.reader.close()
+            try:
+                if self.reader is not None:
+                    await self.reader.close()
+            finally:
+                if self.audit is not None:
+                    await self.audit.close()

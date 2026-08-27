@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     # points at docs/postgres.md) rather than a pydantic validation traceback at import time.
     database_url: str | None = None
 
+    # Issue #108: optional separate stores. audit_database_url points the high-churn traffic
+    # log (audit_events) at its OWN Postgres database (the opt-in revival of the pre-cutover
+    # gateway.db/audit.db split); reader_url points the reader pool at a read replica. Both
+    # default to None = "same database as ACROPOLIS_DATABASE_URL", preserving the
+    # single-database behaviour exactly. See docs/postgres.md for what flipping either does to
+    # an existing deployment (notably: a split audit store is a fresh schema — move existing
+    # audit history with pg_dump -t audit_events BEFORE switching).
+    audit_database_url: str | None = None
+    reader_url: str | None = None
+
     # data_dir survives the cutover but no longer holds gateway.db/audit.db — nothing in the
     # database layer reads it now. Kept because it is still the documented location for
     # non-database on-disk state (e.g. ACROPOLIS_SECRET_KEY_FILE's default neighbourhood in
