@@ -10,7 +10,15 @@ import httpx
 from archon.background import BackgroundLoop
 from archon.secrets import SecretProvider, SecretResolutionError
 from archon.secrets.local import LocalSecretProvider
-from argus.upstream import CLIENT_INFO, UpstreamHandshakeCache, UpstreamHandshakeError, parse_sse_body
+from argus.bridge import META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION
+from argus.headers import MCP_METHOD_HEADER
+from argus.upstream import (
+    CLIENT_INFO,
+    MCP_2026_VERSION,
+    UpstreamHandshakeCache,
+    UpstreamHandshakeError,
+    parse_sse_body,
+)
 from db.models import ServerRecord
 from db.repo import ServerNotFoundError, ServerRepo
 from stoa.webhooks import WebhookDispatcher
@@ -48,7 +56,19 @@ async def probe_server(
     source of truth for whether THIS was a secrets problem.
     """
     secrets = secret_provider or LocalSecretProvider()
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        # Advertise the modern era so 2026-generation upstreams answer `server/discover`
+        # directly; 2025-generation upstreams ignore/4xx it and use the initialize fallback.
+        "MCP-Protocol-Version": MCP_2026_VERSION,
+        # 2026 spec: the modern transport validates that the request's method appears in
+        # both the body and this header (HEADER_MISMATCH otherwise). The canonical constant
+        # (not a lowercase literal) matters: a strict upstream comparing header NAMES
+        # literally — as argus/headers.py's own header_matches_body() convention implies —
+        # would reject the probe.
+        MCP_METHOD_HEADER: "server/discover",
+    }
     # A server with a configured upstream credential needs it on the health probe too, or every
     # registered server requiring auth would show permanently unhealthy regardless of whether
     # tools/call itself works.
@@ -69,7 +89,20 @@ async def probe_server(
         headers["Authorization"] = resolved_auth_header
     discover_body = {
         "jsonrpc": "2.0", "id": "acropolis-discover", "method": "server/discover",
-        "params": {"clientInfo": CLIENT_INFO},
+        # Modern (2026-07-28) discovery: per the spec the request carries NO body parameters
+        # beyond the standard `_meta` envelope — protocolVersion, clientInfo, and
+        # clientCapabilities — alongside the matching `MCP-Protocol-Version` and `Mcp-Method`
+        # headers. (clientInfo lives INSIDE _meta as io.modelcontextprotocol/clientInfo, NOT
+        # at params top level — a strict 2026 server won't find it there.) 2025-generation
+        # upstreams answer this with a method-not-found error and fall through to the
+        # initialize handshake below.
+        "params": {
+            "_meta": {
+                META_PROTOCOL_VERSION: MCP_2026_VERSION,
+                META_CLIENT_INFO: CLIENT_INFO,
+                META_CLIENT_CAPABILITIES: {},
+            },
+        },
     }
 
     try:

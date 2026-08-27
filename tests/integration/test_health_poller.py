@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -146,3 +148,159 @@ async def test_poller_marks_server_unhealthy_via_poll_one_too(db, upstream):
     assert updated.health_status == "unhealthy"
     assert updated.health_reason is not None
     assert "secret resolution failed" in updated.health_reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# Issue #110 — 2026-07-28-generation server/discover probe
+# ---------------------------------------------------------------------------
+
+class _Discovery2026Upstream:
+    """A raw TCP listener standing in for a 2026-07-28-generation MCP server: answers
+    `server/discover` with a spec-shaped DiscoverResult and records every request it receives
+    (method, headers, params) so a test can assert exactly what the probe sent.
+
+    Deliberately STRICT about the routing contract, mirroring what the 2026 spec demands of a
+    modern transport: the request must carry `Mcp-Method` (canonical casing — the lowercase
+    literal the stranded branch had is exactly the failure mode a strict upstream rejects) and
+    `MCP-Protocol-Version` matching the body, and the `_meta` envelope must carry
+    protocolVersion/clientInfo/clientCapabilities. Any violation gets a JSON-RPC error back,
+    which probe_server treats as unhealthy — so a contract violation fails the test loudly
+    instead of passing silently."""
+
+    def __init__(self):
+        self._server: asyncio.AbstractServer | None = None
+        self.url = ""
+        # One dict per received request: {"method", "headers" (lowercased keys), "params"}.
+        self.requests: list[dict] = []
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = await reader.readuntil(b"\r\n\r\n")
+        headers: dict[str, str] = {}
+        for line in head.decode().split("\r\n")[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        length = int(headers.get("content-length", "0"))
+        body_bytes = await reader.readexactly(length) if length else b""
+        body = json.loads(body_bytes) if body_bytes else {}
+        self.requests.append({
+            "method": body.get("method"),
+            "headers": headers,
+            "params": body.get("params") or {},
+        })
+
+        result = None
+        error = None
+        if body.get("method") == "server/discover":
+            meta = (body.get("params") or {}).get("_meta") or {}
+            if headers.get("mcp-method") != "server/discover":
+                error = {"code": -32020, "message": "HEADER_MISMATCH: Mcp-Method missing or not matching body"}
+            elif headers.get("mcp-protocol-version") != "2026-07-28":
+                error = {"code": -32602, "message": "bad MCP-Protocol-Version"}
+            elif meta.get("io.modelcontextprotocol/protocolVersion") != "2026-07-28":
+                error = {"code": -32602, "message": "_meta missing io.modelcontextprotocol/protocolVersion"}
+            elif "io.modelcontextprotocol/clientInfo" not in meta:
+                error = {"code": -32602, "message": "_meta missing io.modelcontextprotocol/clientInfo"}
+            elif "io.modelcontextprotocol/clientCapabilities" not in meta:
+                error = {"code": -32602, "message": "_meta missing io.modelcontextprotocol/clientCapabilities"}
+            else:
+                result = {
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                    "_meta": {
+                        "io.modelcontextprotocol/serverInfo": {
+                            "name": "discovery-2026-fixture", "version": "1.0.0",
+                        }
+                    },
+                }
+        else:
+            # A stateless 2026 server has no initialize handshake — anything else is not
+            # implemented, so a probe that wrongly falls back here reads unhealthy.
+            error = {"code": -32601, "message": "method not found"}
+
+        resp_body: dict = {"jsonrpc": "2.0", "id": body.get("id")}
+        if result is not None:
+            resp_body["result"] = result
+        else:
+            resp_body["error"] = error
+        payload = json.dumps(resp_body).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            + str(len(payload)).encode() + b"\r\n\r\n" + payload
+        )
+        await writer.drain()
+        writer.close()
+
+    async def start(self) -> None:
+        import socket as socket_module
+
+        with socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", port)
+        self.url = f"http://127.0.0.1:{port}/mcp"
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+
+async def test_probe_server_2026_upstream_answers_discover_directly(db):
+    """A 2026-generation upstream answers `server/discover` directly — the probe must be a
+    single stateless call with NO initialize fallback, and it must carry the modern routing
+    headers and the spec's `_meta` envelope (clientInfo INSIDE _meta, never at params top
+    level). The fixture enforces the strict 2026 contract, so any deviation surfaces as
+    unhealthy rather than a silent pass."""
+    upstream = _Discovery2026Upstream()
+    await upstream.start()
+    try:
+        server = await ServerRepo(db).create(slug="gen2026", name="Gen2026", upstream_url=upstream.url)
+        async with httpx.AsyncClient() as client:
+            cache = UpstreamHandshakeCache(client)
+            health_status, protocol, discover_json, health_reason = await probe_server(client, cache, server)
+
+        assert health_status == "healthy"
+        assert protocol == "2026-07-28"
+        assert discover_json["supportedVersions"] == ["2026-07-28"]
+        assert discover_json["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "discovery-2026-fixture"
+        assert health_reason is None
+
+        # Single stateless server/discover — the initialize fallback must never run for a
+        # 2026-generation upstream.
+        assert [r["method"] for r in upstream.requests] == ["server/discover"]
+
+        req = upstream.requests[0]
+        assert req["headers"]["mcp-method"] == "server/discover"  # canonical constant, not a literal
+        assert req["headers"]["mcp-protocol-version"] == "2026-07-28"
+        meta = req["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+        assert meta["io.modelcontextprotocol/clientInfo"] == {"name": "acropolis-gateway", "version": "0.1.0"}
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+        # Per the 2026-07-28 spec, clientInfo lives INSIDE _meta — never at params top level.
+        assert "clientInfo" not in req["params"]
+    finally:
+        await upstream.stop()
+
+
+async def test_probe_server_2026_upstream_keeps_authorization_header(db):
+    """The header-dict rewrite (issue #110) must not disturb the existing behaviour of sending
+    a configured upstream credential on the probe — a 2026-discovery request for an
+    auth-requiring server still carries its resolved Authorization header."""
+    upstream = _Discovery2026Upstream()
+    await upstream.start()
+    try:
+        server = await ServerRepo(db).create(
+            slug="gen2026-auth", name="Gen2026Auth", upstream_url=upstream.url,
+            upstream_auth_header="Bearer probe-token-123",
+        )
+        async with httpx.AsyncClient() as client:
+            cache = UpstreamHandshakeCache(client)
+            health_status, protocol, discover_json, health_reason = await probe_server(client, cache, server)
+
+        assert health_status == "healthy"
+        assert protocol == "2026-07-28"
+        assert upstream.requests[0]["headers"].get("authorization") == "Bearer probe-token-123"
+    finally:
+        await upstream.stop()
