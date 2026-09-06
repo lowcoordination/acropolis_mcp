@@ -264,7 +264,9 @@ async def _run_worker_with_timeout(worker_fn, compiled, value: str, log_label: s
             result_queue.close()
 
 
-async def _match_with_timeout(compiled, value: str) -> MatchOutcome:
+async def _match_with_timeout(
+    compiled, value: str, log_label: str = "block_pattern match"
+) -> MatchOutcome:
     """Runs compiled.search(value) with a hard wall-clock timeout, unless the pattern is an
     re2 pattern (#112).
 
@@ -286,11 +288,17 @@ async def _match_with_timeout(compiled, value: str) -> MatchOutcome:
     cannot do. Returns MatchOutcome.UNDETERMINED on timeout (either kind) or infra failure;
     the caller (_check_param) decides what that means for the block/allow decision, so an
     undetermined result is never silently folded into "did not match".
+
+    log_label names the CALLER in the timeout/infra warnings emitted by
+    _run_worker_with_timeout (which exists precisely to distinguish them). It defaults to the
+    block-pattern caller; #121's allow-pattern loop passes its own, so an operator reading
+    "rewrite this pattern" is pointed at the field the pattern actually lives in rather than
+    being told to go fix a block_pattern that isn't there.
     """
     if is_re2_pattern(compiled):
         return MatchOutcome.MATCHED if compiled.search(value) else MatchOutcome.NOT_MATCHED
 
-    matched, _ = await _run_worker_with_timeout(_regex_worker, compiled, value, "block_pattern match")
+    matched, _ = await _run_worker_with_timeout(_regex_worker, compiled, value, log_label)
     if matched is None:
         return MatchOutcome.UNDETERMINED
     return MatchOutcome.MATCHED if matched else MatchOutcome.NOT_MATCHED
@@ -473,7 +481,7 @@ async def _check_param(name: str, value: Any, rule: ParamRule) -> Optional[tuple
         matched = False
         undetermined = None
         for compiled in rule.compiled_allow_patterns():
-            outcome = await _match_with_timeout(compiled, s)
+            outcome = await _match_with_timeout(compiled, s, "allow_pattern match")
             if outcome is MatchOutcome.MATCHED:
                 matched = True
                 break

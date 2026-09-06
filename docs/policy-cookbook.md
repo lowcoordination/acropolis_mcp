@@ -97,7 +97,7 @@ a param rule accepts `allow_patterns`: a list of regular expressions the value m
 }
 ```
 
-Three properties, all deliberate — don't infer the unstated inverse of any of them:
+Five properties, all deliberate — don't infer the unstated inverse of any of them:
 
 - **Empty `allow_patterns` means no allow constraint.** An empty list behaves exactly like a
   policy without the field at all — it is not an "allow nothing" rule.
@@ -113,6 +113,20 @@ Three properties, all deliberate — don't infer the unstated inverse of any of 
   permit. One caveat: if any pattern in the list matches determinately, the call passes even
   if a different pattern in the same list was undetermined — a verified match satisfies
   "at least one" outright.
+- **An omitted parameter is not constrained.** A param rule only runs when the parameter is
+  actually present in the call. If the caller omits `path` entirely, the rule above does not
+  fire and the call proceeds — an allow-list constrains *the value that was sent*, it does not
+  make the parameter mandatory. This matters more for `allow_patterns` than for
+  `block_patterns`: with a blocklist an absent value is genuinely harmless, but a blast-radius
+  limit can be sidestepped by a caller that simply omits the parameter and lets the tool apply
+  its own server-side default. If a tool behaves that way, an `allow_patterns` rule on that
+  parameter is not sufficient on its own — deny the tool, or constrain it upstream.
+  (Making a parameter mandatory is tracked separately as `ParamRule.required`, issue #131.)
+- **Patterns match case-insensitively.** Every operator pattern compiles case-insensitive (the
+  same for `block_patterns`). For a blocklist that is the conservative direction — it catches
+  more. For an allow-list it is the *permissive* direction: `^/home/lowcoordination/k3s/` also
+  admits `/HOME/LOWCOORDINATION/K3S/`, which on a case-sensitive filesystem is a different
+  path entirely. Write allow patterns knowing they are looser than they look.
 
 `allow_patterns` use the same engine dispatch as `block_patterns` (re2 fast path, forkserver
 fallback with the same hard timeout), and a block for missing the allow-list is recorded as

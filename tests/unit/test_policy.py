@@ -218,8 +218,88 @@ async def test_allow_match_on_one_pattern_permits_despite_undetermined_on_anothe
             allow_patterns=[r"^(a*)*\1$", r"^/safe/"],
         )}},
     )
-    decision = await evaluate("tool", {"value": "/safe/file.txt"}, "srv", policy)
+    # The arg key MUST match the param rule's key ("path"). Keyed on anything else, evaluate()
+    # takes the `param_name not in arguments` skip in argus/policy.py and this test passes
+    # without ever consulting the allow-list — i.e. vacuously (review 2026-09-06).
+    decision = await evaluate("tool", {"path": "/safe/file.txt"}, "srv", policy)
     assert not decision.blocked
+
+    # Guard against exactly that regression: the SAME policy must still BLOCK a value that
+    # matches neither pattern. If the rule ever stops being consulted, this assertion fails
+    # even though the one above would keep passing.
+    miss = await evaluate("tool", {"path": "/unsafe/file.txt"}, "srv", policy)
+    assert miss.blocked
+
+
+async def test_allow_pattern_does_not_fire_when_param_is_omitted():
+    """#121 boundary, pinned deliberately (review 2026-09-06): a param rule only runs when the
+    parameter is PRESENT — argus/policy.py's `param_name not in arguments: continue`. So an
+    allow-list constrains the value that was SENT; it does not make the parameter mandatory.
+
+    This is correct for block_patterns (an absent value cannot match something forbidden) but
+    is a real limit on allow_patterns as a blast-radius control: a caller can sidestep the
+    limit by omitting the parameter and letting the tool apply its own server-side default.
+    Documented in docs/policy-cookbook.md under "An omitted parameter is not constrained."
+
+    Asserted rather than left implicit so that if `required`-style semantics are ever added
+    (issue #131, under epic #119), this test FAILS and forces the docs to be updated with it.
+    """
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"write": {"path": ParamRule(
+            allow_patterns=[r"^/home/lowcoordination/k3s/manifests/"],
+        )}},
+    )
+    # A present value outside the prefix is blocked...
+    assert (await evaluate("write", {"path": "/etc/shadow"}, "srv", policy)).blocked
+    # ...but omitting `path` entirely is NOT blocked: the rule never runs.
+    omitted = await evaluate("write", {}, "srv", policy)
+    assert not omitted.blocked
+    # Another param present, the constrained one still absent — same outcome.
+    assert not (await evaluate("write", {"content": "x"}, "srv", policy)).blocked
+
+
+async def test_allow_pattern_matches_case_insensitively():
+    """#121 boundary, pinned deliberately (review 2026-09-06): operator patterns compile
+    case-insensitive (db/models.py's compile_pattern). For a BLOCKLIST that is conservative;
+    for an ALLOW-list it is permissive — the allow-list admits more than it appears to, since
+    on a case-sensitive filesystem /HOME/... is a different path than /home/....
+
+    Pinned so the looseness is a visible, asserted property rather than a surprise. If the
+    case-sensitivity of operator patterns is ever revisited, this test surfaces the blast
+    radius on the allow side. Documented in docs/policy-cookbook.md.
+    """
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"write": {"path": ParamRule(
+            allow_patterns=[r"^/home/lowcoordination/k3s/manifests/"],
+        )}},
+    )
+    upper = await evaluate("write", {"path": "/HOME/LOWCOORDINATION/K3S/MANIFESTS/a.yaml"}, "srv", policy)
+    assert not upper.blocked, "allow patterns are case-insensitive — see the cookbook caveat"
+
+
+async def test_allow_pattern_timeout_logs_as_allow_not_block(caplog):
+    """#121 operability (review 2026-09-06): an UNDETERMINED on an ALLOW pattern must name the
+    allow field in the operator-facing warning. _run_worker_with_timeout's log_label exists to
+    distinguish callers, but _match_with_timeout hard-coded 'block_pattern match' for every
+    caller — so a slow allow pattern told the operator to go rewrite a block_pattern that does
+    not exist. Pinned so the label can't silently regress to the block-side default."""
+    import logging
+
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(allow_patterns=[r"^(a*)*\1$"])}},
+    )
+    with caplog.at_level(logging.WARNING, logger="argus.policy"):
+        decision = await evaluate("tool", {"value": "a" * 30 + "b"}, "srv", policy)
+
+    assert decision.blocked
+    assert decision.rule == "allow_pattern_undetermined"
+    timeout_logs = [r.getMessage() for r in caplog.records if "UNDETERMINED" in r.getMessage()]
+    assert timeout_logs, "expected a timeout warning naming the caller"
+    assert any("allow_pattern" in m for m in timeout_logs), timeout_logs
+    assert not any(m.startswith("block_pattern") for m in timeout_logs), timeout_logs
 
 
 async def test_empty_allow_patterns_is_byte_identical_to_absent():
