@@ -451,6 +451,41 @@ async def _check_param(name: str, value: Any, rule: ParamRule) -> Optional[tuple
             # docs/policy-cookbook.md for the operator-facing explanation of this trade-off.
             return ("block_pattern_undetermined", compiled.pattern)
 
+    # #121 allow_patterns — allow-SEMANTICS for blast-radius limits (e.g. confining a write
+    # tool's `path` to a set of directory prefixes). When the operator configured any, the
+    # value must match AT LEAST ONE or the call is blocked. The ordering against the block
+    # loop above IS the documented semantics, not an accident:
+    #
+    #   * DENY WINS — block_patterns run first, so a value matching both an allow and a
+    #     block pattern is blocked. An operator's block_patterns express what must NEVER
+    #     match, and an allow-list elsewhere in the same rule cannot be read as permission
+    #     to bypass them. docs/policy-cookbook.md states this as the contract.
+    #   * Fail-closed on UNDETERMINED: for an allow-list, "I could not verify this is
+    #     permitted" must never mean permit. An UNDETERMINED match is treated as NOT
+    #     matched — and if NO pattern yields a determinate MATCHED, the value is blocked,
+    #     reported as 'allow_pattern_undetermined' when an undetermined outcome is why
+    #     permission could not be verified (mirroring block_pattern_undetermined).
+    #   * A determinate MATCHED on ANY pattern in the list satisfies "at least one" — the
+    #     list is a disjunction, and an UNDETERMINED on a DIFFERENT pattern in the same
+    #     list cannot un-verify a match we did prove. Only when nothing matched
+    #     determinately does an UNDETERMINED outcome drive the block.
+    if rule.allow_patterns:
+        matched = False
+        undetermined = None
+        for compiled in rule.compiled_allow_patterns():
+            outcome = await _match_with_timeout(compiled, s)
+            if outcome is MatchOutcome.MATCHED:
+                matched = True
+                break
+            if outcome is MatchOutcome.UNDETERMINED:
+                # Keep going: another pattern may still match determinately, which would
+                # satisfy the allow-list outright. Remember this one in case none do.
+                undetermined = compiled
+        if not matched:
+            if undetermined is not None:
+                return ("allow_pattern_undetermined", undetermined.pattern)
+            return ("allow_pattern", f"no allow pattern matched (allowed: {', '.join(rule.allow_patterns)})")
+
     if rule.max_value is not None:
         try:
             if float(value) > rule.max_value:

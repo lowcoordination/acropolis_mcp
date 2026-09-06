@@ -9,7 +9,7 @@ import yaml
 from db.models import ParamRule, ServerPolicy
 from db.repo import ServerRepo, SlugConflictError
 
-_PARAM_RULE_FIELDS = {"max_length", "block_patterns", "max_value", "min_value", "denied"}
+_PARAM_RULE_FIELDS = {"max_length", "block_patterns", "allow_patterns", "max_value", "min_value", "denied"}
 _SLUG_UNSAFE_CHARS = re.compile(r"[^a-z0-9-]+")
 
 

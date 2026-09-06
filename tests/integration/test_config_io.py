@@ -46,7 +46,8 @@ async def client(tmp_path: Path):
     )
     await server_repo.set_policy(server.id, ServerPolicy(
         mode="allowlist", rate_limit="5/minute", allowed=["shell_run"],
-        param_rules={"shell_run": {"command": ParamRule(max_length=200, block_patterns=["sudo"])}},
+        param_rules={"shell_run": {"command": ParamRule(max_length=200, block_patterns=["sudo"],
+                                                        allow_patterns=["^/home/lowcoordination/k3s/manifests/"])}},
     ))
     await server_repo.create(slug="fetch", name="Fetch", upstream_url="http://127.0.0.1:9002/mcp")
 
@@ -133,6 +134,11 @@ async def test_export_round_trips_policy_faithfully(client):
     assert shell["policy"]["allowed"] == ["shell_run"]
     assert shell["policy"]["param_rules"]["shell_run"]["command"]["max_length"] == 200
     assert shell["policy"]["param_rules"]["shell_run"]["command"]["block_patterns"] == ["sudo"]
+    # #121: allow_patterns rides the model-driven export with no special-casing — assert
+    # it, don't assume it (same discipline as the DLP round-trip test below).
+    assert shell["policy"]["param_rules"]["shell_run"]["command"]["allow_patterns"] == [
+        "^/home/lowcoordination/k3s/manifests/"
+    ]
 
 
 async def test_export_round_trips_dlp_config_faithfully(client):
@@ -272,13 +278,20 @@ async def test_import_never_deletes_servers_absent_from_the_file(client):
         "servers": [{"slug": "shell", "name": "Shell", "upstream_url": "http://127.0.0.1:9001/mcp",
                      "policy": {"mode": "allowlist", "rate_limit": "5/minute", "allowed": ["shell_run"],
                                 "param_rules": {"shell_run": {"command": {"max_length": 200,
-                                                                          "block_patterns": ["sudo"]}}}}}],
+                                                                          "block_patterns": ["sudo"],
+                                                                          "allow_patterns": ["^/home/lowcoordination/k3s/manifests/"]}}}}}],
     })
     resp = await client.post("/api/v1/config/import", json={"yaml": doc, "apply": True})
     assert resp.json()["ok"] is True
     # 'fetch' was not in the file and must survive untouched.
     assert (await client.get("/api/v1/servers/fetch")).status_code == 200
     assert any("fetch" in w for w in resp.json()["warnings"])
+    # #121: the imported allow_patterns must land in the stored policy (validated at
+    # construction like block_patterns, then persisted by set_policy).
+    policy = (await client.get("/api/v1/servers/shell/policy")).json()
+    assert policy["param_rules"]["shell_run"]["command"]["allow_patterns"] == [
+        "^/home/lowcoordination/k3s/manifests/"
+    ]
 
 
 async def test_export_import_export_is_stable_modulo_timestamp(client):

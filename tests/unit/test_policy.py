@@ -133,6 +133,115 @@ async def test_param_rule_applies_regardless_of_mode():
     assert decision.rule == "block_pattern"
 
 
+# ---------------------------------------------------------------------------
+# #121 — allow_patterns on ParamRule (allow-semantics for blast-radius limits)
+# ---------------------------------------------------------------------------
+
+async def test_allow_pattern_permits_inside_prefix_and_blocks_outside():
+    """#121 acceptance: `allow_patterns: ['^/home/lowcoordination/k3s/manifests/']` on
+    write.path permits a write inside that prefix and blocks one outside."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"write": {"path": ParamRule(
+            allow_patterns=[r"^/home/lowcoordination/k3s/manifests/"],
+        )}},
+    )
+
+    inside = await evaluate("write", {"path": "/home/lowcoordination/k3s/manifests/app.yaml"}, "srv", policy)
+    assert not inside.blocked
+
+    outside = await evaluate("write", {"path": "/etc/nginx/nginx.conf"}, "srv", policy)
+    assert outside.blocked
+    assert outside.rule == "allow_pattern"
+    assert "/etc/nginx/nginx.conf" not in (outside.matched or "")
+
+
+async def test_value_matching_both_allow_and_block_is_blocked():
+    """#121 acceptance: DENY WINS. A value matching both an allow and a block pattern is
+    blocked — the block check runs first, and the docs state this as the contract rather
+    than leaving it implicit in check order."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"write": {"path": ParamRule(
+            block_patterns=[r"^/etc/"],
+            allow_patterns=[r"^/etc/allowed/"],
+        )}},
+    )
+    decision = await evaluate("write", {"path": "/etc/allowed/thing"}, "srv", policy)
+    assert decision.blocked
+    assert decision.rule == "block_pattern"
+    assert decision.matched == r"^/etc/"
+
+
+async def test_allow_pattern_undetermined_blocks():
+    """#121 acceptance + fail-closed requirement: an allow-list where the match cannot be
+    decided must BLOCK, never permit — 'I could not verify this is permitted' must not mean
+    permit. The pattern is re2-incompatible (backreference) and catastrophically
+    backtracking against this input, so it goes UNDETERMINED on the forkserver path; no
+    determinate match exists, so the value is blocked as 'allow_pattern_undetermined'."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(allow_patterns=[r"^(a*)*\1$"])}},
+    )
+    decision = await evaluate("tool", {"value": "a" * 30 + "b"}, "srv", policy)
+    assert decision.blocked
+    assert decision.rule == "allow_pattern_undetermined"
+
+
+async def test_allow_pattern_re2_rejected_pattern_evaluates_via_forkserver():
+    """#121 acceptance: a pattern re2 rejects still evaluates via the forkserver path —
+    here determinately MATCHING (proving the fallback completes and returns a real
+    outcome for the allow side, not just for the deny side it was built for)."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(allow_patterns=[r"^(ab)\1$"])}},
+    )
+    # re2 rejects the backreference -> re.Pattern -> forkserver path -> MATCHED -> permitted.
+    permitted = await evaluate("tool", {"value": "abab"}, "srv", policy)
+    assert not permitted.blocked
+
+    # Same engine path, determinate NOT_MATCHED -> blocked as a plain allow_pattern miss.
+    miss = await evaluate("tool", {"value": "abax"}, "srv", policy)
+    assert miss.blocked
+    assert miss.rule == "allow_pattern"
+
+
+async def test_allow_match_on_one_pattern_permits_despite_undetermined_on_another():
+    """#121 design decision, pinned: the allow list is a disjunction. An UNDETERMINED on a
+    DIFFERENT pattern in the same list cannot un-verify a determinate match, so the value
+    is permitted. (If NO pattern matches determinately, UNDETERMINED drives the block —
+    see test_allow_pattern_undetermined_blocks.) Reviewers who want the stricter
+    'any UNDETERMINED blocks outright' semantics: change _check_param, then this test."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"path": ParamRule(
+            allow_patterns=[r"^(a*)*\1$", r"^/safe/"],
+        )}},
+    )
+    decision = await evaluate("tool", {"value": "/safe/file.txt"}, "srv", policy)
+    assert not decision.blocked
+
+
+async def test_empty_allow_patterns_is_byte_identical_to_absent():
+    """#121 acceptance: an empty allow_patterns list is byte-identical to today's behaviour —
+    for the same inputs, a rule with allow_patterns=[] must produce the exact same Decision
+    (all fields) as a rule without the field, and must never act as 'allow nothing'."""
+    plain = ServerPolicy(mode="passthrough", param_rules={"tool": {
+        "value": ParamRule(block_patterns=["sudo"], max_length=10),
+    }})
+    with_empty_allow = ServerPolicy(mode="passthrough", param_rules={"tool": {
+        "value": ParamRule(block_patterns=["sudo"], max_length=10, allow_patterns=[]),
+    }})
+
+    for args in ({"value": "ls -la"}, {"value": "sudo rm -rf /"}, {"value": "a" * 20}):
+        before = await evaluate("tool", args, "srv", plain)
+        after = await evaluate("tool", args, "srv", with_empty_allow)
+        assert before == after, f"decision diverged for {args!r}: {before} vs {after}"
+    # And an arbitrary pass-through value is NOT blocked by the empty allow-list — an empty
+    # allow_patterns must never read as "allow nothing".
+    assert not (await evaluate("tool", {"value": "ls -la"}, "srv", with_empty_allow)).blocked
+
+
 async def test_missing_param_not_checked():
     policy = ServerPolicy(
         mode="passthrough",

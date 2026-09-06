@@ -77,6 +77,47 @@ Treat a blocklist like this as a speed bump, not a sandbox — regex matching on
 string can't catch every way to express the same intent. If a tool is dangerous enough that
 you don't trust a blocklist, deny it outright instead.
 
+### Allow patterns: blast-radius limits
+
+`block_patterns` can only say "never match this." Some constraints go the other way: an agent
+should be able to write files, but only *inside a project directory*. Inverting that into a
+blocklist means enumerating everything it must not write to — unbounded, and wrong. For that,
+a param rule accepts `allow_patterns`: a list of regular expressions the value must match
+**at least one** of, or the call is blocked:
+
+```json
+{
+  "param_rules": {
+    "write": {
+      "path": {
+        "allow_patterns": ["^/home/lowcoordination/k3s/manifests/"]
+      }
+    }
+  }
+}
+```
+
+Three properties, all deliberate — don't infer the unstated inverse of any of them:
+
+- **Empty `allow_patterns` means no allow constraint.** An empty list behaves exactly like a
+  policy without the field at all — it is not an "allow nothing" rule.
+- **Deny wins.** A value matching both an `allow_patterns` entry and a `block_patterns`
+  entry is **blocked**. Block checks run first, and the blocklist is the stronger
+  expression of intent. The opposite precedence (an allow match carving an exception out of
+  the blocklist) is defensible for some setups — if you want that, it must be a deliberate
+  request, not a silent default.
+- **Undecidable is not permitted.** If an allow-pattern match can't be decided (timeout,
+  worker failure — same machinery as above), it counts as *not matched*, and if no pattern
+  matched determinately the call is **blocked**, recorded as
+  `rule: allow_pattern_undetermined`. "I could not verify this is permitted" never means
+  permit. One caveat: if any pattern in the list matches determinately, the call passes even
+  if a different pattern in the same list was undetermined — a verified match satisfies
+  "at least one" outright.
+
+`allow_patterns` use the same engine dispatch as `block_patterns` (re2 fast path, forkserver
+fallback with the same hard timeout), and a block for missing the allow-list is recorded as
+`rule: allow_pattern`.
+
 ### What happens if a pattern is slow
 
 Every `block_patterns` match runs with a hard 0.5s timeout (`ACROPOLIS_REGEX_MATCH_TIMEOUT_
