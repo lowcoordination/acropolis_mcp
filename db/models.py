@@ -67,18 +67,32 @@ SLUG_RE = re.compile(r"^[a-z0-9-]+$")
 class ParamRule(BaseModel):
     max_length: Optional[int] = None
     block_patterns: list[str] = []
+    # #121: allow-semantics for blast-radius limits. Empty list = no allow constraint (the rule
+    # behaves byte-identically to pre-#121 — see argus/policy.py's _check_param, which skips
+    # the allow check entirely when this is empty). Non-empty = the value must match AT LEAST
+    # ONE pattern or the call is blocked. DENY WINS: a value matching both an allow pattern
+    # and a block pattern is blocked — block checks run first, and this is the documented
+    # contract (docs/policy-cookbook.md), not an accident of check order. The opposite choice
+    # (allow-list exception carved out of a blocklist) is defensible but implicit behavior
+    # is exactly what this field refuses to be.
+    allow_patterns: list[str] = []
     max_value: Optional[float] = None
     min_value: Optional[float] = None
     denied: bool = False
 
-    @field_validator("block_patterns")
+    @field_validator("block_patterns", "allow_patterns")
     @classmethod
-    def _validate_patterns(cls, patterns: list[str]) -> list[str]:
+    def _validate_patterns(cls, patterns: list[str], info) -> list[str]:
         # Compile-on-write: bad or oversized regex fail at save time, not at first match.
         # ReDoS mitigation for a web-editable field: cap pattern length.
+        # #121: identical rules for allow_patterns — an operator-supplied pattern is
+        # untrusted regardless of which field it lands in, so the same 200-char cap and
+        # compile check apply (the runtime ReDoS protection is the same re2 fast path /
+        # forkserver machinery for both; see argus/policy.py's _match_with_timeout).
+        label = "block" if info.field_name == "block_patterns" else "allow"
         for p in patterns:
             if len(p) > 200:
-                raise ValueError(f"block pattern too long (max 200 chars): {p!r}")
+                raise ValueError(f"{label} pattern too long (max 200 chars): {p!r}")
             try:
                 re.compile(p, re.IGNORECASE)
             except re.error as e:
@@ -89,6 +103,22 @@ class ParamRule(BaseModel):
     # ^ list of re.Pattern | re2._Regexp (see compile_pattern) — bare `list` annotation because
     # the re2 type is only importable when the module is installed; the engine of each element
     # is discoverable via is_re2_pattern.
+
+    _compiled_allow_cache: Optional[list] = PrivateAttr(default=None)
+    # ^ #121 twin of _compiled_cache for allow_patterns — same bare-list annotation rationale,
+    # same engine discovery via is_re2_pattern.
+
+    def compiled_allow_patterns(self) -> list:
+        """#121 allow-semantics twin of compiled_patterns(): same compile_pattern dispatch
+        (re2 inline fast path where accepted, re.Pattern + forkserver machinery otherwise) and
+        the same cache discipline — allow_patterns is validated (and thus fixed) at construction
+        time and never mutated afterward, so compiling once and caching is safe. The caller
+        (argus/policy.py's _check_param) decides the deny-wins / fail-closed-UNDETERMINED
+        semantics; this method only guarantees the same per-instance compile-once behaviour as
+        the block side."""
+        if self._compiled_allow_cache is None:
+            self._compiled_allow_cache = [compile_pattern(p) for p in self.allow_patterns]
+        return self._compiled_allow_cache
 
     def compiled_patterns(self) -> list:
         # F26 fix (review 2026-08-04): this recompiled every pattern from scratch on every call,

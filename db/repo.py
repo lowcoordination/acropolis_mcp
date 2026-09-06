@@ -560,7 +560,7 @@ class ServerRepo(_PoolAccess):
             )
             param_rows = await conn.fetch(
                 """SELECT server_id, tool_name, param_name, max_length, max_value, min_value,
-                          denied, block_patterns
+                          denied, block_patterns, allow_patterns
                    FROM param_rules WHERE server_id = ANY($1)""",
                 server_ids,
             )
@@ -578,6 +578,8 @@ class ServerRepo(_PoolAccess):
                 min_value=r["min_value"],
                 denied=bool(r["denied"]),
                 block_patterns=json.loads(r["block_patterns"]) if r["block_patterns"] else [],
+                # #121: same JSONB round-trip as block_patterns; NULL (pre-0013 rows) is [].
+                allow_patterns=json.loads(r["allow_patterns"]) if r["allow_patterns"] else [],
             )
 
         result = {}
@@ -643,7 +645,8 @@ class ServerRepo(_PoolAccess):
                 await conn.execute("DELETE FROM param_rules WHERE server_id = $1", server_id)
                 param_rows = [
                     (server_id, tool_name, param_name, rule.max_length, rule.max_value,
-                     rule.min_value, rule.denied, json.dumps(rule.block_patterns))
+                     rule.min_value, rule.denied, json.dumps(rule.block_patterns),
+                     json.dumps(rule.allow_patterns))
                     for tool_name, params in policy.param_rules.items()
                     for param_name, rule in params.items()
                 ]
@@ -651,8 +654,8 @@ class ServerRepo(_PoolAccess):
                     await conn.executemany(
                         """INSERT INTO param_rules
                            (server_id, tool_name, param_name, max_length, max_value, min_value,
-                            denied, block_patterns)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+                            denied, block_patterns, allow_patterns)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
                         param_rows,
                     )
 

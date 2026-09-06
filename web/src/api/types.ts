@@ -54,6 +54,9 @@ export interface ServerUpdateRequest {
 export interface ParamRule {
   max_length?: number | null
   block_patterns: string[]
+  // Issue #121: value must match at least one of these, else blocked. Empty = no constraint.
+  // Deny wins: a value matching both an allow and a block pattern is blocked.
+  allow_patterns: string[]
   max_value?: number | null
   min_value?: number | null
   denied: boolean

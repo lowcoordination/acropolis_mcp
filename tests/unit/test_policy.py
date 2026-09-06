@@ -133,6 +133,195 @@ async def test_param_rule_applies_regardless_of_mode():
     assert decision.rule == "block_pattern"
 
 
+# ---------------------------------------------------------------------------
+# #121 — allow_patterns on ParamRule (allow-semantics for blast-radius limits)
+# ---------------------------------------------------------------------------
+
+async def test_allow_pattern_permits_inside_prefix_and_blocks_outside():
+    """#121 acceptance: `allow_patterns: ['^/home/lowcoordination/k3s/manifests/']` on
+    write.path permits a write inside that prefix and blocks one outside."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"write": {"path": ParamRule(
+            allow_patterns=[r"^/home/lowcoordination/k3s/manifests/"],
+        )}},
+    )
+
+    inside = await evaluate("write", {"path": "/home/lowcoordination/k3s/manifests/app.yaml"}, "srv", policy)
+    assert not inside.blocked
+
+    outside = await evaluate("write", {"path": "/etc/nginx/nginx.conf"}, "srv", policy)
+    assert outside.blocked
+    assert outside.rule == "allow_pattern"
+    assert "/etc/nginx/nginx.conf" not in (outside.matched or "")
+
+
+async def test_value_matching_both_allow_and_block_is_blocked():
+    """#121 acceptance: DENY WINS. A value matching both an allow and a block pattern is
+    blocked — the block check runs first, and the docs state this as the contract rather
+    than leaving it implicit in check order."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"write": {"path": ParamRule(
+            block_patterns=[r"^/etc/"],
+            allow_patterns=[r"^/etc/allowed/"],
+        )}},
+    )
+    decision = await evaluate("write", {"path": "/etc/allowed/thing"}, "srv", policy)
+    assert decision.blocked
+    assert decision.rule == "block_pattern"
+    assert decision.matched == r"^/etc/"
+
+
+async def test_allow_pattern_undetermined_blocks():
+    """#121 acceptance + fail-closed requirement: an allow-list where the match cannot be
+    decided must BLOCK, never permit — 'I could not verify this is permitted' must not mean
+    permit. The pattern is re2-incompatible (backreference) and catastrophically
+    backtracking against this input, so it goes UNDETERMINED on the forkserver path; no
+    determinate match exists, so the value is blocked as 'allow_pattern_undetermined'."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(allow_patterns=[r"^(a*)*\1$"])}},
+    )
+    decision = await evaluate("tool", {"value": "a" * 30 + "b"}, "srv", policy)
+    assert decision.blocked
+    assert decision.rule == "allow_pattern_undetermined"
+
+
+async def test_allow_pattern_re2_rejected_pattern_evaluates_via_forkserver():
+    """#121 acceptance: a pattern re2 rejects still evaluates via the forkserver path —
+    here determinately MATCHING (proving the fallback completes and returns a real
+    outcome for the allow side, not just for the deny side it was built for)."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(allow_patterns=[r"^(ab)\1$"])}},
+    )
+    # re2 rejects the backreference -> re.Pattern -> forkserver path -> MATCHED -> permitted.
+    permitted = await evaluate("tool", {"value": "abab"}, "srv", policy)
+    assert not permitted.blocked
+
+    # Same engine path, determinate NOT_MATCHED -> blocked as a plain allow_pattern miss.
+    miss = await evaluate("tool", {"value": "abax"}, "srv", policy)
+    assert miss.blocked
+    assert miss.rule == "allow_pattern"
+
+
+async def test_allow_match_on_one_pattern_permits_despite_undetermined_on_another():
+    """#121 design decision, pinned: the allow list is a disjunction. An UNDETERMINED on a
+    DIFFERENT pattern in the same list cannot un-verify a determinate match, so the value
+    is permitted. (If NO pattern matches determinately, UNDETERMINED drives the block —
+    see test_allow_pattern_undetermined_blocks.) Reviewers who want the stricter
+    'any UNDETERMINED blocks outright' semantics: change _check_param, then this test."""
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"path": ParamRule(
+            allow_patterns=[r"^(a*)*\1$", r"^/safe/"],
+        )}},
+    )
+    # The arg key MUST match the param rule's key ("path"). Keyed on anything else, evaluate()
+    # takes the `param_name not in arguments` skip in argus/policy.py and this test passes
+    # without ever consulting the allow-list — i.e. vacuously (review 2026-09-06).
+    decision = await evaluate("tool", {"path": "/safe/file.txt"}, "srv", policy)
+    assert not decision.blocked
+
+    # Guard against exactly that regression: the SAME policy must still BLOCK a value that
+    # matches neither pattern. If the rule ever stops being consulted, this assertion fails
+    # even though the one above would keep passing.
+    miss = await evaluate("tool", {"path": "/unsafe/file.txt"}, "srv", policy)
+    assert miss.blocked
+
+
+async def test_allow_pattern_does_not_fire_when_param_is_omitted():
+    """#121 boundary, pinned deliberately (review 2026-09-06): a param rule only runs when the
+    parameter is PRESENT — argus/policy.py's `param_name not in arguments: continue`. So an
+    allow-list constrains the value that was SENT; it does not make the parameter mandatory.
+
+    This is correct for block_patterns (an absent value cannot match something forbidden) but
+    is a real limit on allow_patterns as a blast-radius control: a caller can sidestep the
+    limit by omitting the parameter and letting the tool apply its own server-side default.
+    Documented in docs/policy-cookbook.md under "An omitted parameter is not constrained."
+
+    Asserted rather than left implicit so that if `required`-style semantics are ever added
+    (issue #131, under epic #119), this test FAILS and forces the docs to be updated with it.
+    """
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"write": {"path": ParamRule(
+            allow_patterns=[r"^/home/lowcoordination/k3s/manifests/"],
+        )}},
+    )
+    # A present value outside the prefix is blocked...
+    assert (await evaluate("write", {"path": "/etc/shadow"}, "srv", policy)).blocked
+    # ...but omitting `path` entirely is NOT blocked: the rule never runs.
+    omitted = await evaluate("write", {}, "srv", policy)
+    assert not omitted.blocked
+    # Another param present, the constrained one still absent — same outcome.
+    assert not (await evaluate("write", {"content": "x"}, "srv", policy)).blocked
+
+
+async def test_allow_pattern_matches_case_insensitively():
+    """#121 boundary, pinned deliberately (review 2026-09-06): operator patterns compile
+    case-insensitive (db/models.py's compile_pattern). For a BLOCKLIST that is conservative;
+    for an ALLOW-list it is permissive — the allow-list admits more than it appears to, since
+    on a case-sensitive filesystem /HOME/... is a different path than /home/....
+
+    Pinned so the looseness is a visible, asserted property rather than a surprise. If the
+    case-sensitivity of operator patterns is ever revisited, this test surfaces the blast
+    radius on the allow side. Documented in docs/policy-cookbook.md.
+    """
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"write": {"path": ParamRule(
+            allow_patterns=[r"^/home/lowcoordination/k3s/manifests/"],
+        )}},
+    )
+    upper = await evaluate("write", {"path": "/HOME/LOWCOORDINATION/K3S/MANIFESTS/a.yaml"}, "srv", policy)
+    assert not upper.blocked, "allow patterns are case-insensitive — see the cookbook caveat"
+
+
+async def test_allow_pattern_timeout_logs_as_allow_not_block(caplog):
+    """#121 operability (review 2026-09-06): an UNDETERMINED on an ALLOW pattern must name the
+    allow field in the operator-facing warning. _run_worker_with_timeout's log_label exists to
+    distinguish callers, but _match_with_timeout hard-coded 'block_pattern match' for every
+    caller — so a slow allow pattern told the operator to go rewrite a block_pattern that does
+    not exist. Pinned so the label can't silently regress to the block-side default."""
+    import logging
+
+    policy = ServerPolicy(
+        mode="passthrough",
+        param_rules={"tool": {"value": ParamRule(allow_patterns=[r"^(a*)*\1$"])}},
+    )
+    with caplog.at_level(logging.WARNING, logger="argus.policy"):
+        decision = await evaluate("tool", {"value": "a" * 30 + "b"}, "srv", policy)
+
+    assert decision.blocked
+    assert decision.rule == "allow_pattern_undetermined"
+    timeout_logs = [r.getMessage() for r in caplog.records if "UNDETERMINED" in r.getMessage()]
+    assert timeout_logs, "expected a timeout warning naming the caller"
+    assert any("allow_pattern" in m for m in timeout_logs), timeout_logs
+    assert not any(m.startswith("block_pattern") for m in timeout_logs), timeout_logs
+
+
+async def test_empty_allow_patterns_is_byte_identical_to_absent():
+    """#121 acceptance: an empty allow_patterns list is byte-identical to today's behaviour —
+    for the same inputs, a rule with allow_patterns=[] must produce the exact same Decision
+    (all fields) as a rule without the field, and must never act as 'allow nothing'."""
+    plain = ServerPolicy(mode="passthrough", param_rules={"tool": {
+        "value": ParamRule(block_patterns=["sudo"], max_length=10),
+    }})
+    with_empty_allow = ServerPolicy(mode="passthrough", param_rules={"tool": {
+        "value": ParamRule(block_patterns=["sudo"], max_length=10, allow_patterns=[]),
+    }})
+
+    for args in ({"value": "ls -la"}, {"value": "sudo rm -rf /"}, {"value": "a" * 20}):
+        before = await evaluate("tool", args, "srv", plain)
+        after = await evaluate("tool", args, "srv", with_empty_allow)
+        assert before == after, f"decision diverged for {args!r}: {before} vs {after}"
+    # And an arbitrary pass-through value is NOT blocked by the empty allow-list — an empty
+    # allow_patterns must never read as "allow nothing".
+    assert not (await evaluate("tool", {"value": "ls -la"}, "srv", with_empty_allow)).blocked
+
+
 async def test_missing_param_not_checked():
     policy = ServerPolicy(
         mode="passthrough",

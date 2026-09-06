@@ -67,6 +67,9 @@ async def test_parity_with_full_policy(server_repo):
             "tool_a": {
                 "query": ParamRule(max_length=50, block_patterns=["(a+)+$", r"\b\d{4}\b"]),
                 "limit": ParamRule(min_value=0, max_value=100),
+                # #121: the allow-semantics field must round-trip through the same
+                # decode path the enforcement read uses — see the assertion below.
+                "path": ParamRule(allow_patterns=["^/home/lowcoordination/k3s/manifests/"]),
             },
             "tool_b": {"secret": ParamRule(denied=True)},
         },
@@ -86,6 +89,9 @@ async def test_parity_with_full_policy(server_repo):
     assert loaded.denied == ["tool_c"]
     assert loaded.param_rules["tool_a"]["query"].block_patterns == ["(a+)+$", r"\b\d{4}\b"]
     assert loaded.param_rules["tool_a"]["limit"].max_value == 100
+    assert loaded.param_rules["tool_a"]["path"].allow_patterns == [
+        "^/home/lowcoordination/k3s/manifests/"
+    ]
     assert loaded.param_rules["tool_b"]["secret"].denied is True
     assert loaded.dlp_detectors == {"credit_card": "block", "email": "redact"}
     assert [p.name for p in loaded.dlp_custom_patterns] == ["aws-key"]

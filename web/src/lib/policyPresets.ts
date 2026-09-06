@@ -20,6 +20,7 @@ function paramRule(overrides: Partial<ParamRule>): ParamRule {
   return {
     max_length: null,
     block_patterns: [],
+    allow_patterns: [],
     max_value: null,
     min_value: null,
     denied: false,

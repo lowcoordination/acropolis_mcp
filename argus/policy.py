@@ -264,7 +264,9 @@ async def _run_worker_with_timeout(worker_fn, compiled, value: str, log_label: s
             result_queue.close()
 
 
-async def _match_with_timeout(compiled, value: str) -> MatchOutcome:
+async def _match_with_timeout(
+    compiled, value: str, log_label: str = "block_pattern match"
+) -> MatchOutcome:
     """Runs compiled.search(value) with a hard wall-clock timeout, unless the pattern is an
     re2 pattern (#112).
 
@@ -286,11 +288,17 @@ async def _match_with_timeout(compiled, value: str) -> MatchOutcome:
     cannot do. Returns MatchOutcome.UNDETERMINED on timeout (either kind) or infra failure;
     the caller (_check_param) decides what that means for the block/allow decision, so an
     undetermined result is never silently folded into "did not match".
+
+    log_label names the CALLER in the timeout/infra warnings emitted by
+    _run_worker_with_timeout (which exists precisely to distinguish them). It defaults to the
+    block-pattern caller; #121's allow-pattern loop passes its own, so an operator reading
+    "rewrite this pattern" is pointed at the field the pattern actually lives in rather than
+    being told to go fix a block_pattern that isn't there.
     """
     if is_re2_pattern(compiled):
         return MatchOutcome.MATCHED if compiled.search(value) else MatchOutcome.NOT_MATCHED
 
-    matched, _ = await _run_worker_with_timeout(_regex_worker, compiled, value, "block_pattern match")
+    matched, _ = await _run_worker_with_timeout(_regex_worker, compiled, value, log_label)
     if matched is None:
         return MatchOutcome.UNDETERMINED
     return MatchOutcome.MATCHED if matched else MatchOutcome.NOT_MATCHED
@@ -450,6 +458,41 @@ async def _check_param(name: str, value: Any, rule: ParamRule) -> Optional[tuple
             # against" — visible and loud rather than a silent bypass. See
             # docs/policy-cookbook.md for the operator-facing explanation of this trade-off.
             return ("block_pattern_undetermined", compiled.pattern)
+
+    # #121 allow_patterns — allow-SEMANTICS for blast-radius limits (e.g. confining a write
+    # tool's `path` to a set of directory prefixes). When the operator configured any, the
+    # value must match AT LEAST ONE or the call is blocked. The ordering against the block
+    # loop above IS the documented semantics, not an accident:
+    #
+    #   * DENY WINS — block_patterns run first, so a value matching both an allow and a
+    #     block pattern is blocked. An operator's block_patterns express what must NEVER
+    #     match, and an allow-list elsewhere in the same rule cannot be read as permission
+    #     to bypass them. docs/policy-cookbook.md states this as the contract.
+    #   * Fail-closed on UNDETERMINED: for an allow-list, "I could not verify this is
+    #     permitted" must never mean permit. An UNDETERMINED match is treated as NOT
+    #     matched — and if NO pattern yields a determinate MATCHED, the value is blocked,
+    #     reported as 'allow_pattern_undetermined' when an undetermined outcome is why
+    #     permission could not be verified (mirroring block_pattern_undetermined).
+    #   * A determinate MATCHED on ANY pattern in the list satisfies "at least one" — the
+    #     list is a disjunction, and an UNDETERMINED on a DIFFERENT pattern in the same
+    #     list cannot un-verify a match we did prove. Only when nothing matched
+    #     determinately does an UNDETERMINED outcome drive the block.
+    if rule.allow_patterns:
+        matched = False
+        undetermined = None
+        for compiled in rule.compiled_allow_patterns():
+            outcome = await _match_with_timeout(compiled, s, "allow_pattern match")
+            if outcome is MatchOutcome.MATCHED:
+                matched = True
+                break
+            if outcome is MatchOutcome.UNDETERMINED:
+                # Keep going: another pattern may still match determinately, which would
+                # satisfy the allow-list outright. Remember this one in case none do.
+                undetermined = compiled
+        if not matched:
+            if undetermined is not None:
+                return ("allow_pattern_undetermined", undetermined.pattern)
+            return ("allow_pattern", f"no allow pattern matched (allowed: {', '.join(rule.allow_patterns)})")
 
     if rule.max_value is not None:
         try:

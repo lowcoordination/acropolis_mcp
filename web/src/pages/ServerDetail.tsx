@@ -187,7 +187,7 @@ function ParamRuleEditor({
 
   function addParam() {
     if (!paramName.trim()) return
-    onChange({ ...rules, [paramName.trim()]: { block_patterns: [], denied: false } })
+    onChange({ ...rules, [paramName.trim()]: { block_patterns: [], allow_patterns: [], denied: false } })
     setParamName('')
   }
 
@@ -242,6 +242,19 @@ function ParamRuleEditor({
                 onChange={(e) =>
                   updateRule(name, {
                     block_patterns: e.target.value.split('\n').filter((p) => p.trim()),
+                  })
+                }
+              />
+              <label className="flex items-center gap-1.5">
+                Allow patterns (regex, one per line — value must match at least one; deny wins)
+              </label>
+              <textarea
+                className="w-full rounded px-1.5 py-1 text-xs font-mono"
+                rows={2}
+                value={(rule.allow_patterns ?? []).join('\n')}
+                onChange={(e) =>
+                  updateRule(name, {
+                    allow_patterns: e.target.value.split('\n').filter((p) => p.trim()),
                   })
                 }
               />
