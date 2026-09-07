@@ -521,3 +521,119 @@ class TestSecretHandling:
         rows = await _audit_rows(db)
         assert len(rows) == 1
         assert "hunter2" not in rows[0]["args_summary"]
+
+
+class TestAuditOriginClassFilter:
+    """#123: GET /api/v1/audit?origin_class=... — the API surface for "gateway vs local".
+
+    Before this, `include_test` was the only origin control and had exactly two reachable states
+    (all rows, or NULL-origin rows), so "only local evaluations" was unexpressible over HTTP.
+    """
+
+    async def test_local_returns_only_evaluations(self, eval_app):
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client)
+        await _evaluate(transport, key, arguments={"command": "ls"})
+        await asyncio.sleep(0.3)
+
+        resp = await admin_client.get("/api/v1/audit", params={"origin_class": "local"})
+        assert resp.status_code == 200
+        rows = resp.json()
+        assert rows, "expected the evaluation row"
+        assert all(r["origin"].startswith("local:") for r in rows)
+
+    async def test_gateway_excludes_evaluations(self, eval_app):
+        """Positive control for the filter above: the same rows must be ABSENT from the gateway
+        view, so a passing 'local' assertion cannot be an artefact of returning everything."""
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client)
+        await _evaluate(transport, key, arguments={"command": "ls"})
+        await asyncio.sleep(0.3)
+
+        resp = await admin_client.get("/api/v1/audit", params={"origin_class": "gateway"})
+        assert resp.status_code == 200
+        assert all(r["origin"] is None for r in resp.json())
+
+    async def test_unknown_class_is_rejected_not_silently_empty(self, eval_app):
+        """A typo must not read as 'no such traffic'."""
+        _, admin_client, _, _, _ = eval_app
+        resp = await admin_client.get("/api/v1/audit", params={"origin_class": "lcoal"})
+        assert resp.status_code == 400
+
+    async def test_include_test_still_works(self, eval_app):
+        """Back-compat: the older param keeps its behaviour (all rows, including non-NULL
+        origins) so bookmarked CSV export URLs do not break."""
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client)
+        await _evaluate(transport, key, arguments={"command": "ls"})
+        await asyncio.sleep(0.3)
+
+        default = await admin_client.get("/api/v1/audit")
+        assert all(r["origin"] is None for r in default.json())
+
+        widened = await admin_client.get("/api/v1/audit", params={"include_test": "true"})
+        assert any(r["origin"] is not None for r in widened.json())
+
+    async def test_csv_export_accepts_origin_class(self, eval_app):
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client, name="csvkey")
+        await _evaluate(transport, key, arguments={"command": "ls"})
+        await asyncio.sleep(0.3)
+
+        resp = await admin_client.get(
+            "/api/v1/audit/export.csv", params={"origin_class": "local"}
+        )
+        assert resp.status_code == 200
+        assert "local:csvkey" in resp.text
+
+    async def test_csv_export_rejects_unknown_class_before_streaming(self, eval_app):
+        """The 400 must arrive as a status code, not as a truncated 200 body — validation
+        happens before the streaming response begins."""
+        _, admin_client, _, _, _ = eval_app
+        resp = await admin_client.get(
+            "/api/v1/audit/export.csv", params={"origin_class": "nope"}
+        )
+        assert resp.status_code == 400
+
+
+class TestMetricsOriginBreakdown:
+    """#123: /metrics separates "blocked locally" from "blocked at the gateway"."""
+
+    async def test_local_evaluations_appear_under_the_local_origin_class(self, eval_app):
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client)
+        await _evaluate(transport, key, arguments={"command": "rm -rf /"})
+        await asyncio.sleep(0.3)
+
+        body = (await admin_client.get("/metrics")).text
+        assert 'acropolis_audit_events_total{decision="BLOCKED",origin="local"} 1' in body
+
+    async def test_all_three_classes_are_always_emitted(self, eval_app):
+        """A class must not vanish from the breakdown just because it is idle — a missing series
+        and a zero mean different things to an alert rule."""
+        _, admin_client, _, _, _ = eval_app
+        body = (await admin_client.get("/metrics")).text
+        for origin_class in ("gateway", "local", "test"):
+            assert f'origin="{origin_class}"' in body
+
+    async def test_the_detail_half_never_becomes_a_label(self, eval_app):
+        """The cardinality guarantee: a key name and a caller-asserted hostname must never reach
+        a Prometheus label, or a fleet of ephemeral hosts (or an attacker) could blow up the
+        scrape target's series count."""
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client, name="distinctive-key-name")
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as c:
+            await c.post(EVALUATE, json={
+                "server": slug, "tool_name": "bash", "arguments": {"command": "ls"},
+                "harness": "pi", "host": "distinctive-hostname",
+            }, headers={"Authorization": f"Bearer {key}"})
+        await asyncio.sleep(0.3)
+
+        body = (await admin_client.get("/metrics")).text
+        # The row exists in the audit log with full detail...
+        rows = await _audit_rows(db)
+        assert rows[0]["origin"] == "local:distinctive-key-name/pi@distinctive-hostname"
+        # ...but /metrics carries only the class.
+        assert "distinctive-key-name" not in body
+        assert "distinctive-hostname" not in body
+        assert 'origin="local"' in body

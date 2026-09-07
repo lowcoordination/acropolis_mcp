@@ -206,7 +206,7 @@ async def test_split_audit_store_end_to_end_pipeline(postgres_admin_dsn, tmp_pat
 
                     metrics = await client.get("/metrics")
                     assert metrics.status_code == 200
-                    assert 'acropolis_audit_events_total{decision="ALLOWED"}' in metrics.text
+                    assert 'acropolis_audit_events_total{decision="ALLOWED",origin="gateway"}' in metrics.text
 
         # After lifespan teardown (AuditLogger's _on_stop drains its queue), the rows are
         # guaranteed flushed — into the audit database, never the config database.
