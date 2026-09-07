@@ -54,22 +54,21 @@ from archon.schemas import PolicyEvaluateRequest, PolicyEvaluateResponse
 from archon.settings import Settings
 from argus.audit import AuditLogger
 from argus.metering import Metering
+from argus.origin import local_origin
 from argus.policy import evaluate
 from db.models import ApiKeyRecord
 from db.repo import ServerNotFoundError, ServerRepo
 
 logger = logging.getLogger(__name__)
 
-# The audit `origin` for a local evaluation. Non-NULL, so AuditRepo.count_since's hardcoded
-# `origin IS NULL` filter excludes these rows from /stats automatically — an evaluation is not
-# traffic and must not move the dashboard's allowed/blocked counters, the same reasoning
-# 0004_audit_origin.sql gives for origin='test'.
+# The audit `origin` for a local evaluation is built per-request by argus/origin.py's
+# local_origin() — `local:<key-name>` plus an optional caller-asserted `/<harness>@<host>`. See
+# that module for the format and the trust boundary (the derived key name always comes first).
 #
-# #123 will replace this with a structured scheme carrying harness and host ("which machine,
-# which agent"). It is a single constant, and there is deliberately no CHECK constraint on the
-# column, so that issue has exactly one place to change. Origin values are NOT a stable API
-# contract.
-EVALUATION_ORIGIN = "local-eval"
+# Every such value is non-NULL, so AuditRepo.count_since's hardcoded `origin IS NULL` filter
+# excludes these rows from /stats automatically — an evaluation is not traffic and must not move
+# the dashboard's allowed/blocked counters, the same reasoning 0004_audit_origin.sql gives for
+# origin='test'.
 
 # The audit `endpoint` for this surface — a third value beside the data plane's "per-server"
 # and "aggregate". Plain TEXT, no constraint, no migration needed.
@@ -186,7 +185,8 @@ def build_policy_evaluation_router(
             rpc_method=EVALUATION_RPC_METHOD,
             api_key_id=key_record.id,
             client_ip=client_ip,
-            origin=EVALUATION_ORIGIN,
+            # Derived key name first, caller assertion (if any) second — see argus/origin.py.
+            origin=local_origin(key_record.name, body.harness, body.host),
             tool=body.tool_name,
         )
 

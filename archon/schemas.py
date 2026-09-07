@@ -244,10 +244,18 @@ class ToolTestResponse(BaseModel):
 class PolicyEvaluateRequest(BaseModel):
     """A proposed tool call to evaluate against a server's policy, WITHOUT executing it (#122).
 
-    Deliberately carries no origin/harness/host field. #123 will decide whether that metadata is
-    caller-asserted (and therefore untrusted, needing its own validation before it may reach an
-    audit row) or derived; shipping a half-designed field now would create a compatibility
-    obligation for a design that has not happened yet.
+    `harness`/`host` (#123) are the CALLER'S ASSERTION about where the evaluation came from —
+    the gateway is HTTP-remote from the agent harness and cannot observe either. They are
+    therefore untrusted input, and the audit row always pairs them with a derived prefix (the
+    API key's name) that the caller cannot influence. See argus/origin.py for the full trust
+    boundary.
+
+    The constraints below ARE that validation, and they are a security boundary rather than
+    tidiness: the charset allowlists exclude ':', '/', '@', whitespace and newlines, so an
+    assertion cannot forge extra structure in the origin string, break class parsing, or inject
+    a newline into the Prometheus exposition format. Rejecting (422) rather than sanitizing is
+    deliberate — a fleet misconfigured to send junk should fail loudly at the adapter author,
+    not have its identity silently rewritten into something that looks plausible in an audit log.
     """
 
     server: str
@@ -256,6 +264,12 @@ class PolicyEvaluateRequest(BaseModel):
     # expensive to hash. 256 is far above any legitimate MCP tool name.
     tool_name: str = Field(max_length=256)
     arguments: dict = {}
+    # Lowercase — a harness is a program name ("pi", "claude-code"), and normalizing the case
+    # space keeps the audit filter from splitting one harness across "Pi" and "pi".
+    harness: Optional[str] = Field(default=None, max_length=32, pattern=r"^[a-z0-9][a-z0-9._-]*$")
+    # Hostname charset per RFC 1123, case preserved: hostnames are case-insensitive but operators
+    # recognize their own machines by the casing they chose.
+    host: Optional[str] = Field(default=None, max_length=64, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9.-]*$")
 
 
 class PolicyEvaluateResponse(BaseModel):

@@ -21,8 +21,9 @@ import json
 import httpx
 import pytest
 
+from argus.origin import CLASS_LOCAL, origin_class
 from db.models import ParamRule, ServerPolicy
-from db.repo import AuditRepo, ServerRepo
+from db.repo import _UNSET, AuditRepo, ServerRepo
 
 from .fastmcp_fixture import run_fastmcp_server
 
@@ -71,15 +72,23 @@ async def _evaluate(transport, key, slug="e", tool="bash", arguments=None, heade
         return await c.post(EVALUATE, json=body, headers={**hdrs, **(headers or {})})
 
 
-async def _audit_rows(db, origin="local-eval"):
+async def _audit_rows(db, origin=None):
     """Reads the evaluation audit rows, after letting AuditLogger's batching loop flush.
 
     AuditLogger.log enqueues and returns; the insert happens on a background loop every
     FLUSH_INTERVAL_SECONDS (0.1). Same 0.3s settle other integration suites use — see
     test_quotas.py.
+
+    Filters by origin CLASS ("local"), not by an exact value: since #123 the origin carries the
+    minting key's name (`local:<key-name>`), so a fixed exact-match string would silently return
+    zero rows for any test that mints a differently-named key — a vacuously passing assertion.
+    Pass `origin=` to assert on one exact value.
     """
     await asyncio.sleep(0.3)
-    return await AuditRepo(db).query(origin=origin)
+    rows = await AuditRepo(db).query(origin=_UNSET)
+    if origin is not None:
+        return [r for r in rows if r["origin"] == origin]
+    return [r for r in rows if origin_class(r["origin"]) == CLASS_LOCAL]
 
 
 class TestAuthentication:
@@ -273,6 +282,70 @@ class TestDecision:
         resp = await _evaluate(transport, narrow, slug=slug, arguments={"command": "ls"})
         assert resp.status_code == 403, resp.text
 
+    async def test_origin_carries_the_derived_key_name(self, eval_app):
+        """#123: the audit row identifies WHICH credential asked, without the caller saying so."""
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client, name="fleet-guard")
+        await _evaluate(transport, key, arguments={"command": "ls"})
+
+        rows = await _audit_rows(db)
+        assert len(rows) == 1
+        assert rows[0]["origin"] == "local:fleet-guard"
+
+    async def test_origin_carries_a_validated_caller_assertion(self, eval_app):
+        """The derived key name leads; the caller's harness/host follows it."""
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client, name="fleet-guard")
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as c:
+            resp = await c.post(EVALUATE, json={
+                "server": slug, "tool_name": "bash", "arguments": {"command": "ls"},
+                "harness": "pi", "host": "laptop-01",
+            }, headers={"Authorization": f"Bearer {key}"})
+        assert resp.status_code == 200, resp.text
+
+        rows = await _audit_rows(db)
+        assert rows[0]["origin"] == "local:fleet-guard/pi@laptop-01"
+
+    async def test_a_forged_assertion_cannot_displace_the_derived_name(self, eval_app):
+        """The trust boundary: whatever the caller asserts, the key's real name still leads, so
+        a reader can always tell which credential was actually presented."""
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client, name="real-key")
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as c:
+            await c.post(EVALUATE, json={
+                "server": slug, "tool_name": "bash", "arguments": {"command": "ls"},
+                "harness": "pi", "host": "someone-elses-box",
+            }, headers={"Authorization": f"Bearer {key}"})
+
+        rows = await _audit_rows(db)
+        assert rows[0]["origin"].startswith("local:real-key/")
+
+    @pytest.mark.parametrize("field,value", [
+        ("harness", "pi@evil"),        # '@' would forge the host separator
+        ("harness", "pi/evil"),        # '/' would forge the assertion separator
+        ("harness", "pi:evil"),        # ':' would forge a class boundary
+        ("harness", "pi\nevil"),      # newline would corrupt Prometheus exposition
+        ("harness", "PI"),             # case is normalized by rejection, not rewriting
+        ("harness", "-leading"),       # must start alphanumeric
+        ("harness", "x" * 33),         # over the length bound
+        ("host", "box\nname"),
+        ("host", "box@name"),
+        ("host", "x" * 65),
+    ])
+    async def test_malformed_assertion_is_rejected_not_sanitized(self, eval_app, field, value):
+        """422, not a silently rewritten value: a fleet sending junk should fail loudly at the
+        adapter author rather than have its identity quietly reshaped in the audit log."""
+        db, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client)
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as c:
+            resp = await c.post(EVALUATE, json={
+                "server": slug, "tool_name": "bash", "arguments": {"command": "ls"},
+                field: value,
+            }, headers={"Authorization": f"Bearer {key}"})
+        assert resp.status_code == 422, f"{field}={value!r} should be rejected"
+        # And nothing was evaluated or recorded.
+        assert await _audit_rows(db) == []
+
     async def test_unknown_server_404s(self, eval_app):
         _, admin_client, transport, _, _ = eval_app
         key = await _mint_key(admin_client)
@@ -303,7 +376,8 @@ class TestAuditing:
         assert decisions == ["ALLOWED", "BLOCKED"]
         for row in rows:
             assert row["endpoint"] == "policy-evaluate"
-            assert row["origin"] == "local-eval"
+            # `local:<key-name>` — derived from the key, no caller assertion sent here.
+            assert row["origin"] == "local:guard"
             assert row["tool"] == "bash"
             assert row["api_key_id"] is not None
             assert row["status_code"] == 200
