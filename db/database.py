@@ -16,7 +16,7 @@ logger = logging.getLogger("db.database")
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
-# ONE forward-only migration sequence for ONE database, numbered 0001..0013 with no gaps or
+# ONE forward-only migration sequence for ONE database, numbered 0001..0014 with no gaps or
 # duplicates — see 0001_init.sql's header for the full one-database decision.
 MIGRATIONS = [
     "0001_init.sql",
@@ -32,6 +32,7 @@ MIGRATIONS = [
     "0011_proposals.sql",
     "0012_proposals_project_scope.sql",
     "0013_param_rule_allow_patterns.sql",
+    "0014_audit_origin_index.sql",
 ]
 
 # Issue #108: when the audit log is pointed at its own database (Database(audit_dsn=...)), it

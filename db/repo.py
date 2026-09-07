@@ -27,6 +27,10 @@ logger = logging.getLogger("db.repo")
 
 _UNSET = object()  # sentinel: distinguishes "argument omitted" from "argument is None"
 
+# The origin class naming NULL — see argus/origin.py for the vocabulary and why NULL and
+# "gateway" are the same thing under two names (storage vs API/label).
+_CLASS_GATEWAY = "gateway"
+
 
 # ─── gateway_write_lock conversion ───────────────────────────────────────────────────────────
 #
@@ -855,6 +859,7 @@ class AuditRepo(_PoolAccess):
         api_key_id: Optional[int] = None, after: Optional[str] = None,
         before: Optional[str] = None, search: Optional[str] = None,
         origin: object = _UNSET, server_slug_in: Optional[list[str]] = None,
+        origin_class: Optional[str] = None,
     ) -> list[dict]:
         """Newest-first. `before_id` is keyset pagination — pass the smallest `id` from the
         previous page to fetch the next (older) page, rather than an OFFSET (which re-scans
@@ -868,6 +873,13 @@ class AuditRepo(_PoolAccess):
         because `None` is a meaningful value here — "give me only normal traffic" — distinct from
         "don't filter on origin at all" (the default, returning both normal and 'test' rows).
         A plain `Optional[str] = None` couldn't express the first case.
+
+        `origin_class` (#123) filters by the origin's leading segment instead of its full value —
+        "every local evaluation" regardless of which key, harness or host produced it. Since the
+        detail half carries a key name and a caller-asserted hostname, exact-match is unusable for
+        that question: a UI filter would have to enumerate every host that has ever called. The
+        two origin filters compose, but callers normally use one or the other. "gateway" is the
+        name for the NULL origin (see argus/origin.py) and maps to `origin IS NULL`.
 
         `server_slug_in` (enterprise #4): project-scoped callers (archon/api.py's GET /audit etc.)
         resolve their project's server slugs via ServerRepo.list(project_id=...) first, then pass
@@ -918,6 +930,19 @@ class AuditRepo(_PoolAccess):
                 w.is_null("origin")
             else:
                 w.eq("origin", origin)
+        if origin_class is not None:
+            if origin_class == _CLASS_GATEWAY:
+                w.is_null("origin")
+            else:
+                # `origin = $n OR origin LIKE $n || ':%'` — matches both a bare class token
+                # (the legacy 'test' value, which predates the class:detail scheme) and any
+                # class:detail value. The prefix is bound as a parameter and the class itself is
+                # validated against a fixed vocabulary at the API boundary, so there is no LIKE
+                # metacharacter injection here.
+                w.raw(
+                    f"(origin = {w.bind(origin_class)} "
+                    f"OR origin LIKE {w.bind(origin_class + ':%')})"
+                )
         limit_ph = w.bind(limit)
         async with self._read() as conn:
             rows = await conn.fetch(
@@ -943,6 +968,48 @@ class AuditRepo(_PoolAccess):
                 f"SELECT COUNT(*) FROM audit_events {w.where_sql()}", *w.params
             )
         return count or 0
+
+    async def count_by_origin_class_since(self, since_iso: str) -> dict[str, dict[str, int]]:
+        """Audit-event counts since `since_iso`, grouped as {origin_class: {decision: count}}.
+
+        Backs /metrics' by-origin breakdown (#123). A single GROUP BY rather than a
+        count_since() per (origin, decision) pair, deliberately: /metrics holds no cache and
+        issues its audit reads live on every scrape (every 15-30s), so a cross-product of
+        point queries would multiply that load by the number of origin classes. Grouping also
+        subsumes the separate "total" query the synthesized OTHER series needed.
+
+        Returns the CLASS, not the full origin: the detail half carries a key name and a
+        caller-asserted hostname, and putting those in a Prometheus label would create unbounded
+        time series. Classing happens in SQL (split on the first ':') so the grouping is done by
+        the database rather than by fetching every distinct origin into Python.
+
+        Deliberately NOT a parameter on count_since: that method's `origin IS NULL` is
+        load-bearing for /stats and its four existing callers, all of which mean "real traffic
+        only". Adding a mode to it would put a filter that must never change for those callers
+        one keyword argument away from changing.
+        """
+        async with self._read() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    CASE
+                        WHEN origin IS NULL THEN 'gateway'
+                        WHEN position(':' in origin) > 0
+                            THEN split_part(origin, ':', 1)
+                        ELSE origin
+                    END AS origin_class,
+                    decision,
+                    COUNT(*) AS n
+                FROM audit_events
+                WHERE ts >= $1
+                GROUP BY 1, 2
+                """,
+                since_iso,
+            )
+        out: dict[str, dict[str, int]] = {}
+        for row in rows:
+            out.setdefault(row["origin_class"], {})[row["decision"]] = row["n"]
+        return out
 
     async def prune_older_than(self, cutoff_iso: str, batch_size: int = 5000) -> int:
         # Batching a potentially huge DELETE is kept deliberately: one giant DELETE holds a
