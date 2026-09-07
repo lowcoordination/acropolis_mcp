@@ -616,6 +616,19 @@ class TestMetricsOriginBreakdown:
         for origin_class in ("gateway", "local", "test"):
             assert f'origin="{origin_class}"' in body
 
+    async def test_other_absorbs_decisions_not_named_explicitly(self, eval_app):
+        """The OTHER series is derived by subtraction per class, so a decision the exposition
+        does not name explicitly — PASSTHROUGH, the data plane's most common — must land there
+        rather than vanishing from the totals."""
+        db, admin_client, transport, slug, _ = eval_app
+        await AuditRepo(db).insert_many([{
+            "ts": "2099-01-01T00:00:00.000Z", "server_slug": slug,
+            "decision": "PASSTHROUGH", "origin": None, "bridged": False,
+        }])
+
+        body = (await admin_client.get("/metrics")).text
+        assert 'acropolis_audit_events_total{decision="OTHER",origin="gateway"} 1' in body
+
     async def test_the_detail_half_never_becomes_a_label(self, eval_app):
         """The cardinality guarantee: a key name and a caller-asserted hostname must never reach
         a Prometheus label, or a fleet of ephemeral hosts (or an attacker) could blow up the

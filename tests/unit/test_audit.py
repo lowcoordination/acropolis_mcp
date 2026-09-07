@@ -312,3 +312,18 @@ async def test_count_by_origin_class_respects_the_since_bound(db):
     since = _iso(datetime.now(timezone.utc) - timedelta(days=1))
     counts = await repo.count_by_origin_class_since(since)
     assert counts == {"gateway": {"BLOCKED": 1}}
+
+
+async def test_count_by_origin_class_counts_every_decision_including_passthrough(db):
+    """PASSTHROUGH is a legal decision (0001_init's CHECK) and the most common one on the data
+    plane, but /metrics only names ALLOWED/BLOCKED/ERROR explicitly and derives OTHER by
+    subtraction. If the grouped read dropped or mis-bucketed a decision, OTHER would silently
+    absorb the error — so pin that every decision is returned, per class."""
+    repo = AuditRepo(db)
+    await _seed(repo, origin=None, decision="PASSTHROUGH")
+    await _seed(repo, origin=None, decision="ALLOWED")
+    await _seed(repo, origin="local:guard", decision="PASSTHROUGH")
+
+    counts = await repo.count_by_origin_class_since("1970-01-01T00:00:00.000Z")
+    assert counts["gateway"] == {"PASSTHROUGH": 1, "ALLOWED": 1}
+    assert counts["local"] == {"PASSTHROUGH": 1}
