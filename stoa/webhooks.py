@@ -160,7 +160,16 @@ class WebhookDispatcher(BackgroundLoop):
         while True:
             try:
                 event = await self._queue.get()
-                if event.get("decision") == "BLOCKED" and event.get("origin") != "test":
+                # `origin is not None` — NOT `!= "test"`. Only real client traffic (origin
+                # NULL) represents a call the gateway actually refused for someone; every
+                # non-NULL origin is a different kind of row that must never page anyone.
+                # Issue #123: the old exact-match let origin='local-eval' through, so after
+                # #122 shipped, every blocked LOCAL EVALUATION fired an alert — a policy
+                # question ("would this be blocked?") paging on-call as though a real call had
+                # been refused, on every command a local guard checks. A NULL check is also
+                # closed by construction against origin classes added later, which an
+                # exact-match denylist never is.
+                if event.get("decision") == "BLOCKED" and event.get("origin") is None:
                     await self._handle_blocked(event)
             except asyncio.CancelledError:
                 raise

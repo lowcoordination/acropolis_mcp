@@ -6,6 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Response
 
+from argus.origin import ORIGIN_CLASSES
 from db.repo import AuditRepo, ServerRepo
 from stoa.gitops import ConfigSource
 
@@ -13,7 +14,15 @@ logger = logging.getLogger("argus.metrics")
 
 
 def _escape_label(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape a label VALUE per the Prometheus text exposition format.
+
+    Backslash, double-quote AND newline all require escaping — an unescaped newline terminates
+    the metric line early and corrupts every series after it in the same scrape, so a single bad
+    label value breaks the whole endpoint rather than one series. The newline case was missing
+    until #123; no current label can contain one (see the origin CLASS discipline below), but a
+    sanitizer that only half-works is worse than none, because the next label added will assume
+    it is safe."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def build_metrics_router(server_repo: ServerRepo, audit_repo: AuditRepo, config_source: Optional["ConfigSource"] = None) -> APIRouter:
@@ -44,12 +53,13 @@ def build_metrics_router(server_repo: ServerRepo, audit_repo: AuditRepo, config_
         # alert thresholds; a missing series is visibly missing. acropolis_audit_store_up makes
         # the outage directly alertable instead of inferred from a gap.
         audit_ok = True
-        total_24h = allowed_24h = blocked_24h = error_24h = 0
+        by_origin: dict[str, dict[str, int]] = {}
         try:
-            total_24h = await audit_repo.count_since(since)
-            allowed_24h = await audit_repo.count_since(since, decision="ALLOWED")
-            blocked_24h = await audit_repo.count_since(since, decision="BLOCKED")
-            error_24h = await audit_repo.count_since(since, decision="ERROR")
+            # ONE grouped read, not four-per-origin-class point queries: this handler caches
+            # nothing and runs on every 15-30s scrape, so a cross-product would multiply the
+            # audit-store load by the number of origin classes. It also subsumes the separate
+            # "total" query the OTHER series used to need.
+            by_origin = await audit_repo.count_by_origin_class_since(since)
         except Exception:  # noqa: BLE001 — a monitoring endpoint must never 500 on a store outage
             audit_ok = False
             logger.warning(
@@ -60,15 +70,31 @@ def build_metrics_router(server_repo: ServerRepo, audit_repo: AuditRepo, config_
 
         lines = []
         if audit_ok:
+            # The `origin` label carries the CLASS only — "gateway" (real traffic), "local" (a
+            # local execution evaluation) or "test" (Try-it). Never the full origin value: its
+            # detail half carries an API key name and a caller-asserted hostname, which as a
+            # Prometheus label is unbounded cardinality that a fleet of ephemeral hosts — or an
+            # attacker — could use to blow up the scrape target's series count. The full value
+            # stays queryable in the audit log and the Audit UI, where it costs nothing.
+            #
+            # Every class present in the window is emitted, so a class added later appears
+            # without a change here; the three known ones are emitted even at zero so a
+            # breakdown never silently loses a series when a class happens to be idle.
             lines += [
-                "# HELP acropolis_audit_events_total Audit events recorded in the last 24h, by decision.",
+                "# HELP acropolis_audit_events_total Audit events recorded in the last 24h, by decision and origin class.",
                 "# TYPE acropolis_audit_events_total counter",
-                f'acropolis_audit_events_total{{decision="ALLOWED"}} {allowed_24h}',
-                f'acropolis_audit_events_total{{decision="BLOCKED"}} {blocked_24h}',
-                f'acropolis_audit_events_total{{decision="ERROR"}} {error_24h}',
-                f'acropolis_audit_events_total{{decision="OTHER"}} {max(total_24h - allowed_24h - blocked_24h - error_24h, 0)}',
-                "",
             ]
+            for origin_class in sorted(set(ORIGIN_CLASSES) | set(by_origin)):
+                counts = by_origin.get(origin_class, {})
+                known = {d: counts.get(d, 0) for d in ("ALLOWED", "BLOCKED", "ERROR")}
+                other = max(sum(counts.values()) - sum(known.values()), 0)
+                label = _escape_label(origin_class)
+                for decision, value in (*known.items(), ("OTHER", other)):
+                    lines.append(
+                        f'acropolis_audit_events_total'
+                        f'{{decision="{decision}",origin="{label}"}} {value}'
+                    )
+            lines.append("")
         lines += [
             "# HELP acropolis_audit_store_up Whether the audit store was readable for this scrape (1 = up, 0 = down).",
             "# TYPE acropolis_audit_store_up gauge",

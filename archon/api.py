@@ -92,6 +92,7 @@ from archon.schemas import (
 )
 from argus.audit import AuditLogger
 from argus.generation import ClientGeneration
+from argus.origin import ORIGIN_CLASSES
 from argus.pipeline import Pipeline
 from argus.quotas import period_start
 from argus.rate_limiter import RateLimiterRegistry, server_key
@@ -1336,6 +1337,33 @@ def build_control_plane_router(
         # server being renamed or deleted, so there's nothing to join against), so project
         # scoping resolves the project's server slugs first and passes them as server_slug_in
         # (see AuditRepo.query's own docstring).
+        def _resolve_origin_filters(origin_class: Optional[str], include_test: bool) -> dict:
+            """Translate the two audit origin query params into AuditRepo.query kwargs (#123).
+
+            `origin_class` is the expressive one: "gateway" | "local" | "test", filtering on the
+            origin's leading segment so a caller can ask for "every local evaluation" without
+            enumerating the key names and hostnames that appear in the detail half.
+
+            `include_test` predates it and is kept working rather than removed — it is a public
+            query param, and the CSV export URL is the kind of thing people bookmark. It only
+            ever had two reachable states (all rows, or NULL-origin rows), and since #122 its
+            name has been misleading: it includes every non-NULL origin, local evaluations
+            included, not just Try-it calls. `origin_class` supersedes it and wins when both are
+            given.
+
+            Validates against the known vocabulary and 400s otherwise: an unknown class would
+            otherwise silently return zero rows, which reads as "no such traffic" rather than
+            "you asked the wrong question".
+            """
+            if origin_class is not None:
+                if origin_class not in ORIGIN_CLASSES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"unknown origin_class; expected one of {', '.join(ORIGIN_CLASSES)}",
+                    )
+                return {"origin": _UNSET, "origin_class": origin_class}
+            return {"origin": _UNSET if include_test else None, "origin_class": None}
+
         @router.get("/audit", response_model=list[AuditEventResponse], dependencies=[Depends(require_role("viewer"))])
         async def query_audit(
             server_slug: Optional[str] = None, decision: Optional[str] = None,
@@ -1343,6 +1371,7 @@ def build_control_plane_router(
             api_key_id: Optional[int] = None, after: Optional[str] = None,
             before: Optional[str] = None, search: Optional[str] = None,
             include_test: bool = False, project_id: Optional[int] = None,
+            origin_class: Optional[str] = None,
         ):
             # Feature #1 (tool tester): Try-it calls are tagged origin='test' and excluded from
             # the default history view, same as they're excluded from /stats — an operator
@@ -1355,7 +1384,8 @@ def build_control_plane_router(
                 server_slug=server_slug, decision=decision, tool=tool,
                 before_id=before_id, limit=min(limit, 500),
                 api_key_id=api_key_id, after=after, before=before, search=search,
-                origin=_UNSET if include_test else None, server_slug_in=server_slug_in,
+                server_slug_in=server_slug_in,
+                **_resolve_origin_filters(origin_class, include_test),
             )
             return [AuditEventResponse(**{**e, "bridged": bool(e["bridged"])}) for e in events]
 
@@ -1365,11 +1395,14 @@ def build_control_plane_router(
             tool: Optional[str] = None, api_key_id: Optional[int] = None,
             after: Optional[str] = None, before: Optional[str] = None,
             search: Optional[str] = None, include_test: bool = False,
-            project_id: Optional[int] = None,
+            project_id: Optional[int] = None, origin_class: Optional[str] = None,
         ):
             server_slug_in = None
             if project_id is not None:
                 server_slug_in = [s.slug for s in await server_repo.list(project_id=project_id)]
+            # Resolved (and validated) BEFORE the streaming response begins — raising inside
+            # rows() would surface as a truncated 200 body, not a 400.
+            origin_filters = _resolve_origin_filters(origin_class, include_test)
             columns = [
                 "id", "ts", "server_slug", "api_key_id", "client_ip", "endpoint", "rpc_method",
                 "tool", "decision", "rule", "matched", "reason", "args_summary", "bridged",
@@ -1399,7 +1432,8 @@ def build_control_plane_router(
                         server_slug=server_slug, decision=decision, tool=tool,
                         before_id=before_id, limit=500, api_key_id=api_key_id,
                         after=after, before=before, search=search,
-                        origin=_UNSET if include_test else None, server_slug_in=server_slug_in,
+                        server_slug_in=server_slug_in,
+                        **origin_filters,
                     )
                     if not events:
                         break

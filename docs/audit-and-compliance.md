@@ -22,16 +22,49 @@ recorded here. Two columns distinguish those rows:
 | Column | Gateway traffic | Local evaluation |
 |---|---|---|
 | `endpoint` | `per-server`, `aggregate` | `policy-evaluate` |
-| `origin` | `NULL` (real traffic), `test` (Try-it) | `local-eval` |
+| `origin` | `NULL` (real traffic), `test` (Try-it) | `local:…` |
 
-Because `origin` is non-NULL, evaluations are excluded from `/stats` automatically — the same
-mechanism that keeps Try-it calls from moving the dashboard. An evaluation is a question, not
-traffic. Retention treats these rows exactly like any other data-plane row (30 days by default,
-prunable), and rows predating the column render normally with `origin` NULL — no backfill needed.
+### The `origin` scheme
 
-> `origin` values are **not** a stable API contract. Issue #123 will replace `local-eval` with a
-> structured scheme carrying the harness and host ("which machine, which agent"). There is no
-> CHECK constraint on the column, and the current value lives in a single constant.
+`origin` is `<class>` or `<class>:<detail>` — the class is everything before the first colon:
+
+| Value | Meaning |
+|---|---|
+| `NULL` | real gateway traffic |
+| `test` | admin "Try it" tool tester |
+| `local:<key-name>` | a local evaluation |
+| `local:<key-name>/<harness>@<host>` | …with a caller-asserted harness and host |
+
+**The derived half comes first, and the caller cannot influence it.** `<key-name>` is the
+gateway's own record of which API key was presented. The `<harness>@<host>` suffix *is* asserted
+by the caller — the gateway is HTTP-remote from the agent harness and cannot observe either; it
+sees only a `client_ip`, which is already its own column. So a forged assertion always sits next
+to a derived prefix that contradicts it. That is what keeps "the record that proves enforcement
+wasn't silently lowered and raised back" honest for local rows: you can always tell which
+credential actually asked, whatever the caller claims about itself.
+
+Assertions are validated at the API boundary (422 on failure, never silently rewritten) with a
+charset that excludes `:`, `/`, `@`, whitespace and newlines, so they cannot forge extra
+structure.
+
+### Filtering
+
+`GET /api/v1/audit?origin_class=gateway|local|test` filters on the class, so "every local
+evaluation" doesn't require enumerating the key names and hostnames in the detail half. The same
+parameter works on `/audit/export.csv`, and the Audit page has a matching control. An unknown
+class is a `400`, not an empty result — a typo should not read as "no such traffic".
+
+The older `include_test=true` still works but is superseded: it has only two states (everything,
+or real traffic only) and its name is now misleading, since it widens to *every* non-NULL origin
+rather than only Try-it calls.
+
+Because `origin` is non-NULL for both, evaluations and Try-it calls are excluded from `/stats`
+automatically. An evaluation is a question, not traffic. Retention treats these rows exactly like
+any other data-plane row (30 days by default, prunable), and rows predating the column render
+normally with `origin` NULL — no backfill needed.
+
+> `origin` values are **not** a stable API contract, and there is no CHECK constraint on the
+> column. Treat the *class* as the stable part; the detail half may gain fields.
 
 **Known gap (#125):** `args_summary` redacts argument values by **key name**. A secret inline in a
 command string (`--from-literal=password=hunter2`) is truncated at 120 characters but **not**

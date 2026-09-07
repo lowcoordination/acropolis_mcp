@@ -1,0 +1,13 @@
+-- Issue #123: /metrics now breaks the audit-event counters down by origin CLASS, which means a
+-- `GROUP BY origin` over a 24h window on every Prometheus scrape (every 15-30s).
+--
+-- audit_events is the highest-churn table in the schema (see 0001_init.sql's header) and 0004
+-- added `origin` with no index at all, so that grouping would scan. The existing audit indexes
+-- are all (<column>, ts) pairs — idx_audit_server_ts, idx_audit_decision, idx_audit_api_key —
+-- and this follows the same shape for the same reason: every audit read is time-bounded, so ts
+-- belongs in the index alongside whatever is being filtered or grouped.
+--
+-- Deliberately NOT a CHECK constraint on origin. The value is open-ended by design (#123's
+-- class:detail scheme carries a caller-asserted harness and host), and a CHECK would have to be
+-- migrated every time a class is added — the exact coupling 0004's header avoided.
+CREATE INDEX IF NOT EXISTS idx_audit_origin_ts ON audit_events(origin, ts);

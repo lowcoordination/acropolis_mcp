@@ -59,8 +59,9 @@ class TestMetricsDegradesWhenAuditStoreDown:
         resp = await client.get("/metrics")
         assert resp.status_code == 200
         body = resp.text
-        assert 'acropolis_audit_events_total{decision="ALLOWED"}' in body
-        assert 'acropolis_audit_events_total{decision="BLOCKED"}' in body
+        # #123 added an `origin` label to this family — the series now carry both dimensions.
+        assert 'acropolis_audit_events_total{decision="ALLOWED",origin="gateway"}' in body
+        assert 'acropolis_audit_events_total{decision="BLOCKED",origin="gateway"}' in body
         assert "acropolis_audit_store_up 1" in body
         assert 'acropolis_server_health{slug="metrics-ok"}' in body
 
@@ -74,7 +75,10 @@ class TestMetricsDegradesWhenAuditStoreDown:
         server_repo = ServerRepo(db)
         await server_repo.create(slug="metrics-down", name="Down", upstream_url="http://127.0.0.1:1/mcp")
 
-        monkeypatch.setattr(AuditRepo, "count_since", _AuditStoreDown._raise)
+        # #123: /metrics reads through count_by_origin_class_since (one grouped query) rather
+        # than four count_since calls. Patched by the name the handler ACTUALLY calls — patching
+        # the old name here would leave this test green while covering nothing.
+        monkeypatch.setattr(AuditRepo, "count_by_origin_class_since", _AuditStoreDown._raise)
         resp = await client.get("/metrics")
 
         assert resp.status_code == 200
@@ -86,20 +90,22 @@ class TestMetricsDegradesWhenAuditStoreDown:
         assert 'acropolis_server_health{slug="metrics-down"}' in body
 
     async def test_audit_failure_never_raises_partway_into_family(self, app_client, monkeypatch):
-        """A failure on the SECOND count_since call (after the first succeeded) must still
-        degrade the whole family, not emit a half-populated counter — the scrape must never see
-        a partial acropolis_audit_events_total series that implies the first call's data is
-        representative."""
+        """The whole acropolis_audit_events_total family degrades together — a scrape must never
+        see a partially populated counter.
+
+        #123 changed the shape of this risk rather than removing it. The family used to be built
+        from four sequential count_since calls, so the hazard was a failure on the second; it is
+        now ONE grouped query, so a partial read is no longer possible mid-family. What remains
+        is that the family is emitted from a dict comprehension over the returned classes — a
+        failure must leave `by_origin` empty and skip the family entirely, not emit the classes
+        gathered so far. Simulated by failing the grouped read outright, which is now the only
+        way it can fail."""
         client, db = app_client
-        calls = {"n": 0}
 
-        async def flaky_count_since(self, *args, **kwargs):
-            calls["n"] += 1
-            if calls["n"] >= 2:
-                raise RuntimeError("simulated audit store outage (issue #109)")
-            return 7
+        async def failing_grouped_read(self, *args, **kwargs):
+            raise RuntimeError("simulated audit store outage (issue #109)")
 
-        monkeypatch.setattr(AuditRepo, "count_since", flaky_count_since)
+        monkeypatch.setattr(AuditRepo, "count_by_origin_class_since", failing_grouped_read)
         resp = await client.get("/metrics")
 
         assert resp.status_code == 200

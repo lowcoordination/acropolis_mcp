@@ -356,6 +356,60 @@ class TestWebhookDispatcherBehavior:
 
         assert receiver.requests == []
 
+    async def test_only_real_traffic_fires_a_blocked_webhook(self, db):
+        """The origin filter in _loop, driven through the REAL path — audit.log() broadcast to
+        a subscribed dispatcher — rather than by calling _handle_blocked directly.
+
+        This is the gap that let issue #123's bug ship: the sibling test above pokes
+        _handle_blocked, which is DOWNSTREAM of the `origin` check in _loop, so the predicate
+        itself had no coverage at all. When #122 added origin='local-eval', `origin != "test"`
+        happily let it through and every blocked local evaluation paged on-call — a policy
+        QUESTION alerting as though a real call had been refused, on every command a local
+        guard checks.
+
+        Asserts on the DEBOUNCE MAP rather than on delivered HTTP: _handle_blocked registers a
+        debounce entry and defers the actual POST by DEBOUNCE_WINDOW_SECONDS (60s), so
+        deliveries are unobservable in a fast test. The debounce key is what proves the event
+        got past the filter, which is precisely what is under test here. Each event uses a
+        distinct `rule` so it gets its own key — a shared key would collapse all four into one
+        entry and hide exactly what we are measuring.
+        """
+        settings_repo = SettingsRepo(db)
+        await settings_repo.set_many({
+            "webhook_url": "https://example.invalid/hook", "webhook_enabled": "true",
+            "webhook_events": "blocked",
+        })
+        audit = AuditLogger(AuditRepo(db))
+        dispatcher = WebhookDispatcher(audit, settings_repo)
+
+        cases = {
+            None: "rule-real",
+            "test": "rule-test",
+            "local-eval": "rule-localeval",
+            "local:guard/pi@laptop": "rule-structured",
+        }
+        try:
+            audit.start()
+            dispatcher.start()
+            for origin, rule in cases.items():
+                await audit.log(
+                    server_slug="srv", tool="bash", decision="BLOCKED",
+                    rule=rule, matched="rm -rf", origin=origin,
+                )
+            await asyncio.sleep(0.3)
+
+            registered = {k[1] for k in dispatcher._debounce}
+        finally:
+            await dispatcher.stop()
+            await audit.stop()
+
+        # Only the origin=None row may reach the alerting path. A non-NULL origin is a call the
+        # gateway did not actually refuse for a client, so it must never page anyone.
+        assert registered == {"rule-real"}, (
+            f"only real traffic may alert; these origins also got through: "
+            f"{sorted(registered - {'rule-real'})}"
+        )
+
     async def test_cap_suppresses_then_flushes_one_notice_with_the_true_tally_on_stop(self, db):
         settings_repo = SettingsRepo(db)
         await settings_repo.set_many({"webhook_url": "https://x/", "webhook_enabled": "true"})
