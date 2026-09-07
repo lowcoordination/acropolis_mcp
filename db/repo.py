@@ -934,14 +934,24 @@ class AuditRepo(_PoolAccess):
             if origin_class == _CLASS_GATEWAY:
                 w.is_null("origin")
             else:
-                # `origin = $n OR origin LIKE $n || ':%'` — matches both a bare class token
-                # (the legacy 'test' value, which predates the class:detail scheme) and any
-                # class:detail value. The prefix is bound as a parameter and the class itself is
-                # validated against a fixed vocabulary at the API boundary, so there is no LIKE
-                # metacharacter injection here.
+                # `origin = $n OR origin LIKE $n` — matches both a bare class token (the legacy
+                # 'test' value, which predates the class:detail scheme) and any class:detail
+                # value.
+                #
+                # `%` and `_` in the class are escaped for the LIKE branch, exactly as the
+                # `search` filter above does and for the same reason: without it, a class of "%"
+                # is a WILDCARD that matches every structured origin, and "_" matches any
+                # single-character class — a filter that silently widens instead of narrowing.
+                # archon/api.py validates origin_class against a fixed vocabulary before it gets
+                # here, but this is a public repo method (argus/metrics.py and future callers
+                # reach it directly), so the escaping belongs at the layer that builds the SQL
+                # rather than resting on one caller's validation.
+                escaped = (
+                    origin_class.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                )
                 w.raw(
                     f"(origin = {w.bind(origin_class)} "
-                    f"OR origin LIKE {w.bind(origin_class + ':%')})"
+                    f"OR origin LIKE {w.bind(escaped + ':%')} ESCAPE '\\')"
                 )
         limit_ph = w.bind(limit)
         async with self._read() as conn:

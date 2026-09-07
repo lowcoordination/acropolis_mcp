@@ -327,3 +327,27 @@ async def test_count_by_origin_class_counts_every_decision_including_passthrough
     counts = await repo.count_by_origin_class_since("1970-01-01T00:00:00.000Z")
     assert counts["gateway"] == {"PASSTHROUGH": 1, "ALLOWED": 1}
     assert counts["local"] == {"PASSTHROUGH": 1}
+
+
+async def test_origin_class_treats_like_metacharacters_literally(db):
+    """A class containing `%` or `_` must not act as a SQL LIKE wildcard.
+
+    Found by /security-scan on #123: the class is used in a LIKE prefix match, so an unescaped
+    `%` matched EVERY structured origin — a filter that silently widens instead of narrowing,
+    which is the worst direction for an audit filter to fail in. archon/api.py validates the
+    class against a fixed vocabulary, but AuditRepo.query is a public method reached directly by
+    argus/metrics.py and by future callers, so the escaping belongs here. Mirrors the same
+    escaping the `search` filter has always done.
+    """
+    repo = AuditRepo(db)
+    await _seed(repo, tool="structured", origin="local:secret-key")
+    await _seed(repo, tool="legacy", origin="test")
+
+    for hostile in ("%", "_", "local%", "loca_", "' OR 1=1 --", "local'"):
+        assert await repo.query(origin_class=hostile) == [], (
+            f"{hostile!r} must match nothing, not act as a wildcard"
+        )
+
+    # Positive control: a legitimate class on the same fixture still matches, so the assertions
+    # above are not passing merely because the search space is empty.
+    assert {e["tool"] for e in await repo.query(origin_class="local")} == {"structured"}
