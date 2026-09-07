@@ -57,8 +57,8 @@ async def eval_app(app_env, upstream):
         yield app_env.db, admin_client, app_env.transport, "e", upstream
 
 
-async def _mint_key(admin_client, name="guard", **quota) -> str:
-    resp = await admin_client.post("/api/v1/keys", json={"name": name, **quota})
+async def _mint_key(admin_client, name="guard", **fields) -> str:
+    resp = await admin_client.post("/api/v1/keys", json={"name": name, **fields})
     assert resp.status_code == 201, resp.text
     return resp.json()["plaintext"]
 
@@ -105,6 +105,35 @@ class TestAuthentication:
         )
         assert disable.status_code == 200, disable.text
         assert (await _evaluate(transport, key)).status_code == 401
+
+    async def test_malformed_authorization_header_returns_401(self, eval_app):
+        """Every malformed Authorization shape is rejected, whichever guard catches it.
+
+        Note for future maintainers: the bearer-prefix check in verify_evaluation_key is
+        deliberately REDUNDANT with the verify() call after it, and no test can isolate it.
+        The handler slices auth_header[7:] unconditionally, and that slice mangles the
+        "acropolis_" prefix of any real key (a bare key becomes "is_..."), so verify() rejects
+        every input the prefix check would have caught. Mutating the prefix check to `if False`
+        leaves the whole suite green — that is defense-in-depth working, not missing coverage.
+        Do not "fix" it by removing the prefix check: it produces the accurate 401 detail
+        ("missing bearer token" vs "invalid or disabled api key"), which is what an operator
+        debugging a client integration actually needs.
+        """
+        _, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client, name="prefixless")
+
+        # The scheme is REQUIRED: a bare key with no "Bearer " prefix is the realistic client
+        # mistake. `key` is a genuinely valid key, so the 401 is about the missing scheme.
+        bare = await _evaluate(transport, key=None, headers={"Authorization": key})
+        assert bare.status_code == 401, "a key without the Bearer scheme must be rejected"
+
+        # Same key, correct scheme -> 200. Positive control proving the 401 above is the missing
+        # scheme and not a bad key.
+        assert (await _evaluate(transport, key, arguments={"command": "ls"})).status_code == 200
+
+        for header in ("", "Bearer", f"Basic {key}", "Basic dXNlcjpwYXNz"):
+            resp = await _evaluate(transport, key=None, headers={"Authorization": header})
+            assert resp.status_code == 401, f"header {header!r} must be rejected"
 
     async def test_admin_session_is_not_accepted(self, eval_app):
         """The two credential systems stay disjoint: a logged-in admin session is NOT a valid
@@ -162,6 +191,39 @@ class TestDecision:
         resp = await _evaluate(transport, key, arguments={"command": "ls -la"})
         assert resp.status_code == 200
         assert resp.json() == {"blocked": False, "reason": None, "rule": None, "matched": None}
+
+    async def test_key_from_another_project_is_refused(self, eval_app):
+        """Project scoping — the endpoint's authorization boundary.
+
+        A key minted in project B must not evaluate against a server in project A, even though
+        it is a perfectly valid, enabled key. Found by mutating the scope check to a no-op:
+        18/18 passed, because every other test uses a single project and never exercises it.
+        """
+        db, admin_client, transport, slug, _ = eval_app
+        created = await admin_client.post(
+            "/api/v1/projects", json={"slug": "other", "name": "Other"}
+        )
+        assert created.status_code == 201, created.text
+
+        other_key = await _mint_key(admin_client, name="outsider", project_slug="other")
+        resp = await _evaluate(transport, other_key, slug=slug, arguments={"command": "ls"})
+        assert resp.status_code == 403, resp.text
+
+        # Positive control on the SAME server: an in-project key does get an answer, so the 403
+        # above is the project boundary and not some unrelated failure.
+        insider = await _mint_key(admin_client, name="insider")
+        assert (await _evaluate(transport, insider, slug=slug,
+                                arguments={"command": "ls"})).status_code == 200
+
+    async def test_scoped_key_cannot_reach_an_unlisted_server(self, eval_app):
+        """The other half of key_scope_violation: server_scopes naming a different slug."""
+        db, admin_client, transport, slug, _ = eval_app
+        server_repo = ServerRepo(db)
+        await server_repo.create(slug="other-srv", name="Other", upstream_url="http://127.0.0.1:1/mcp")
+
+        narrow = await _mint_key(admin_client, name="narrow", server_scopes=["other-srv"])
+        resp = await _evaluate(transport, narrow, slug=slug, arguments={"command": "ls"})
+        assert resp.status_code == 403, resp.text
 
     async def test_unknown_server_404s(self, eval_app):
         _, admin_client, transport, _, _ = eval_app
