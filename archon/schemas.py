@@ -505,7 +505,8 @@ class AuditEventResponse(BaseModel):
     bridged: bool
     status_code: Optional[int]
     latency_ms: Optional[int]
-    origin: Optional[str] = None  # None (normal traffic) | "test" (admin Try-it call)
+    origin: Optional[str] = None  # See argus/origin.py: None (real traffic) | "test" (Try-it)
+    # | "local:<key>[/<harness>@<host>]" (local evaluation).
     dlp_detector: Optional[str] = None  # enterprise #10 — which detector fired, if any
     dlp_action: Optional[str] = None  # "block" | "redact" — never the matched/redacted value
     dlp_match_count: Optional[int] = None

@@ -294,9 +294,11 @@ subprocess for patterns re2 rejects — so it is metered identically:
 - It counts against the API key's quota. A guard that evaluates and then executes spends **two**
   quota units per executed call. See [Quotas](quotas.md).
 
-Every evaluation writes an audit row with `endpoint="policy-evaluate"` and a local-execution
-`origin`, kept out of `/stats` so it never inflates traffic counters. See
-[Audit and compliance](audit-and-compliance.md).
+Every evaluation writes an audit row with `endpoint="policy-evaluate"` and an `origin` of
+`local:<key-name>` — plus `/<harness>@<host>` when the caller sends the optional `harness` and
+`host` fields, which is how a fleet answers "which machine, which agent". Those rows are kept out
+of `/stats` so they never inflate traffic counters, and `?origin_class=local` filters to them.
+See [Audit and compliance](audit-and-compliance.md#the-origin-scheme).
 
 > **Known gap (#125):** `summarize_args` redacts argument values by **key name**. A secret
 > passed as `{"password": "..."}` is redacted in the audit row; a secret sitting inline in a

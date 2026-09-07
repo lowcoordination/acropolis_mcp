@@ -46,6 +46,7 @@ function EventRow({ event }: { event: AuditEvent }) {
             </div>
           )}
           {event.args_summary && <div className="font-mono break-all">Args: {event.args_summary}</div>}
+          {event.origin && <div className="font-mono">Origin: {event.origin}</div>}
           {!!event.bridged && <div>Bridged (2026 stateless client)</div>}
           {event.latency_ms !== null && <div>Latency: {event.latency_ms}ms</div>}
         </div>
@@ -68,6 +69,7 @@ export function Audit() {
   const { data: keys } = useKeys(activeProjectId)
   const [serverFilter, setServerFilter] = useState('')
   const [decisionFilter, setDecisionFilter] = useState('')
+  const [originFilter, setOriginFilter] = useState('')
   const [apiKeyFilter, setApiKeyFilter] = useState('')
   const [afterInput, setAfterInput] = useState('')
   const [beforeInput, setBeforeInput] = useState('')
@@ -88,6 +90,7 @@ export function Audit() {
   const { data: history, isLoading } = useAuditQuery({
     server_slug: serverFilter || undefined,
     decision: decisionFilter || undefined,
+    origin_class: originFilter || undefined,
     api_key_id: apiKeyId,
     after,
     before,
@@ -103,6 +106,11 @@ export function Audit() {
   const filteredLive = liveEvents.filter((e) => {
     if (serverFilter && e.server_slug !== serverFilter) return false
     if (decisionFilter && e.decision !== decisionFilter) return false
+    // Mirrors the backend's origin_class filter (AuditRepo.query): match on the leading
+    // segment, with null meaning 'gateway'. This list re-implements every filter in TS, so a
+    // control added to the query above and not here is silently ignored in the live view.
+    if (originFilter && (e.origin === null ? 'gateway' : e.origin.split(':')[0]) !== originFilter)
+      return false
     if (apiKeyId !== undefined && e.api_key_id !== apiKeyId) return false
     if (after && e.ts < after) return false
     if (before && e.ts > before) return false
@@ -117,6 +125,7 @@ export function Audit() {
   const exportHref = auditApi.exportCsvUrl({
     server_slug: serverFilter || undefined,
     decision: decisionFilter || undefined,
+    origin_class: originFilter || undefined,
     api_key_id: apiKeyId,
     after,
     before,
@@ -165,6 +174,19 @@ export function Audit() {
           <option value="BLOCKED">Blocked</option>
           <option value="PASSTHROUGH">Passthrough</option>
           <option value="ERROR">Error</option>
+        </select>
+        <select
+          className="rounded-md px-3 py-2 text-sm"
+          value={originFilter}
+          onChange={(e) => setOriginFilter(e.target.value)}
+        >
+          {/* #123: "" is not "everything" — it is the default view, which the backend scopes to
+              real traffic only (origin IS NULL), matching how Try-it calls have always been
+              hidden unless asked for. */}
+          <option value="">Default (real traffic)</option>
+          <option value="gateway">Gateway only</option>
+          <option value="local">Local execution</option>
+          <option value="test">Try-it tests</option>
         </select>
         <select
           className="rounded-md px-3 py-2 text-sm"

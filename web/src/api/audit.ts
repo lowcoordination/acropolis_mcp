@@ -14,6 +14,10 @@ export interface AuditQuery {
   // Enterprise #4: optional project filter — instance-wide (unfiltered) by default, matching
   // pre-feature behavior exactly.
   project_id?: number
+  // #123: 'gateway' | 'local' | 'test'. Filters on the origin's leading segment, so "every
+  // local evaluation" doesn't require enumerating the key names and hostnames in the detail
+  // half. Undefined = the default view (real traffic only).
+  origin_class?: string
 }
 
 // Filters shared between the history query and the CSV export — before_id/limit are

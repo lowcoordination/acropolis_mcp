@@ -11,6 +11,29 @@ config-drift gauge. It answers "how many calls were blocked in the last day" and
 healthy right now." It does **not** answer "where did THIS call spend its time" or "which upstream
 call was slow" — that's what distributed tracing exists for.
 
+### Decision counters break down by origin class
+
+`acropolis_audit_events_total` carries two labels — `decision` and `origin`:
+
+```
+acropolis_audit_events_total{decision="BLOCKED",origin="gateway"} 12
+acropolis_audit_events_total{decision="BLOCKED",origin="local"} 3
+```
+
+`origin` is the **class only**: `gateway` (real traffic), `local` (a local-execution
+evaluation via `POST /api/v1/policy/evaluate`), or `test` (Try-it). That makes "blocked locally"
+separately alertable from "blocked at the gateway" — the two surfaces have different meanings
+and a single mixed counter answers neither question.
+
+All three classes are emitted even when idle: a missing series and a zero mean different things
+to an alert rule.
+
+**The full origin value is deliberately not a label.** Its detail half carries an API key name
+and a caller-asserted hostname (see [Audit and compliance](audit-and-compliance.md#the-origin-scheme)),
+and unbounded label values are how a Prometheus server falls over — a fleet of ephemeral hosts
+would do it by accident, and a hostile caller could do it on purpose. The full value stays
+queryable in the audit log and the Audit UI, where cardinality costs nothing.
+
 ### Degraded audit store (issue #109)
 
 The audit-derived counters (`acropolis_audit_events_total`) and the server/config-derived

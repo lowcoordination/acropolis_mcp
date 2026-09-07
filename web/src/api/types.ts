@@ -214,6 +214,10 @@ export interface AuditEvent {
   dlp_detector: string | null
   dlp_action: DlpAction | null
   dlp_match_count: number | null
+  // #123: null = real gateway traffic; 'test' = Try-it; 'local:<key>[/<harness>@<host>]' = a
+  // local-execution evaluation. The backend has returned this since migration 0004 but nothing
+  // in the SPA read it until the origin filter landed.
+  origin: string | null
 }
 
 export interface SetupStatusResponse {
