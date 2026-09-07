@@ -192,6 +192,52 @@ there. This was a deliberate design boundary from the start of this milestone (c
 two would break every existing MCP client integration) and is regression-tested explicitly in
 `tests/integration/test_identity.py`.
 
+## The evaluation endpoint is API-key authenticated
+
+`POST /api/v1/policy/evaluate` (see [the policy cookbook](policy-cookbook.md#evaluating-a-call-without-making-it))
+is the one route under `/api/v1` that does **not** use a session cookie or `admin_token`. It
+requires an API key:
+
+```
+Authorization: Bearer acropolis_...
+```
+
+A logged-in admin session gets **401** there. That is deliberate, not an oversight, and there are
+two independent reasons:
+
+1. **The caller should hold a server-scoped credential.** The consumer is a long-lived guard
+   process on a developer's machine that asks "may I run this command?" on every proposed tool
+   call. An API key is scoped to specific servers in one project; a session cookie carries its
+   owner's full role. Handing a guard an admin session to answer that question would be a large
+   privilege escalation.
+2. **Quota has no identity without a key.** Quota is enforced per API key. A session-authenticated
+   call would be structurally unmeterable, which would defeat the metering this endpoint requires
+   — it runs the regex forkserver, so an unmetered version is a DoS vector.
+
+Project scoping therefore resolves from the **key**, exactly as on the data plane: a key minted in
+project A gets 403 for a server in project B. The global-admin superset described under
+[Roles](#roles) is a control-plane concept and deliberately does not apply.
+
+### Neither "open" mode reaches it
+
+The gateway has two states where a request can succeed without credentials. **Neither applies to
+this endpoint**, and both exclusions are regression-tested:
+
+| Open state | Governs | Applies here? |
+|---|---|---|
+| `auth_mode: open` | the data plane, `/mcp/*` | **No** — this endpoint never reads `auth_mode` |
+| pre-first-run window (no `admin_password_hash`, no `admin_token`) | `/api/v1` session routes | **No** — this endpoint never calls `require_admin` |
+
+So with `auth_mode: open` configured, `/mcp/{slug}` accepts a keyless `tools/call` while
+`/api/v1/policy/evaluate` still returns 401. There is no configuration, flag, or setting that
+makes it answerable without a valid, enabled key.
+
+The reasoning: `auth_mode: open` exists for single-tenant deployments where the **proxy** is
+trusted-by-network. This endpoint is a **policy oracle**. Unauthenticated access lets anyone
+binary-search your `block_patterns` — which encode which paths, hosts, and credentials you care
+about — at forkserver cost per probe. That is a strictly worse exposure than an open proxy, so it
+does not inherit the proxy's relaxation.
+
 ## The legacy session path (retired)
 
 `archon/admin_auth.py` has three ways in, tried in order: the `admin_token` break-glass bearer,

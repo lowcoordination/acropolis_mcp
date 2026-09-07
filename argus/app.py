@@ -19,10 +19,12 @@ from archon.setup import build_setup_router
 from argus.aggregate_pipeline import AggregatePipeline
 from argus.audit import AuditLogger
 from argus.bridge import ProtocolBridge
+from argus.metering import Metering
 from argus.metrics import build_metrics_router
 from argus.pipeline import Pipeline
 from argus.policy import warm_forkserver
 from argus.rate_limiter import RateLimiterRegistry
+from argus.policy_api import build_policy_evaluation_router
 from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
 from argus.tracing import build_tracing_manager
@@ -366,6 +368,15 @@ def create_app(
         secret_provider=secret_provider, tracing=tracing, usage_repo=usage_repo,
         project_repo=project_repo, project_member_repo=project_member_repo,
         proposal_repo=proposal_repo,
+    ))
+    # #122: a SECOND router serving /api/v1, deliberately separate from the control-plane one
+    # above. This one is gated by API KEY rather than by session/admin-token + require_role, so
+    # keeping it out of archon/api.py preserves that file's invariant that
+    # `grep require_role archon/api.py` enumerates every route and its minimum role. Its own
+    # gate and the reasoning behind it are in argus/policy_api.py's module docstring.
+    app.include_router(build_policy_evaluation_router(
+        server_repo, api_keys, audit,
+        Metering(rate_limiter, usage_repo, webhook_dispatcher), settings,
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo, config_source))

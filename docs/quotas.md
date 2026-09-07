@@ -133,6 +133,20 @@ still 1000/month across the fleet.
 Rate limiting is the opposite case and needs a shared backend before you scale out, because its
 default state genuinely is per-process — see [rate limiting](rate-limiting.md).
 
+## Policy evaluations consume quota
+
+`POST /api/v1/policy/evaluate` is metered exactly like a `tools/call`: same ordering (auth →
+rate limit → quota), same `usage_rollups` increment, same 80%/100% threshold webhooks. An
+evaluation costs the gateway the same regex work as a real call, so it draws on the same budget.
+
+**A guard that evaluates and then executes spends two quota units per executed call** — one for
+the evaluation, one for the call itself. Size quotas accordingly; this surprises people.
+
+Quota stays **fail-open** on that endpoint, exactly as described below. That means the DoS
+protection the evaluation endpoint needs is carried by the **rate limiter**, which fails closed,
+not by quota. The two controls have different jobs there, and it is worth being explicit rather
+than implying quota is a security boundary it was never designed to be.
+
 ## Fail-open, deliberately — and why this differs from secret-resolution's fail-closed default
 
 **If the quota check itself fails — a database read error, a corrupted row, anything short

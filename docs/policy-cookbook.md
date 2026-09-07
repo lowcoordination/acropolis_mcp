@@ -233,6 +233,78 @@ unreasonable amount of data in one call:
 A non-numeric value for a parameter with `max_value`/`min_value` set is left alone (the rule
 simply can't apply to it) — this is for capping a number, not for type-checking.
 
+## Evaluating a call without making it
+
+`POST /api/v1/policy/evaluate` answers "would this be blocked?" against a server's policy and
+returns the decision. Nothing is forwarded upstream; no `tools/call` is made.
+
+It exists for callers that are not MCP clients — chiefly a local agent guard that intercepts a
+proposed `bash`/`write`/`edit` before it runs, and needs the same policy and the same audit
+trail as the gateway's HTTP traffic.
+
+```
+POST /api/v1/policy/evaluate
+Authorization: Bearer acropolis_...
+
+{ "server": "prod-shell", "tool_name": "bash",
+  "arguments": {"command": "fsck -y /dev/sda1"} }
+
+200 { "blocked": true,
+      "reason": "param 'command' failed rule 'block_pattern': fsck -y",
+      "rule": "block_pattern", "matched": "fsck -y" }
+```
+
+The response carries exactly four fields. `matched` is the **operator's pattern**, never the
+caller's argument text — see [DLP](dlp.md)'s audit-safety invariant.
+
+**Authentication is an API key, not a session** — this is the one route under `/api/v1` that
+works that way, and `auth_mode: open` does not apply to it. See
+[Authentication](authentication.md#the-evaluation-endpoint-is-api-key-authenticated).
+
+### Callers must fail closed
+
+**Any response that is not `200` with a well-formed body must be treated as `blocked: true`.**
+That includes `401`, `403`, `404`, `413`, `422`, `429`, every `5xx`, a timeout, a connection
+refusal, and an unparseable body. Only an explicit `200 {"blocked": false}` permits the call.
+
+This is not defensive style, it is the whole security property. A guard that treats an
+unreachable gateway as permission has no value: the cheapest way to defeat it is to make the
+gateway unreachable.
+
+Set an explicit client-side timeout — a few seconds is ample, since the gateway's own
+`block_pattern` match budget bounds the server side (see [What happens if a pattern is
+slow](#what-happens-if-a-pattern-is-slow)) — and treat its expiry as a block.
+
+This is a deliberate availability trade, and worth being explicit with your users about:
+**gateway down means the agent cannot run local commands.** That is the intended behaviour. If
+that trade is wrong for your deployment, the answer is to make the gateway highly available, not
+to fail open.
+
+`429` deserves a specific note because a busy guard will actually hit it: a rate-limit or quota
+refusal is still a block, not a retryable "unknown". A caller may back off and retry rather than
+failing the user's action outright, but it must not proceed in the meantime.
+
+### It consumes the same budgets as real traffic
+
+An evaluation runs the same regex engine as a real `tools/call` — including the forkserver
+subprocess for patterns re2 rejects — so it is metered identically:
+
+- It draws on the **same** `srv:{slug}` rate-limit bucket as data-plane calls, so a caller
+  cannot double an effective budget by alternating surfaces. See [Rate limiting](rate-limiting.md).
+- It counts against the API key's quota. A guard that evaluates and then executes spends **two**
+  quota units per executed call. See [Quotas](quotas.md).
+
+Every evaluation writes an audit row with `endpoint="policy-evaluate"` and a local-execution
+`origin`, kept out of `/stats` so it never inflates traffic counters. See
+[Audit and compliance](audit-and-compliance.md).
+
+> **Known gap (#125):** `summarize_args` redacts argument values by **key name**. A secret
+> passed as `{"password": "..."}` is redacted in the audit row; a secret sitting inline in a
+> command string — `--from-literal=password=hunter2` — is truncated but **not** redacted. This
+> applies equally to a real `tools/call` with the same argument; the evaluation endpoint does not
+> add exposure, but a local guard sends command strings on every call, so it meets the gap more
+> often. The response body is unaffected either way.
+
 ## A note on the aggregate endpoint
 
 Everything above is per-server. If you also use the aggregate `/mcp` endpoint (tools from

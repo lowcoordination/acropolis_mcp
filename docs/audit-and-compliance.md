@@ -12,6 +12,33 @@ Acropolis maintains two separate audit logs, each serving a distinct purpose:
 
 **Purpose:** Traffic analysis, debugging, understanding agent behavior.
 
+### Local execution decisions
+
+Not every row in the data-plane log came over HTTP. `POST /api/v1/policy/evaluate` (see [the
+policy cookbook](policy-cookbook.md#evaluating-a-call-without-making-it)) lets a local agent
+guard ask whether a proposed command would be blocked *before* it runs, and each answer is
+recorded here. Two columns distinguish those rows:
+
+| Column | Gateway traffic | Local evaluation |
+|---|---|---|
+| `endpoint` | `per-server`, `aggregate` | `policy-evaluate` |
+| `origin` | `NULL` (real traffic), `test` (Try-it) | `local-eval` |
+
+Because `origin` is non-NULL, evaluations are excluded from `/stats` automatically — the same
+mechanism that keeps Try-it calls from moving the dashboard. An evaluation is a question, not
+traffic. Retention treats these rows exactly like any other data-plane row (30 days by default,
+prunable), and rows predating the column render normally with `origin` NULL — no backfill needed.
+
+> `origin` values are **not** a stable API contract. Issue #123 will replace `local-eval` with a
+> structured scheme carrying the harness and host ("which machine, which agent"). There is no
+> CHECK constraint on the column, and the current value lives in a single constant.
+
+**Known gap (#125):** `args_summary` redacts argument values by **key name**. A secret inline in a
+command string (`--from-literal=password=hunter2`) is truncated at 120 characters but **not**
+redacted, so it can appear in a data-plane audit row. This is true of any `tools/call` carrying
+the same argument, not only of evaluations — but a local guard sends command strings on every
+call, so it meets the gap far more often.
+
 ## 2. Control-Plane Audit (`gateway.db`)
 
 **What it records:** Administrative actions — server created/updated/deleted, policy changed, API key minted/disabled/revoked, settings modified, config imported.

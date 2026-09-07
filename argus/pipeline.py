@@ -11,7 +11,7 @@ from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
-from archon.auth.apikeys import ApiKeyService
+from archon.auth.apikeys import ApiKeyService, key_scope_violation
 from archon.secrets import SecretProvider, SecretResolutionError
 from archon.secrets.local import LocalSecretProvider
 from archon.settings import Settings
@@ -29,17 +29,11 @@ from argus.headers import (
     strip_hop_by_hop,
 )
 from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
+from argus.metering import Metering
 from argus.policy import Decision, evaluate
-from argus.quotas import period_start
-from argus.rate_limiter import (
-    RateLimitBackendUnavailable,
-    RateLimiterRegistry,
-    server_key,
-    tool_key,
-)
+from argus.rate_limiter import RateLimiterRegistry
 from argus.toolslist import ToolsCache
 from argus.tracing import TracingManager, _DisabledTracingManager
-from db.database import utcnow
 from db.models import ApiKeyRecord, ServerPolicy, ServerRecord
 from db.repo import ServerRepo, SettingsRepo, UsageRepo
 
@@ -127,6 +121,34 @@ class Pipeline:
         # without a UsageRepo enforces nothing and records nothing.
         self._usage = usage_repo
         self._webhooks = webhook_dispatcher
+        # NOTE: metering (rate limits, quota, usage rollups) is deliberately NOT assigned here —
+        # see the `_metering` property below for why it is derived on access instead.
+
+    @property
+    def _metering(self) -> Metering:
+        """Metering built lazily from the collaborators this Pipeline already holds, and
+        rebuilt whenever they are replaced.
+
+        Composed rather than injected so that every existing Pipeline(...) call site — app.py,
+        the benches, and a large number of tests — keeps its current signature.
+        argus/policy_api.py builds its own Metering over the same collaborators; the rules live
+        in one place (argus/metering.py), the refusal shapes do not.
+
+        Deliberately not assigned in __init__: tests construct a Pipeline via
+        `Pipeline.__new__(Pipeline)` and set only the attributes the path under test needs
+        (see tests/unit/test_rate_limiter.py), and code elsewhere may swap self._rate_limiter
+        to point at a different backend. Caching a Metering at construction time would make
+        those callers exercise a stale backend while appearing to work — the failure mode this
+        property exists to prevent. Constructing one is three attribute reads, so the hot path
+        pays nothing meaningful for the guarantee.
+        """
+        cached = getattr(self, "_metering_cache", None)
+        deps = (self._rate_limiter, getattr(self, "_usage", None), getattr(self, "_webhooks", None))
+        if cached is None or cached[0] != deps:
+            metering = Metering(*deps)
+            self._metering_cache = (deps, metering)
+            return metering
+        return cached[1]
 
     @property
     def tools_cache(self) -> Optional[ToolsCache]:
@@ -296,35 +318,13 @@ class Pipeline:
         return record
 
     def _check_key_scope(self, record: ApiKeyRecord, slug: str, server: ServerRecord) -> None:
-        """The two per-server scope checks, shared by _authenticate (after a fresh verify)
-        and handle()'s pre_authenticated re-dispatch (#111), where the aggregate has already
-        verified the key this request and only these checks still need to run. Both are pure
-        Python over the record and the server — no DB — so the pre-authenticated path pays
-        nothing for keeping them.
-
-        The first check is key_permits_server — server_scopes is an operator-configured
-        allowlist of slugs (may be None = "any server"). The second is the project-agreement
-        invariant that must hold regardless: a key minted in project A must never reach a
-        server in project B, even if server_scopes was (mis)configured to name that server by
-        slug. The two checks COMPOSE (both must pass), neither replaces the other. Deliberately
-        does NOT consult any notion of "global admin" — there is no Principal/session on the
-        data plane, only a key; the global-admin-superset rule is a CONTROL-plane
-        (session-based) concept in archon/project_rbac.py and must never leak into this purely
-        key-vs-server check.
-
-        Explicit `is None` check rather than relying on `!=` alone: `None != None` is False
-        in Python, so a bare `record.project_id != server.project_id` would treat a
-        project-less KEY and a project-less SERVER as matching. Currently unreachable
-        (0010_projects.sql backfills every existing row to 'default', and both
-        ApiKeyRepo.create/ServerRepo.create resolve an explicit project_id at write time —
-        see that migration's header), but this is the one project-boundary check in the
-        codebase that must fail closed on NULL the way archon/project_rbac.py's resolvers
-        all deliberately do, even if that invariant is ever violated by a future code path.
-        """
-        if not self._api_keys.key_permits_server(record, slug):
-            raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
-        if record.project_id is None or record.project_id != server.project_id:
-            raise RoutingError(403, rpc_error(None, f"key not scoped for server '{slug}'"))
+        """Data-plane raiser for the shared scope predicate. The checks and the full reasoning
+        for each of them live in archon/auth/apikeys.py's key_scope_violation, which
+        argus/policy_api.py also consumes with a different error shape; this method contributes
+        only the JSON-RPC RoutingError that the data plane needs."""
+        violation = key_scope_violation(self._api_keys, record, slug, server)
+        if violation is not None:
+            raise RoutingError(403, rpc_error(None, violation))
 
     async def _read_body_guarded(self, request: Request) -> bytes:
         content_length = request.headers.get("content-length")
@@ -754,195 +754,47 @@ class Pipeline:
         api_key_id: Optional[int], rpc_id: Any, start: float,
         client_ip: Optional[str] = None,
     ) -> Optional[Response]:
-        # Re-register only when the spec string has changed: always calling register() would
-        # reset consumed token state and defeat rate limiting entirely, while never
-        # re-registering means an operator's limit change is ignored until restart.
-        # RateLimiterRegistry.ensure_current is a no-op on the hot path once the bucket
-        # matches the live policy.
-        #
-        # check_all() treats an unregistered key as "unlimited": only srv_key is registered
-        # here, so it is the sole enforced limit. tool_key is checked but never registered —
-        # per-tool limits are a tracked gap (tool_policies.rate_limit exists in the schema but
-        # ServerPolicy doesn't surface it; see tool_key()'s docstring). Per-API-key limits
-        # have no schema field at all; adding one is a real feature (migration + API + UI).
-        #
-        # `policy` is passed in by the caller, which fetched it once for this request — it is
-        # not re-fetched here (two DB reads of request-scoped-immutable data per tools/call).
-        srv_key = server_key(server.slug)
-        if policy.rate_limit:
-            self._rate_limiter.ensure_current(srv_key, policy.rate_limit)
-        else:
-            self._rate_limiter.unregister(srv_key)
-
-        keys = [srv_key] if policy.rate_limit else []
-        keys.append(tool_key(server.slug, tool_name))
-        try:
-            allowed = await self._rate_limiter.check_all(keys)
-        except RateLimitBackendUnavailable:
-            # Issue #31: fail CLOSED, deliberately — see RateLimitBackendUnavailable's
-            # docstring for the reasoning (an adversary trying to bypass a rate limit already
-            # controls the load needed to make a shared backend unavailable; fail-open there
-            # would hand them the bypass for free). Own `rule` value so this is distinguishable
-            # in the audit trail from a genuine over-limit block — an operator seeing a spike of
-            # `rate_limit_backend_unavailable` needs a different response (check the backend)
-            # than one seeing `rate_limit` (the configured limit is doing its job).
-            logger.error(
-                "rate limit backend unavailable for server=%s tool=%s — failing closed",
-                server.slug, tool_name,
-            )
-            return await self._refuse(
-                server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
-                message="Rate limit unavailable", status=429,
-                rule="rate_limit_backend_unavailable",
-                reason="rate limit backend unreachable; failing closed",
-                api_key_id=api_key_id, start=start, client_ip=client_ip,
-                endpoint="per-server", rpc_method="tools/call",
-                data={"tool": tool_name},
-            )
-        if not allowed:
-            return await self._refuse(
-                server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
-                message="Rate limit exceeded", status=429, rule="rate_limit",
-                api_key_id=api_key_id, start=start, client_ip=client_ip,
-                endpoint="per-server", rpc_method="tools/call",
-                data={"tool": tool_name},
-            )
-        return None
+        """Data-plane adapter over Metering.check_rate_limits: turns a shape-agnostic verdict
+        into this surface's JSON-RPC refusal plus its BLOCKED audit row. The rules — including
+        the fail-CLOSED backend-unavailable branch — live in argus/metering.py."""
+        verdict = await self._metering.check_rate_limits(server, policy, tool_name)
+        if verdict.allowed:
+            return None
+        return await self._refuse(
+            server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
+            message=verdict.message, status=verdict.status, rule=verdict.rule,
+            reason=verdict.reason,
+            api_key_id=api_key_id, start=start, client_ip=client_ip,
+            endpoint="per-server", rpc_method="tools/call",
+            data=verdict.data,
+        )
 
     async def _check_quota(
         self, server: ServerRecord, tool_name: str, key_record: Optional[ApiKeyRecord],
         rpc_id: Any, start: float, client_ip: Optional[str] = None,
     ) -> Optional[Response]:
-        """Call-count budget over a billing period, enforced AFTER auth and AFTER the rate
-        limiter, BEFORE policy evaluation — the non-negotiable ordering from
-        02-quotas-and-usage.md. Rate limiting answers "how fast"; this answers "how much, over
-        a period" — a different, complementary primitive (see argus/rate_limiter.py's own
-        module-level framing), not a replacement for it.
-
-        FAIL-OPEN, deliberately, and this is the one place in this feature that reverses every
-        other enterprise item's fail-CLOSED default (see argus/pipeline.py's
-        _resolve_credential for the fail-closed precedent this deliberately departs from, and
-        docs/quotas.md for the full rationale written out). If self._usage is None (no
-        UsageRepo wired — every pre-feature call site and test), if the key has no quota
-        configured, or if the quota check ITSELF fails (a DB error reading total_since — the
-        key row itself is never re-read here, see the code comment), the
-        call proceeds exactly as if no quota existed. The only way this method blocks a call is
-        a clean, successful read that shows the caller genuinely over budget.
-
-        SECURITY-SCAN NOTE (accepted, not fixed): the read here (total_since) and the write in
-        _record_usage happen in two separate steps with the actual upstream forward in between
-        — a classic TOCTOU window. A burst of N concurrent requests against a key with
-        remaining_budget < N can all read the SAME "still under budget" total before any of
-        them increments, and all N get forwarded — a real overshoot past the configured limit
-        under concurrency, not merely a theoretical one. This is accepted rather than
-        engineered around (e.g. with a single atomic check-and-increment SQL statement) because
-        it is consistent with, not a violation of, this feature's own documented threat model:
-        quota is a soft budget control, and the fail-open rationale above already establishes
-        that forwarding some calls over budget is a business cost, not a security exposure.
-        RateLimiterRegistry's token bucket, by contrast, IS atomic per-check (see
-        rate_limiter.py's asyncio.Lock) because bursts are exactly the failure mode a rate
-        limiter exists to prevent — the two features have different jobs and different
-        correctness requirements as a result. Worth being explicit about rather than silent.
-        """
-        if self._usage is None or key_record is None:
+        """Data-plane adapter over Metering.check_quota: turns a shape-agnostic verdict into
+        this surface's JSON-RPC refusal plus its BLOCKED audit row. The fail-OPEN posture and
+        the 80%/100% threshold webhook live in argus/metering.py."""
+        verdict = await self._metering.check_quota(server, tool_name, key_record)
+        if verdict.allowed:
             return None
-        # #111: `key_record` is the SAME row _authenticate/authenticate_no_scope already
-        # verified this request — it is passed through rather than re-fetched by id. The old
-        # api_keys.get() here was a second get_by_id of an identical, request-scoped record.
-        key = key_record
-        if key.quota_calls is None or key.quota_period is None:
-            return None
-        try:
-            since = period_start(key.quota_period).isoformat()
-            used = await self._usage.total_since(api_key_id=key.id, since_iso=since)
-        except Exception:
-            # Fail open — see docstring. A DB hiccup on the quota check must never take down
-            # the data plane; the worst case of forwarding anyway is one call slightly over a
-            # soft budget, not a security exposure (contrast with _resolve_credential, where
-            # failing open could leak a request to an upstream expecting credentials).
-            logger.error(
-                "quota check failed for api_key_id=%s server=%s tool=%s — failing open",
-                key_record.id, server.slug, tool_name, exc_info=True,
-            )
-            return None
-
-        if used < key.quota_calls:
-            await self._maybe_fire_quota_webhook(key, used + 1, since)
-            return None
-
         return await self._refuse(
             server_slug=server.slug, tool=tool_name, rpc_id=rpc_id,
-            message="Quota exceeded", status=429, rule="quota",
-            reason=f"Quota exceeded: {used}/{key.quota_calls} calls this {key.quota_period}",
-            api_key_id=key.id, start=start, client_ip=client_ip,
+            message=verdict.message, status=verdict.status, rule=verdict.rule,
+            reason=verdict.reason,
+            api_key_id=key_record.id if key_record is not None else None,
+            start=start, client_ip=client_ip,
             endpoint="per-server", rpc_method="tools/call",
-            data={"tool": tool_name, "quota_period": key.quota_period},
+            data=verdict.data,
         )
-
-    async def _maybe_fire_quota_webhook(self, key, projected_used: int, since_iso: str) -> None:
-        """Fires the `quota` webhook event at 80%/100% thresholds — see stoa/webhooks.py's
-        VALID_EVENTS and docs/quotas.md. `projected_used` is `used + 1` (the count AFTER the
-        call currently being evaluated completes), so the threshold fires on the call that
-        actually crosses it rather than one call later. Debouncing per key+period (so a busy
-        key doesn't spam one webhook per call once over a threshold) and race-safety under a
-        concurrent burst are entirely WebhookDispatcher's responsibility (see its
-        fire_quota_threshold method) — this call site only computes WHETHER a threshold was
-        newly crossed by this specific call, a pure function of (previous count, new count,
-        quota), and hands off the decision, not the debounce state.
-        """
-        if self._webhooks is None or key.quota_calls is None:
-            return
-        # Security-scan check (division-by-zero on key.quota_calls): the only caller of this
-        # method is _check_quota's `if used < key.quota_calls: await
-        # self._maybe_fire_quota_webhook(...)` branch — if quota_calls were ever <= 0, that
-        # condition could only be true for a negative `used`, which total_since's
-        # COALESCE(SUM(calls), 0) can never produce. So this method is unreachable whenever
-        # quota_calls <= 0, and the division below is safe by that construction, not by luck.
-        # archon/schemas.py's _validate_quota_pairing is the actual enforcement point (rejects
-        # quota_calls <= 0 at the API boundary) — this comment documents why a hypothetical
-        # bypass of that layer (a direct ApiKeyRepo.create/set_quota call, which has no such
-        # guard) still wouldn't crash here, not a claim that this method re-validates anything.
-        prior_pct = ((projected_used - 1) / key.quota_calls) * 100
-        new_pct = (projected_used / key.quota_calls) * 100
-        for threshold in (100, 80):
-            if prior_pct < threshold <= new_pct:
-                await self._webhooks.fire_quota_threshold(
-                    key_prefix=key.key_prefix, key_name=key.name, threshold=threshold,
-                    period=key.quota_period, period_start_iso=since_iso,
-                )
-                break  # only the highest newly-crossed threshold fires for a single call
 
     async def _record_usage(
         self, server: ServerRecord, tool_name: Optional[str], api_key_id: Optional[int],
     ) -> None:
-        """Increments the usage rollup for this call, in the SAME code path that emits the
-        tools/call audit event — called immediately alongside (never instead of)
-        self._audit.log for every tools/call decision (rate-limit block, quota block, policy
-        allow/deny alike), so a rollup total can never drift from a count of the audit rows
-        for the same window. See tests/integration/test_quotas.py's
-        TestRollupsMatchAuditRows for the test that proves this by direct comparison, and
-        AuditLogger.log's own docstring for the parallel "one write path" discipline this
-        mirrors.
-
-        Fails open exactly like _check_quota, for the same reason: a rollup WRITE failure is a
-        cost-visibility gap, not a security boundary, and must never turn into a 500 on an
-        otherwise-successful call.
-        """
-        if self._usage is None:
-            return
-        try:
-            await self._usage.increment(
-                ts_iso=utcnow(), api_key_id=api_key_id, server_id=server.id, tool=tool_name,
-                # Attribute the rollup to the SERVER's project (a server belongs to exactly
-                # one project; the calling key's project is checked for AGREEMENT with this in
-                # _authenticate below, not used as the attribution source here).
-                project_id=server.project_id,
-            )
-        except Exception:
-            logger.error(
-                "usage rollup write failed for api_key_id=%s server=%s tool=%s",
-                api_key_id, server.slug, tool_name, exc_info=True,
-            )
+        """Delegates to Metering.record_usage — see there for the "never drifts from the audit
+        rows" discipline and the fail-open rationale."""
+        await self._metering.record_usage(server, tool_name, api_key_id)
 
     class _CredentialResolutionFailed(Exception):
         """Internal-only signal carrying the already-built error Response — see
