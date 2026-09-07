@@ -16,6 +16,7 @@ produces one).
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -169,6 +170,53 @@ class TestAuthentication:
 
         # ...but the evaluation endpoint is not.
         assert (await _evaluate(transport, key=None)).status_code == 401
+
+
+class TestBodySizeGuard:
+    """Parity with the data plane's body-size limit.
+
+    Found by /security-scan: the guard originally checked only the declared Content-Length, so a
+    body sent with chunked transfer-encoding (no such header) bypassed it entirely — a 2MB
+    payload was accepted here while /mcp/{slug} returned 413 for the identical bytes. The issue
+    requires this endpoint not be weaker than the data plane it borrows from.
+    """
+
+    async def test_oversized_body_with_declared_length_is_refused(self, eval_app):
+        _, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client)
+        resp = await _evaluate(
+            transport, key, arguments={"command": "a" * 2_000_000},
+        )
+        assert resp.status_code == 413
+
+    async def test_oversized_body_without_content_length_is_refused(self, eval_app):
+        """The bypass case: chunked encoding sends no Content-Length at all."""
+        _, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client)
+
+        async def chunked():
+            yield json.dumps({
+                "server": slug, "tool_name": "bash",
+                "arguments": {"command": "a" * 2_000_000},
+            }).encode()
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as c:
+            resp = await c.post(
+                EVALUATE, content=chunked(),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            )
+        assert "content-length" not in {k.lower() for k in resp.request.headers}, (
+            "precondition: this request must not declare a Content-Length"
+        )
+        assert resp.status_code == 413
+
+    async def test_normal_body_is_unaffected(self, eval_app):
+        """Positive control — the guard must not reject ordinary requests."""
+        _, admin_client, transport, slug, _ = eval_app
+        key = await _mint_key(admin_client)
+        assert (await _evaluate(
+            transport, key, arguments={"command": "ls -la"}
+        )).status_code == 200
 
 
 class TestDecision:

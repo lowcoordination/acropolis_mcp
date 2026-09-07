@@ -99,13 +99,18 @@ def build_policy_evaluation_router(
         arrives in the request BODY, not the path, so they run in the handler once the body is
         parsed. This mirrors how archon/api.py's create_server handles a body-named project.
 
-        The size guard is advisory, and deliberately described as such: FastAPI has already
-        buffered the body by the time a handler runs, so the data plane's _read_body_guarded
-        cannot apply here, and a request that lies about Content-Length or uses chunked encoding
-        defeats this check. The real backstop for an oversized body on a FastAPI route is the
-        ASGI server's own limit — a deployment concern, see docs/tls-and-reverse-proxy.md. It
-        reuses settings.max_body_bytes so an operator tuning that knob gets consistent behaviour
-        across both surfaces.
+        The size guard mirrors the data plane's _read_body_guarded in BOTH of its steps, and
+        both are load-bearing. Checking only the declared Content-Length is not enough: a
+        request that omits the header (chunked transfer-encoding) or lies about it sails past
+        that check, and the body still reaches the regex engine. A security scan caught exactly
+        that — a 2MB body with no Content-Length was accepted here while the data plane returned
+        413 for the identical payload. So the ACTUAL byte length is checked too, after
+        `request.body()` (which is already buffered and cached by Starlette at this point, so
+        reading it here costs nothing and does not consume the stream the handler's parsed
+        `body` argument comes from).
+
+        Reuses settings.max_body_bytes, so an operator tuning that knob gets consistent
+        behaviour across both surfaces.
         """
         content_length = request.headers.get("content-length")
         if content_length:
@@ -115,6 +120,8 @@ def build_policy_evaluation_router(
                 raise HTTPException(status_code=400, detail="invalid content-length header")
             if declared > settings.max_body_bytes:
                 raise HTTPException(status_code=413, detail="payload too large")
+        if len(await request.body()) > settings.max_body_bytes:
+            raise HTTPException(status_code=413, detail="payload too large")
 
         auth_header = request.headers.get("authorization", "")
         if not auth_header.lower().startswith("bearer "):
