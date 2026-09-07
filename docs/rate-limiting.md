@@ -92,6 +92,22 @@ A refusal caused by the backend being down is recorded with `rule = rate_limit_b
 distinct from a genuine over-limit refusal (`rule = rate_limit`). A spike of the former means go
 look at Valkey; a spike of the latter means the configured limit is doing its job.
 
+## Policy evaluations share the same buckets
+
+`POST /api/v1/policy/evaluate` (see [the policy cookbook](policy-cookbook.md#evaluating-a-call-without-making-it))
+is rate limited on the **same** `srv:{slug}` bucket as data-plane calls, not a namespace of its
+own. A server limited to `5/minute` allows five requests per minute *across both surfaces
+combined*.
+
+That is deliberate. Separate buckets would let a caller double its effective budget by
+alternating between `/mcp/{slug}` and the evaluation endpoint — isolation in name, a bypass in
+practice. Both surfaces run the same regex engine, including the forkserver subprocess for
+patterns re2 rejects, so both deserve the same meter.
+
+**Operational consequence:** a local guard adapter evaluates every proposed tool call, which can
+be far more requests than the server's real traffic. Size the limit for evaluations plus calls,
+not calls alone.
+
 ## Behaviour is identical across backends
 
 A spec like `5/minute` means the same thing in both backends — same continuous-refill token

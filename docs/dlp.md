@@ -130,6 +130,14 @@ The same discipline applies to webhook payloads (`stoa/webhooks.py`): a `blocked
 carries `dlp_detector` (the name) but never the matched value, consistent with that feature's
 existing exclusion of `args_summary` from every webhook payload.
 
+The invariant extends to API responses. `Decision.dlp_redacted_arguments` — the caller's
+arguments with matches substituted, safe to forward upstream — must reach **neither an audit row,
+nor a webhook, nor a trace, nor an API response**. `POST /api/v1/policy/evaluate` returns a
+four-field body built field-by-field from the `Decision` (never `**asdict(decision)`) with
+`extra="forbid"` on the response model, so a future field added to `Decision` cannot ride along
+into a response by default. Only `argus/pipeline.py` ever reads that field, to rebuild the
+forwarded body.
+
 ## ReDoS safety on custom patterns
 
 `dlp_custom_patterns` are operator-supplied regex — untrusted input, exactly the attack surface

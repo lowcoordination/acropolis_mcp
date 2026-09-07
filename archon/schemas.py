@@ -5,7 +5,7 @@ import socket
 from typing import Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from db.models import SLUG_RE, DlpCustomPattern, ParamRule, ServerPolicy
 
@@ -239,6 +239,55 @@ class ToolTestResponse(BaseModel):
     status_code: Optional[int]
     latency_ms: Optional[int]
     upstream_response: Optional[dict] = None
+
+
+class PolicyEvaluateRequest(BaseModel):
+    """A proposed tool call to evaluate against a server's policy, WITHOUT executing it (#122).
+
+    Deliberately carries no origin/harness/host field. #123 will decide whether that metadata is
+    caller-asserted (and therefore untrusted, needing its own validation before it may reach an
+    audit row) or derived; shipping a half-designed field now would create a compatibility
+    obligation for a design that has not happened yet.
+    """
+
+    server: str
+    # The data plane validates only `isinstance(tool_name, str)`; a bound is added here because
+    # this value is used to key a rate-limit bucket, and an unbounded name would be pointlessly
+    # expensive to hash. 256 is far above any legitimate MCP tool name.
+    tool_name: str = Field(max_length=256)
+    arguments: dict = {}
+
+
+class PolicyEvaluateResponse(BaseModel):
+    """The four-field Decision contract from #122. Deliberately minimal — it can be widened
+    later, never narrowed.
+
+    `extra="forbid"` plus FIELD-BY-FIELD construction at the call site (never
+    `PolicyEvaluateResponse(**asdict(decision))`) is the structural guarantee behind
+    docs/dlp.md's audit-safety invariant: `Decision.dlp_redacted_arguments` carries the
+    caller's arguments with secrets substituted, is safe to forward upstream, and must never
+    reach an audit row, a webhook, a trace, or — as of this endpoint — an API response.
+    Pydantic would drop an unknown key anyway; relying on that implicit behaviour is exactly
+    what that invariant says not to do.
+
+    `args_summary` is excluded on purpose too: echoing a redacted summary of the caller's own
+    input back to them adds attack surface with no value, and it keeps #125's inline-secret gap
+    confined to the audit row with no response-side exposure at all.
+
+    On `matched`: for a `block_pattern` violation this is the OPERATOR's regex
+    (`compiled.pattern`), for `denied_param` the parameter name, and for `max_length` a
+    synthesized "len=500 exceeds max=100". None of them echo argument CONTENT — which is why
+    returning this field is safe. If a future change ever makes `matched` the actually-matched
+    substring, this response silently becomes a data-exfiltration channel; that change must not
+    be made without revisiting this contract.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    blocked: bool
+    reason: Optional[str] = None
+    rule: Optional[str] = None
+    matched: Optional[str] = None
 
 
 # Security-scan finding: SQLite's INTEGER column is a 64-bit signed value; a quota_calls sent
