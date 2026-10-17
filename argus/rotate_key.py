@@ -146,12 +146,6 @@ class TokenKeyManager:
             self._fingerprint = fingerprint
         return self._issuer
 
-    async def reload(self) -> TokenIssuer | None:
-        """Force the next ``current()`` to re-read and rebuild (used by tests and any future
-        operator-facing "reload keys" affordance)."""
-        self._fingerprint = None
-        return await self.current()
-
     async def _read_state(self) -> tuple[str | None, str | None, str | None]:
         active = await self._repo.get(ACTIVE_REF_KEY) or getattr(
             self._settings, "token_signing_key_ref", None
