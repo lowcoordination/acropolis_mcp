@@ -190,9 +190,9 @@ def create_app(
     # first-request failure.
     secret_provider = build_secret_provider(settings)
     # Issue #134 Task 4: owns the live TokenIssuer and re-loads it when a `rotate-signing-key`
-    # run persists new rotation state. Constructed (no I/O) here so the JWKS route and, later,
-    # Task 3's injection share ONE issuer; the first current() call happens in lifespan below as
-    # the fail-loud-at-boot point.
+    # run persists new rotation state. Constructed (no I/O) here so the JWKS route and T3's
+    # injection share ONE issuer; the first current() call happens in lifespan below as the
+    # fail-loud-at-boot point.
     token_key_manager = TokenKeyManager(settings, secret_provider, settings_repo)
     # Built once at startup, same shape as secret_provider above — reads ACROPOLIS_OTEL_ENABLED
     # / ACROPOLIS_OTEL_SAMPLE_RATIO from the environment. init() (called in lifespan below, not

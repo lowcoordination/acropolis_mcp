@@ -5,8 +5,10 @@ Two halves live here:
 1. **``TokenKeyManager``** — what a RUNNING app uses to hold the live ``TokenIssuer`` and to
    pick up a rotation without a restart. It re-reads the persisted rotation state (the ``settings``
    table plus the env bootstrap) and rebuilds the issuer only when that state's fingerprint
-   changes. The public JWKS route goes through ``current()``; token injection (T3) receives the
-   issuer produced by the first ``current()`` at boot.
+   changes. The public JWKS route goes through ``current()``, so a rotation is visible there
+   immediately; token injection (T3) receives the issuer produced by the first ``current()`` at
+   boot, so wiring injection to the manager (so a rotation also flips the signer the pipeline and
+   health poller use) is the rotation-drill follow-up (T6).
 
 2. **``rotate_signing_key``** — the operator-facing rotation sequence, wrapped by the
    ``argus rotate-signing-key`` CLI. It mirrors ``argus/reencrypt.py`` in shape: dry-run by
