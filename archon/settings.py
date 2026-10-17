@@ -109,13 +109,15 @@ class Settings(BaseSettings):
     vault_ttl_seconds: float = 60.0
 
     # Issue #134 (Task 1): the signing key Acropolis uses to mint audience-bound JWTs for the
-    # upstream hop (argus/tokens.py). The private half is EITHER a secret-provider reference
-    # (enc:v1:.../vault://..., the recommended form — key material stays out of Settings) OR, for
-    # the `local` tier, a PEM literal (same convention as a literal upstream_auth_header: the
-    # local provider passes it through unchanged). The public half is DERIVED from it by the
-    # issuer and never stored separately. Unset (the default) = no issuer configured =
-    # credential_mode='token' is rejected at the API layer (Task 3). Resolved through the secret
-    # provider at boot — see TokenIssuer.from_settings.
+    # upstream hop (argus/tokens.py). This holds a SECRET-PROVIDER REFERENCE (enc:v1:... /
+    # vault://...) and is resolved at boot — see TokenIssuer.from_settings. It deliberately does
+    # NOT accept inline key material, for the same reason the encrypted provider's key is read
+    # straight from os.environ rather than modeled as a Settings field: a PEM literal here would
+    # put a long-lived signing key in a repr()-able field populated from an env var — the exact
+    # k3s#66 exposure issue #134 exists to close. Token signing therefore requires the 'encrypted'
+    # or 'openbao' provider (the default 'local' provider has no reference to resolve). The public
+    # half is DERIVED by the issuer and never stored separately. Unset (default) = no issuer =
+    # credential_mode='token' is rejected at the API layer (Task 3).
     token_signing_key_ref: str | None = None
 
     # block_pattern / DLP custom-pattern regex matching (argus/policy.py, issue #106). Both

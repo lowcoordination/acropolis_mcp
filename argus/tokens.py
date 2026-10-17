@@ -115,17 +115,6 @@ def _derive_kid(public_key) -> str:
     return _b64url(hashlib.sha256(der).digest())
 
 
-def _ref_label(ref: str) -> str:
-    """A log/error-safe rendering of a ``token_signing_key_ref``.
-
-    The ref is EITHER a reference string (``enc:v1:...``/``vault://...``, safe to echo) OR a raw
-    PEM literal under the ``local`` provider — and a PEM literal IS the private key, so it must
-    never appear in an error message or log line. ``is_reference``'s allowlist is the same test
-    the rest of the codebase uses to decide what's safe to display.
-    """
-    return ref if is_reference(ref) else "<PEM literal>"
-
-
 class _CachedToken:
     """Per-slug cache entry. ``refreshing`` deduplicates the background refresh task so N
     concurrent requests inside the refresh window schedule ONE re-mint, not N."""
@@ -177,18 +166,35 @@ class TokenIssuer:
         credential uses — so ``enc:v1:``/``vault://`` references work identically, and a
         misconfigured ref raises ``TokenIssuerConfigError`` before the app starts rather than on
         the first tool call (the fail-loud-at-boot posture).
+
+        The ref must be a REFERENCE, never inline key material: a PEM literal in this field
+        would put the long-lived signing key in a pydantic Settings field populated from the
+        process environment — the exact k3s#66 exposure issue #134 exists to close — so a
+        non-reference ref is rejected outright below. Token signing therefore requires the
+        ``encrypted`` or ``openbao`` secret provider; the default ``local`` provider (an
+        identity resolve) has no reference to resolve and cannot hold a signing key.
         """
         ref = getattr(settings, "token_signing_key_ref", None)
         if not ref:
             return None
+        if not is_reference(ref):
+            # Deliberately do NOT echo `ref` — at this point it is (or could be) inline key
+            # material, so the message states the contract without quoting the value.
+            raise TokenIssuerConfigError(
+                "token_signing_key_ref must be a secret-provider reference (enc:v1:... or "
+                "vault://...), not inline key material. An inline PEM would place the "
+                "long-lived signing key in the process environment (readable from "
+                "/proc/<pid>/environ — see issue #134, k3s#66). Use the 'encrypted' or "
+                "'openbao' secret provider and reference the key there."
+            )
         try:
             pem = await secret_provider.resolve(ref)
         except SecretResolutionError as exc:
             # Deliberately exc.reason, NOT str(exc): SecretResolutionError's message embeds the
-            # original ref, and for a PEM literal the ref IS the private key. reason is always
-            # key-material-free by construction (see that class's docstring).
+            # original ref, which is verbose ciphertext/path noise we don't want in a boot
+            # failure; reason is the concise operator-facing cause by construction.
             raise TokenIssuerConfigError(
-                f"token signing key {_ref_label(ref)} is unresolvable: {exc.reason}"
+                f"token signing key {ref} is unresolvable: {exc.reason}"
             ) from exc
         try:
             private_key = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
@@ -197,12 +203,11 @@ class TokenIssuer:
             # private key is encrypted") — safe to include, and the encrypted-PEM case is exactly
             # the operator hint we want to surface rather than swallow.
             raise TokenIssuerConfigError(
-                f"token signing key {_ref_label(ref)} did not resolve to a usable PEM private "
-                f"key: {exc}"
+                f"token signing key {ref} did not resolve to a usable PEM private key: {exc}"
             ) from exc
         if not isinstance(private_key, rsa.RSAPrivateKey):
             raise TokenIssuerConfigError(
-                f"token signing key {_ref_label(ref)} resolved to a non-RSA key; RS256 "
+                f"token signing key {ref} resolved to a non-RSA key; RS256 "
                 "requires an RSA keypair"
             )
         return cls(private_key)

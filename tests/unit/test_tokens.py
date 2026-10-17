@@ -2,8 +2,8 @@
 
 Verification bar per the issue contract: claim shape (iss/aud/exp/kid), TTL math, refresh-at-80%
 with no blocking after the first mint, jwks() exposes ONLY public key material, kid is stable
-across restarts, and from_settings fails loud on an unresolvable ref — while never leaking the
-PEM literal (the local-tier case where the ref IS the private key).
+across restarts, and from_settings fails loud on an unresolvable ref — and rejects inline key
+material outright (a PEM literal must never reach the key loader or an error message).
 
 These tests deliberately do NOT verify with a third-party JWT library — the verifier half of
 this contract is the Go middleware, pinned to this implementation via the shared conformance
@@ -214,16 +214,19 @@ async def test_from_settings_returns_none_when_unset():
     assert await TokenIssuer.from_settings(Settings(), LocalSecretProvider()) is None
 
 
-async def test_from_settings_resolves_pem_literal_via_local():
-    private_key, pem = _generate_rsa_key()
-    issuer = await TokenIssuer.from_settings(
-        Settings(token_signing_key_ref=pem), LocalSecretProvider()
-    )
-    assert issuer is not None
-    assert issuer.kid == tokens._derive_kid(private_key.public_key())
-    header, payload, _, _ = _decode_token(await issuer.get_token("slug"))
-    assert header["kid"] == issuer.kid
-    assert payload["iss"] == "acropolis"
+async def test_from_settings_rejects_inline_pem_literal():
+    """#134 remediation: token_signing_key_ref must be a reference, never inline key material —
+    a PEM literal would put the long-lived signing key in a repr()-able Settings field populated
+    from an env var (the k3s#66 exposure the design exists to close)."""
+    _, pem = _generate_rsa_key()
+    with pytest.raises(TokenIssuerConfigError) as exc_info:
+        await TokenIssuer.from_settings(
+            Settings(token_signing_key_ref=pem), LocalSecretProvider()
+        )
+    message = str(exc_info.value)
+    assert "reference" in message
+    # The rejection must not echo the key material it just refused to hold.
+    assert pem not in message
 
 
 async def test_from_settings_resolves_reference_via_provider():
@@ -270,35 +273,10 @@ async def test_from_settings_raises_on_unresolvable_ref():
     assert "Vault returned HTTP 403" in message
 
 
-async def test_from_settings_raises_on_non_pem():
-    with pytest.raises(TokenIssuerConfigError, match="PEM"):
-        await TokenIssuer.from_settings(
-            Settings(token_signing_key_ref="this is not a key"),
-            LocalSecretProvider(),
-        )
-
-
-async def test_from_settings_raises_on_non_rsa_key():
-    ec_key = ec.generate_private_key(ec.SECP256R1())
-    ec_pem = ec_key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    ).decode("ascii")
-    with pytest.raises(TokenIssuerConfigError, match="non-RSA"):
-        await TokenIssuer.from_settings(
-            Settings(token_signing_key_ref=ec_pem), LocalSecretProvider()
-        )
-
-
-async def test_error_message_never_leaks_pem_literal():
-    """The local-tier shape is a PEM literal, where the ref IS the private key. A failure path
-    must not echo it into logs/errors — use SecretResolutionError.reason, not str(exc)."""
-    _, pem = _generate_rsa_key()
-
-    class _LeakyRefProvider:
+async def test_from_settings_raises_on_reference_resolving_to_non_pem():
+    class _GarbageProvider:
         async def resolve(self, ref):
-            raise SecretResolutionError(ref, "decryption failed")
+            return "this is not a key"
 
         async def store(self, ref, value):
             raise NotImplementedError
@@ -306,11 +284,33 @@ async def test_error_message_never_leaks_pem_literal():
         async def delete(self, ref):
             raise NotImplementedError
 
-    with pytest.raises(TokenIssuerConfigError) as exc_info:
+    with pytest.raises(TokenIssuerConfigError, match="PEM"):
         await TokenIssuer.from_settings(
-            Settings(token_signing_key_ref=pem), _LeakyRefProvider()
+            Settings(token_signing_key_ref="vault://acropolis/token-signing#key"),
+            _GarbageProvider(),
         )
-    message = str(exc_info.value)
-    assert pem not in message
-    assert "decryption failed" in message
-    assert "<PEM literal>" in message
+
+
+async def test_from_settings_raises_on_reference_resolving_to_non_rsa_key():
+    ec_key = ec.generate_private_key(ec.SECP256R1())
+    ec_pem = ec_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+
+    class _EcProvider:
+        async def resolve(self, ref):
+            return ec_pem
+
+        async def store(self, ref, value):
+            raise NotImplementedError
+
+        async def delete(self, ref):
+            raise NotImplementedError
+
+    with pytest.raises(TokenIssuerConfigError, match="non-RSA"):
+        await TokenIssuer.from_settings(
+            Settings(token_signing_key_ref="vault://acropolis/token-signing#key"),
+            _EcProvider(),
+        )
