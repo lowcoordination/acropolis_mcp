@@ -115,6 +115,59 @@ def _derive_kid(public_key) -> str:
     return _b64url(hashlib.sha256(der).digest())
 
 
+def _build_jwk(public_key, kid: str) -> dict:
+    """Serialize a public key as its RFC 7517/7518 RSA JWK (public material only — ``kty``/``n``/
+    ``e``/``alg``/``use``/``kid``; never ``d``/``p``/``q``/...).
+
+    Shared by the active key and by previously-active keys still in their rotation overlap window.
+    """
+    numbers = public_key.public_numbers()
+    return {
+        "kty": _KEY_TYPE,
+        "use": _KEY_USE,
+        "alg": _ALGORITHM,
+        "kid": kid,
+        "n": _b64url(_int_to_bytes(numbers.n)),
+        "e": _b64url(_int_to_bytes(numbers.e)),
+    }
+
+
+async def _resolve_rsa_private_key(ref: str, secret_provider: SecretProvider):
+    """Resolve a secret-provider reference to a validated RSA private key.
+
+    Shared by ``TokenIssuer.from_settings`` (the env-driven boot path) and the rotation manager
+    in ``argus/rotate_key.py`` (the DB-driven re-load path) so both fail the SAME way: resolve
+    failures and non-PEM/non-RSA material raise ``TokenIssuerConfigError`` that names the ref
+    and the reason but never the key material. The per-step comments carry the discipline from
+    ``from_settings``'s original inline implementation (why ``exc.reason``, not ``str(exc)``; why
+    the PEM error message is safe to include).
+    """
+    try:
+        pem = await secret_provider.resolve(ref)
+    except SecretResolutionError as exc:
+        # Deliberately exc.reason, NOT str(exc): SecretResolutionError's message embeds the
+        # original ref, which is verbose ciphertext/path noise we don't want in a boot
+        # failure; reason is the concise operator-facing cause by construction.
+        raise TokenIssuerConfigError(
+            f"token signing key {ref} is unresolvable: {exc.reason}"
+        ) from exc
+    try:
+        private_key = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+        # These messages are generic ("could not deserialize", "password was not given but
+        # private key is encrypted") — safe to include, and the encrypted-PEM case is exactly
+        # the operator hint we want to surface rather than swallow.
+        raise TokenIssuerConfigError(
+            f"token signing key {ref} did not resolve to a usable PEM private key: {exc}"
+        ) from exc
+    if not isinstance(private_key, rsa.RSAPrivateKey):
+        raise TokenIssuerConfigError(
+            f"token signing key {ref} resolved to a non-RSA key; RS256 "
+            "requires an RSA keypair"
+        )
+    return private_key
+
+
 class _CachedToken:
     """Per-slug cache entry. ``refreshing`` deduplicates the background refresh task so N
     concurrent requests inside the refresh window schedule ONE re-mint, not N."""
@@ -139,6 +192,7 @@ class TokenIssuer:
         *,
         ttl_seconds: float = TOKEN_TTL_SECONDS,
         refresh_fraction: float = REFRESH_FRACTION,
+        previous: tuple[tuple[object, float], ...] = (),
     ):
         if not isinstance(private_key, rsa.RSAPrivateKey):
             raise TokenIssuerConfigError("TokenIssuer requires an RSA private key (RS256)")
@@ -151,9 +205,16 @@ class TokenIssuer:
         self._ttl = ttl_seconds
         self._refresh_after = ttl_seconds * refresh_fraction
         self._kid = _derive_kid(self._public_key)
-        self._public_jwk = self._build_public_jwk()
+        self._public_jwk = _build_jwk(self._public_key, self._kid)
         # One token per slug; values are _CachedToken entries. Never persisted, never logged.
         self._cache: dict[str, _CachedToken] = {}
+        # Previously-active keys still PUBLISHED (not signing) for the rotation overlap window,
+        # keyed by kid -> (public_jwk, drop_at_epoch). Dropped lazily once the overlap elapses —
+        # see _drop_expired_previous. The constructor takes these so a restarted app re-loads an
+        # in-flight overlap from the rotation state (argus/rotate_key.py) rather than losing it.
+        self._previous: dict[str, tuple[dict, float]] = {}
+        for prev_key, drop_at in previous:
+            self._add_previous(prev_key, drop_at)
 
     @classmethod
     async def from_settings(
@@ -187,30 +248,7 @@ class TokenIssuer:
                 "/proc/<pid>/environ — see issue #134, k3s#66). Use the 'encrypted' or "
                 "'openbao' secret provider and reference the key there."
             )
-        try:
-            pem = await secret_provider.resolve(ref)
-        except SecretResolutionError as exc:
-            # Deliberately exc.reason, NOT str(exc): SecretResolutionError's message embeds the
-            # original ref, which is verbose ciphertext/path noise we don't want in a boot
-            # failure; reason is the concise operator-facing cause by construction.
-            raise TokenIssuerConfigError(
-                f"token signing key {ref} is unresolvable: {exc.reason}"
-            ) from exc
-        try:
-            private_key = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
-        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
-            # These messages are generic ("could not deserialize", "password was not given but
-            # private key is encrypted") — safe to include, and the encrypted-PEM case is exactly
-            # the operator hint we want to surface rather than swallow.
-            raise TokenIssuerConfigError(
-                f"token signing key {ref} did not resolve to a usable PEM private key: {exc}"
-            ) from exc
-        if not isinstance(private_key, rsa.RSAPrivateKey):
-            raise TokenIssuerConfigError(
-                f"token signing key {ref} resolved to a non-RSA key; RS256 "
-                "requires an RSA keypair"
-            )
-        return cls(private_key)
+        return cls(await _resolve_rsa_private_key(ref, secret_provider))
 
     @property
     def kid(self) -> str:
@@ -218,17 +256,50 @@ class TokenIssuer:
         return self._kid
 
     def jwks(self) -> dict:
-        """The public half of the keypair as a standard JWKS document (``{"keys": [...]}``).
+        """The public half of every published keypair as a standard JWKS document
+        (``{"keys": [...]}``) — the ACTIVE key first, then any previously-active keys still in
+        their overlap window. During rotation that is BOTH ``kid``s, which is what lets a server
+        that cached the old key keep verifying until it sees a new-``kid`` token and refetches.
 
         Contains ONLY public material (``kty``/``n``/``e``/``alg``/``use``/``kid``); the private
         components (``d``/``p``/``q``/...) are never serialized. Task 4 serves this at
         ``/.well-known/jwks.json`` unauthenticated — it is public by definition.
         """
-        return {"keys": [self._public_jwk]}
+        self._drop_expired_previous()
+        return {"keys": [self._public_jwk] + [jwk for jwk, _ in self._previous.values()]}
+
+    def _add_previous(self, private_key, drop_at: float) -> None:
+        """Register a previously-active key to stay PUBLISHED (not signing) until ``drop_at``.
+
+        Validated as RSA at add time — the same fail-loud discipline as the active key — so a
+        misconfigured previous-key reference surfaces when the issuer is (re)loaded, not on the
+        first JWKS request.
+        """
+        if not isinstance(private_key, rsa.RSAPrivateKey):
+            raise TokenIssuerConfigError(
+                "TokenIssuer previous keys must be RSA private keys (RS256)"
+            )
+        public_key = private_key.public_key()
+        kid = _derive_kid(public_key)
+        self._previous[kid] = (_build_jwk(public_key, kid), float(drop_at))
+
+    def _drop_expired_previous(self) -> None:
+        """Drop any previously-active key whose overlap window has elapsed.
+
+        Lazy by design: rotation is a rare operator event and JWKS/mint are hot paths, so the
+        drop is folded into those calls rather than a dedicated timer. The comparison uses the
+        same wall-clock source (``_epoch_seconds``) the overlap deadline was computed from, so
+        tests can advance it deterministically.
+        """
+        now = _epoch_seconds()
+        expired = [kid for kid, (_jwk, drop_at) in self._previous.items() if drop_at <= now]
+        for kid in expired:
+            del self._previous[kid]
 
     async def get_token(self, slug: str) -> str:
         """Return the slug's current token, minting only when necessary (see module docstring's
         cache semantics). Never raises SecretResolutionError — the key is already in memory."""
+        self._drop_expired_previous()
         now = _monotonic()
         entry = self._cache.get(slug)
         if entry is None or now >= entry.expires_at:
@@ -271,13 +342,4 @@ class TokenIssuer:
         )
         return f"{signing_input}.{_b64url(signature)}"
 
-    def _build_public_jwk(self) -> dict:
-        numbers = self._public_key.public_numbers()
-        return {
-            "kty": _KEY_TYPE,
-            "use": _KEY_USE,
-            "alg": _ALGORITHM,
-            "kid": self._kid,
-            "n": _b64url(_int_to_bytes(numbers.n)),
-            "e": _b64url(_int_to_bytes(numbers.e)),
-        }
+

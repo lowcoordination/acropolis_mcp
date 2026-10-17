@@ -25,6 +25,7 @@ from argus.pipeline import Pipeline
 from argus.policy import warm_forkserver
 from argus.rate_limiter import RateLimiterRegistry
 from argus.policy_api import build_policy_evaluation_router
+from argus.rotate_key import TokenKeyManager
 from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
 from argus.tracing import build_tracing_manager
@@ -188,6 +189,11 @@ def create_app(
     # missing admin_token or a bad webhook_url would, rather than surfacing as a mysterious
     # first-request failure.
     secret_provider = build_secret_provider(settings)
+    # Issue #134 Task 4: owns the live TokenIssuer and re-loads it when a `rotate-signing-key`
+    # run persists new rotation state. Constructed (no I/O) here so the JWKS route and, later,
+    # Task 3's injection share ONE issuer; the first current() call happens in lifespan below as
+    # the fail-loud-at-boot point.
+    token_key_manager = TokenKeyManager(settings, secret_provider, settings_repo)
     # Built once at startup, same shape as secret_provider above — reads ACROPOLIS_OTEL_ENABLED
     # / ACROPOLIS_OTEL_SAMPLE_RATIO from the environment. init() (called in lifespan below, not
     # here) is where the actual OTel SDK / OTLP exporter gets built (or, if
@@ -282,6 +288,11 @@ def create_app(
         # than raising, since tracing is an observability nice-to-have, not a security control
         # the gateway should refuse to start without.
         tracing.init()
+        # Issue #134 Task 4: resolve the token issuer at startup — the fail-loud-at-boot posture
+        # carried over from secret_provider's construction. current() loads the active signing key
+        # (and any in-flight rotation overlap) and raises TokenIssuerConfigError on an
+        # unresolvable ref, aborting boot rather than surfacing as a 500 on the first JWKS hit.
+        await token_key_manager.current()
         # Issue #106: spend the forkserver's one-time cold-start cost here (measured ~5x a warm
         # match) rather than on whichever request happens to arrive first. Also logs a boot-time
         # warning if even a warm match on this host already eats a large fraction of the
@@ -350,6 +361,7 @@ def create_app(
     app.state.webhook_dispatcher = webhook_dispatcher
     app.state.config_source = config_source
     app.state.secret_provider = secret_provider
+    app.state.token_key_manager = token_key_manager
     app.state.tracing = tracing
     app.state.pipeline = pipeline
     app.state.aggregate_pipeline = aggregate_pipeline
@@ -380,6 +392,17 @@ def create_app(
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo, config_source))
+
+    # Issue #134 Task 4: the public JWKS route. Deliberately unauthenticated — the public half
+    # of the signing keypair is public by definition, and the fleet's mcp-authn middleware (Task
+    # 5) fetches it to verify tokens. Registered BEFORE the SPA catch-all so it is never shadowed;
+    # returns 404 when no issuer is configured (no key to publish).
+    @app.get("/.well-known/jwks.json", include_in_schema=False)
+    async def jwks_route(request: Request) -> Response:
+        issuer = await request.app.state.token_key_manager.current()
+        if issuer is None:
+            return Response(status_code=404, content="Not Found")
+        return JSONResponse(issuer.jwks())
 
     _mount_web_ui(app)
 

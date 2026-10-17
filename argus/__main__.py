@@ -9,9 +9,11 @@ import uvicorn
 
 from archon.config_io import export_config, plan_import
 from archon.importer import apply_import, parse_guard_config
+from archon.secrets import build_secret_provider
 from archon.settings import Settings
 from argus.app import create_app
 from argus.reencrypt import reencrypt_credentials
+from argus.rotate_key import rotate_signing_key
 from db.database import Database
 from db.repo import ServerRepo, SettingsRepo
 
@@ -226,6 +228,46 @@ async def _run_reencrypt(apply: bool) -> int:
         await db.close()
 
 
+async def _run_rotate(apply: bool) -> int:
+    """T4 (issue #134/#135): rotate the upstream-token signing key with an overlap window.
+
+    Generates a new RSA keypair, persists it via the configured secret provider, publishes BOTH
+    the old and new kids in the JWKS (the old key stays published for 2 × TTL = 20 min), and
+    signs with the new key. Dry-run is the default; --apply persists the rotation state to the
+    settings table, from which a running app picks it up without a restart (see
+    argus/rotate_key.py's module docstring). Exit code: 0 only when a dry run previews cleanly,
+    or an apply verified the new key is live and signing; 1 on any failure.
+    """
+    settings = Settings()
+    db = _make_db(settings)
+    await db.connect()
+    try:
+        provider = build_secret_provider(settings)
+        result = await rotate_signing_key(
+            settings, provider, SettingsRepo(db), dry_run=not apply
+        )
+        if result.error:
+            print(f"error: {result.error}", file=sys.stderr)
+            return 1
+        if apply:
+            if not result.verified:
+                print("error: rotation applied but the new key could not be verified live "
+                      "and signing", file=sys.stderr)
+                return 1
+            print(f"rotated signing key: {result.previous_kid} -> {result.new_kid}")
+            print(f"  previous key {result.previous_ref} stays published for "
+                  f"{result.overlap_seconds:.0f}s (2 × TTL) then drops")
+            print(f"  active key {result.new_ref}")
+            print("verified: new key is live and signing")
+        else:
+            print(f"would rotate signing key: {result.previous_kid} -> {result.new_kid}")
+            print(f"  previous key stays published for {result.overlap_seconds:.0f}s (2 × TTL)")
+            print("(dry run — re-run with --apply)")
+        return 0
+    finally:
+        await db.close()
+
+
 def cli() -> None:
     parser = argparse.ArgumentParser(prog="argus")
     subparsers = parser.add_subparsers(dest="command")
@@ -267,6 +309,15 @@ def cli() -> None:
         "--apply", action="store_true", help="Actually rewrite the credentials (default: dry run)"
     )
 
+    rotate_parser = subparsers.add_parser(
+        "rotate-signing-key", help="Rotate the upstream-token signing key with an overlap "
+        "window (T4, issue #134 — dry run unless --apply)"
+    )
+    rotate_parser.add_argument(
+        "--apply", action="store_true", help="Actually generate, publish, and switch the key "
+        "(default: dry run)"
+    )
+
     args = parser.parse_args()
 
     if args.command == "import":
@@ -280,6 +331,8 @@ def cli() -> None:
         raise SystemExit(exit_code)
     elif args.command == "reencrypt":
         raise SystemExit(asyncio.run(_run_reencrypt(args.apply)))
+    elif args.command == "rotate-signing-key":
+        raise SystemExit(asyncio.run(_run_rotate(args.apply)))
     else:
         _run_server()
 
