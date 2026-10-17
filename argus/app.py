@@ -27,6 +27,7 @@ from argus.rate_limiter import RateLimiterRegistry
 from argus.policy_api import build_policy_evaluation_router
 from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
+from argus.tokens import TokenIssuer
 from argus.tracing import build_tracing_manager
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database, PoolExhaustedError
@@ -282,6 +283,15 @@ def create_app(
         # than raising, since tracing is an observability nice-to-have, not a security control
         # the gateway should refuse to start without.
         tracing.init()
+        # Issue #134 (T3): construct the token issuer BEFORE any background job starts. If the
+        # signing key is configured but unresolvable, TokenIssuer.from_settings raises
+        # TokenIssuerConfigError and this lifespan raises — the app refuses to start (fail-loud
+        # at boot, same posture as a misconfigured secret provider). Returns None when no signing
+        # key is configured, in which case credential_mode='token' is rejected at the API layer.
+        token_issuer = await TokenIssuer.from_settings(settings, secret_provider)
+        app.state.token_issuer = token_issuer
+        pipeline.set_token_issuer(token_issuer)
+        health_poller.set_token_issuer(token_issuer)
         # Issue #106: spend the forkserver's one-time cold-start cost here (measured ~5x a warm
         # match) rather than on whichever request happens to arrive first. Also logs a boot-time
         # warning if even a warm match on this host already eats a large fraction of the
@@ -350,6 +360,7 @@ def create_app(
     app.state.webhook_dispatcher = webhook_dispatcher
     app.state.config_source = config_source
     app.state.secret_provider = secret_provider
+    app.state.token_issuer = None  # set in lifespan (async key load); None until then
     app.state.tracing = tracing
     app.state.pipeline = pipeline
     app.state.aggregate_pipeline = aggregate_pipeline

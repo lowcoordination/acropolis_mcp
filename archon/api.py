@@ -157,6 +157,7 @@ def _server_to_response(server, project_slugs_by_id: Optional[dict[int, str]] = 
         # never resolves" split the plan calls out as the thing that keeps secrets out of the UI.
         upstream_auth_header_is_reference=is_reference(server.upstream_auth_header),
         health_reason=server.health_reason,
+        credential_mode=server.credential_mode,
         project_id=server.project_id,
         project_slug=project_slugs_by_id.get(server.project_id) if server.project_id else None,
     )
@@ -304,6 +305,17 @@ def build_control_plane_router(
         if PROJECT_ROLE_RANK.get(role) is None or PROJECT_ROLE_RANK[role] < PROJECT_ROLE_RANK["admin"]:
             raise HTTPException(status_code=403, detail="insufficient project role")
 
+        # Issue #134 (T3): token mode needs a configured signing key. The schema enforces the
+        # enum; this enforces the cross-field invariant (mode=token requires an issuer) against
+        # runtime state — the issuer is None until lifespan runs, and stays None when
+        # ACROPOLIS_TOKEN_SIGNING_KEY_REF is unset.
+        if body.credential_mode == "token" and getattr(request.app.state, "token_issuer", None) is None:
+            raise HTTPException(
+                status_code=400,
+                detail="credential_mode='token' requires a token signing key "
+                        "(set ACROPOLIS_TOKEN_SIGNING_KEY_REF)",
+            )
+
         # Enterprise #5: what actually lands in the DB may differ from what the operator typed —
         # a literal typed while the `encrypted` tier is selected is encrypted here BEFORE it
         # ever reaches server_repo.create; a vault:// reference or a literal under `local`/
@@ -315,6 +327,7 @@ def build_control_plane_router(
                 enabled=body.enabled, in_aggregate=body.in_aggregate,
                 upstream_auth_header=stored_auth_header,
                 project_id=project_id,
+                credential_mode=body.credential_mode,
             )
         except SlugConflictError:
             raise HTTPException(status_code=409, detail=f"server slug '{body.slug}' already exists")
@@ -417,6 +430,15 @@ def build_control_plane_router(
             require_project_role("admin", project_id_param=None, server_slug_param="slug")
         ),
     ):
+        # Issue #134 (T3): same cross-field invariant as create_server — setting token mode needs
+        # a configured signing key. body.credential_mode is None unless explicitly provided.
+        if body.credential_mode == "token" and getattr(request.app.state, "token_issuer", None) is None:
+            raise HTTPException(
+                status_code=400,
+                detail="credential_mode='token' requires a token signing key "
+                        "(set ACROPOLIS_TOKEN_SIGNING_KEY_REF)",
+            )
+
         # F23: upstream_auth_header needs three states (unset/set-to-value/cleared-to-null),
         # which a plain `Optional[str] = None` field can't distinguish on its own — checking
         # model_fields_set tells us whether the key was present in the request body at all.
@@ -443,6 +465,7 @@ def build_control_plane_router(
                 slug, name=body.name, upstream_url=body.upstream_url,
                 enabled=body.enabled, in_aggregate=body.in_aggregate,
                 upstream_auth_header=auth_header_update,
+                credential_mode=body.credential_mode,
             )
         except ServerNotFoundError:
             raise HTTPException(status_code=404, detail="server not found")
