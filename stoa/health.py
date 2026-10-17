@@ -12,6 +12,7 @@ from archon.secrets import SecretProvider, SecretResolutionError
 from archon.secrets.local import LocalSecretProvider
 from argus.bridge import META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION
 from argus.headers import MCP_METHOD_HEADER
+from argus.tokens import TokenIssuer
 from argus.upstream import (
     CLIENT_INFO,
     MCP_2026_VERSION,
@@ -37,10 +38,15 @@ PROBE_TIMEOUT_SECONDS = 10.0
 # on probe_server below).
 SECRET_RESOLUTION_FAILURE_PREFIX = "secret resolution failed: "
 
+# Issue #134 (T3): the reason prefix when a token-mode probe can't mint its JWT — distinguishable
+# from a plain network failure (health_reason None) and from a secret-resolution failure above.
+TOKEN_MINT_FAILURE_PREFIX = "token mint failed: "
+
 
 async def probe_server(
     client: httpx.AsyncClient, handshake_cache: UpstreamHandshakeCache, server: ServerRecord,
     secret_provider: SecretProvider | None = None,
+    token_issuer: TokenIssuer | None = None,
 ) -> tuple[str, str | None, dict | None, str | None]:
     """Probe one server's generation and health.
 
@@ -80,7 +86,21 @@ async def probe_server(
     # upstream that doesn't actually need auth) — it is reported as its own distinguishable
     # unhealthy reason instead.
     resolved_auth_header: str | None = None
-    if server.upstream_auth_header:
+    if server.credential_mode == "token":
+        # Issue #134 (T3): a token-mode server needs its JWT on the probe too — a health check
+        # must carry the same credential a real tools/call does, or the server reads permanently
+        # unhealthy (probe 401s) while tools/call itself works. Mint via the startup-wired
+        # issuer; fail closed (unhealthy, distinguishable reason) if it's absent or the mint
+        # fails — never probe unauthenticated and misreport health.
+        if token_issuer is None:
+            return ("unhealthy", None, None, f"{TOKEN_MINT_FAILURE_PREFIX}token signing is not configured")
+        try:
+            resolved_auth_header = f"Bearer {await token_issuer.get_token(server.slug)}"
+        except Exception:
+            logger.exception("probe for '%s' could not mint a token", server.slug)
+            return ("unhealthy", None, None, f"{TOKEN_MINT_FAILURE_PREFIX}token mint failed")
+        headers["Authorization"] = resolved_auth_header
+    elif server.upstream_auth_header:
         try:
             resolved_auth_header = await secrets.resolve(server.upstream_auth_header)
         except SecretResolutionError as e:
@@ -176,6 +196,7 @@ class HealthPoller(BackgroundLoop):
         interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         webhook_dispatcher: Optional[WebhookDispatcher] = None,
         secret_provider: Optional[SecretProvider] = None,
+        token_issuer: Optional[TokenIssuer] = None,
     ):
         super().__init__()
         self._repo = server_repo
@@ -186,6 +207,16 @@ class HealthPoller(BackgroundLoop):
         # Defaults to LocalSecretProvider (pass-through) — see Pipeline's identical default and
         # rationale; app.py wires the real, settings-selected provider.
         self._secrets = secret_provider or LocalSecretProvider()
+        # Issue #134 (T3): the JWT issuer, wired by argus/app.py's lifespan after construction
+        # (same two-phase shape as Pipeline — see Pipeline.set_token_issuer). None = token mode
+        # unavailable, so token-mode probes fail closed (unhealthy) rather than probe bare.
+        self._token_issuer = token_issuer
+
+    def set_token_issuer(self, issuer: Optional[TokenIssuer]) -> None:
+        """Wire the issuer constructed at startup (argus/app.py's lifespan). None = token mode
+        unavailable — probe_server then reports token-mode servers unhealthy rather than probing
+        them unauthenticated."""
+        self._token_issuer = issuer
 
     async def poll_once(self) -> None:
         # Each _probe_and_store is wrapped individually so an exception in EITHER the probe or
@@ -214,7 +245,8 @@ class HealthPoller(BackgroundLoop):
 
     async def _probe_and_store(self, server: ServerRecord) -> None:
         health_status, protocol, discover_json, health_reason = await probe_server(
-            self._client, self._handshakes, server, secret_provider=self._secrets
+            self._client, self._handshakes, server, secret_provider=self._secrets,
+            token_issuer=self._token_issuer,
         )
         await self._repo.set_health(
             server.slug, health_status=health_status, upstream_protocol=protocol,

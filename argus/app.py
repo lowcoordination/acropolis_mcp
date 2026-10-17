@@ -288,11 +288,18 @@ def create_app(
         # than raising, since tracing is an observability nice-to-have, not a security control
         # the gateway should refuse to start without.
         tracing.init()
-        # Issue #134 Task 4: resolve the token issuer at startup — the fail-loud-at-boot posture
-        # carried over from secret_provider's construction. current() loads the active signing key
-        # (and any in-flight rotation overlap) and raises TokenIssuerConfigError on an
-        # unresolvable ref, aborting boot rather than surfacing as a 500 on the first JWKS hit.
-        await token_key_manager.current()
+        # Issue #134 (T3 + T4): construct the token issuer BEFORE any background job starts.
+        # T4's TokenKeyManager is the single loader — it resolves the active signing key AND any
+        # in-flight rotation overlap (both published kids during the overlap window), which the
+        # plain TokenIssuer.from_settings cannot see. If the signing key is configured but
+        # unresolvable, current() raises TokenIssuerConfigError and this lifespan raises — the app
+        # refuses to start (fail-loud at boot, same posture as a misconfigured secret provider).
+        # Returns None when no signing key is configured, in which case credential_mode='token'
+        # is rejected at the API layer.
+        token_issuer = await token_key_manager.current()
+        app.state.token_issuer = token_issuer
+        pipeline.set_token_issuer(token_issuer)
+        health_poller.set_token_issuer(token_issuer)
         # Issue #106: spend the forkserver's one-time cold-start cost here (measured ~5x a warm
         # match) rather than on whichever request happens to arrive first. Also logs a boot-time
         # warning if even a warm match on this host already eats a large fraction of the
@@ -362,6 +369,7 @@ def create_app(
     app.state.config_source = config_source
     app.state.secret_provider = secret_provider
     app.state.token_key_manager = token_key_manager
+    app.state.token_issuer = None  # set in lifespan (async key load); None until then
     app.state.tracing = tracing
     app.state.pipeline = pipeline
     app.state.aggregate_pipeline = aggregate_pipeline
