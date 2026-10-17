@@ -133,6 +133,7 @@ def _row_to_server(row: asyncpg.Record) -> ServerRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         upstream_auth_header=row["upstream_auth_header"],
+        credential_mode=row["credential_mode"],
         project_id=row["project_id"],
     )
 
@@ -352,6 +353,7 @@ class ServerRepo(_PoolAccess):
         enabled: bool = True,
         in_aggregate: bool = True,
         upstream_auth_header: Optional[str] = None,
+        credential_mode: str = "none",
         project_id: Optional[int] = None,
     ) -> ServerRecord:
         # [TRANSACTION + UNIQUE-violation catch] replaces gateway_write_lock.
@@ -386,11 +388,11 @@ class ServerRepo(_PoolAccess):
                     server_id = await conn.fetchval(
                         """INSERT INTO servers
                            (slug, name, upstream_url, enabled, in_aggregate, upstream_auth_header,
-                            created_at, updated_at, project_id)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                            credential_mode, created_at, updated_at, project_id)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                            RETURNING id""",
                         slug, name, upstream_url, enabled, in_aggregate,
-                        upstream_auth_header, now, now, project_id,
+                        upstream_auth_header, credential_mode, now, now, project_id,
                     )
                 except asyncpg.UniqueViolationError as e:
                     raise SlugConflictError(slug) from e
@@ -416,6 +418,7 @@ class ServerRepo(_PoolAccess):
         enabled: Optional[bool] = None,
         in_aggregate: Optional[bool] = None,
         upstream_auth_header: object = _UNSET,
+        credential_mode: Optional[str] = None,
     ) -> ServerRecord:
         current = await self.get(slug)
         # Placeholders are generated positionally ($1, $2, ...) rather than as literal "?"s. The
@@ -441,6 +444,11 @@ class ServerRepo(_PoolAccess):
             # "field explicitly set to null" — the None-means-omitted convention every other
             # field on this method uses would make it impossible to ever clear a credential.
             _next("upstream_auth_header", upstream_auth_header)
+        if credential_mode is not None:
+            # credential_mode is NOT NULL with a real 'none' default, so the plain
+            # None-means-omitted convention suffices here — no _UNSET sentinel needed, because
+            # there is no meaningful "clear" distinct from "set to 'none'".
+            _next("credential_mode", credential_mode)
         if not fields:
             return current
         _next("updated_at", utcnow())

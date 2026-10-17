@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from archon.settings import Settings
+from archon.config_io import export_config, plan_import
 from argus.app import create_app
 from db.database import Database
 from db.models import DlpCustomPattern, ParamRule, ServerPolicy
@@ -426,3 +427,49 @@ async def test_has_upstream_auth_header_true_for_reference_same_as_literal(clien
     fetch_body = fetch_resp.json()
     assert fetch_body["has_upstream_auth_header"] is False
     assert fetch_body["upstream_auth_header_is_reference"] is False
+
+
+# --------------------------------------------------------------------------- #134: credential_mode
+
+async def test_credential_mode_round_trips_through_export_import(tmp_path: Path):
+    """#134: credential_mode is a first-class server field on the config path — 'token' (and
+    'static') round-trip faithfully, while the default 'none' is omitted from the export so an
+    untouched server's committed file stays diffable. Re-importing an export of either kind must
+    report 'unchanged', not a spurious update."""
+    db = Database(tmp_path)
+    await db.connect()
+    server_repo = ServerRepo(db)
+    settings_repo = SettingsRepo(db)
+    try:
+        await server_repo.create(
+            slug="tokened", name="Tokened", upstream_url="http://127.0.0.1:9009/mcp",
+            credential_mode="token",
+        )
+        await server_repo.create(
+            slug="plain", name="Plain", upstream_url="http://127.0.0.1:9010/mcp",
+        )
+
+        exported = await export_config(server_repo, settings_repo)
+        tokened = next(s for s in exported.data["servers"] if s["slug"] == "tokened")
+        plain = next(s for s in exported.data["servers"] if s["slug"] == "plain")
+        assert tokened["credential_mode"] == "token"
+        assert "credential_mode" not in plain  # 'none' is omitted, never spelled out
+
+        plan = await plan_import(server_repo, settings_repo, exported.to_yaml())
+        server_kinds = {a.kind for a in plan.actions if a.target.startswith("server")}
+        assert server_kinds == {"unchanged"}, plan.actions
+
+        # An import that FLIPS the mode must actually write it — the round-trip is live, not
+        # just export-shaped.
+        doc = yaml.safe_dump({
+            "version": 1,
+            "servers": [{"slug": "plain", "name": "Plain",
+                         "upstream_url": "http://127.0.0.1:9010/mcp",
+                         "policy": {"mode": "passthrough"}, "credential_mode": "static"}],
+        })
+        applied = await plan_import(server_repo, settings_repo, doc, apply=True)
+        assert applied.ok, applied.errors
+        fetched = await server_repo.get("plain")
+        assert fetched.credential_mode == "static"
+    finally:
+        await db.close()

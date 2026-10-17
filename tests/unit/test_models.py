@@ -5,7 +5,7 @@ import re
 import pytest
 from pydantic import ValidationError
 
-from db.models import DlpCustomPattern, ParamRule, ServerPolicy
+from db.models import DlpCustomPattern, ParamRule, ServerPolicy, ServerRecord
 
 
 # ---------------------------------------------------------------------------
@@ -175,3 +175,19 @@ def test_server_policy_with_dlp_custom_patterns_round_trips_via_model_dump():
     dumped = policy.model_dump()
     rebuilt = ServerPolicy(**dumped)
     assert rebuilt == policy
+
+
+# ---------------------------------------------------------------------------
+# #134 — ServerRecord.credential_mode (upstream token auth)
+# ---------------------------------------------------------------------------
+
+def test_server_record_defaults_credential_mode_to_none():
+    """A server with no credential_mode configured defaults to 'none' — the byte-identical-to-
+    today behaviour. Enforcement is layered: the DB CHECK (0015) is the schema backstop,
+    archon/schemas.py (T3) validates at the API, archon/config_io.py at import."""
+    rec = ServerRecord(
+        id=1, slug="s", name="S", upstream_url="http://127.0.0.1:1/mcp",
+        enabled=True, in_aggregate=True,
+        created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00",
+    )
+    assert rec.credential_mode == "none"

@@ -18,7 +18,7 @@ import yaml
 from archon.schemas import _validate_upstream_url
 from archon.secrets import is_reference
 from db.database import utcnow
-from db.models import ServerPolicy
+from db.models import ServerPolicy, _VALID_CREDENTIAL_MODES
 from db.repo import ProjectNotFoundError, ProjectRepo, ServerNotFoundError, ServerRepo, SettingsRepo
 
 EXPORT_VERSION = 1
@@ -158,6 +158,12 @@ async def export_config(
                 servers_with_credentials.append(server.slug)
                 if include_credentials:
                     entry["upstream_auth_header"] = server.upstream_auth_header
+        # #134: credential_mode is not a secret, but 'none' is the default for every server that
+        # predates the feature — omit it (like the exclude_none policy dump above) so committed
+        # exports stay diffable and untouched servers don't churn. Only a non-default mode is
+        # spelled out.
+        if server.credential_mode != "none":
+            entry["credential_mode"] = server.credential_mode
         servers_out.append(entry)
 
     stored = await settings_repo.get_all()
@@ -227,6 +233,10 @@ class _ParsedServer:
     # project of an existing server", so importing an old-shaped file can't silently move a
     # server OUT of whatever project it's actually in today.
     project_slug: Optional[str] = None
+    # #134: None means "not present in the file" — plan_import leaves an existing server's mode
+    # untouched on update and defaults a new server to 'none' on create, so importing a pre-#134
+    # file can't flip a running server off its configured credential mechanism.
+    credential_mode: Optional[str] = None
 
 
 def _parse(yaml_text: str) -> tuple[list[_ParsedServer], dict[str, str], list[str]]:
@@ -294,6 +304,17 @@ def _parse(yaml_text: str) -> tuple[list[_ParsedServer], dict[str, str], list[st
             errors.append(f"server '{slug}': invalid policy: {e}")
             continue
 
+        credential_mode = raw.get("credential_mode")
+        if credential_mode is not None and credential_mode not in _VALID_CREDENTIAL_MODES:
+            # Reject a bad mode BEFORE it reaches the DB CHECK on apply — the CHECK is the
+            # authoritative backstop, but a clean plan error (rather than a CheckViolationError
+            # 500) is what keeps the dry-run preview honest.
+            errors.append(
+                f"server '{slug}': credential_mode must be one of "
+                f"{sorted(_VALID_CREDENTIAL_MODES)}, got {credential_mode!r}"
+            )
+            continue
+
         servers.append(
             _ParsedServer(
                 slug=slug,
@@ -304,6 +325,7 @@ def _parse(yaml_text: str) -> tuple[list[_ParsedServer], dict[str, str], list[st
                 policy=policy,
                 upstream_auth_header=raw.get("upstream_auth_header"),
                 project_slug=raw.get("project_slug"),
+                credential_mode=credential_mode,
             )
         )
 
@@ -378,6 +400,7 @@ async def plan_import(
                     enabled=parsed.enabled, in_aggregate=parsed.in_aggregate,
                     upstream_auth_header=parsed.upstream_auth_header,
                     project_id=target_project_id,
+                    credential_mode=parsed.credential_mode or "none",
                 )
                 await server_repo.set_policy(created.id, parsed.policy)
             continue
@@ -403,6 +426,10 @@ async def plan_import(
 
         if parsed.upstream_auth_header is not None:
             field_deltas.append("upstream_auth_header: (set from file)")
+        if parsed.credential_mode is not None and existing.credential_mode != parsed.credential_mode:
+            field_deltas.append(
+                f"credential_mode: {existing.credential_mode} -> {parsed.credential_mode}"
+            )
 
         if field_deltas:
             plan.actions.append(
@@ -412,6 +439,8 @@ async def plan_import(
                 update_kwargs: dict[str, Any] = {}
                 if parsed.upstream_auth_header is not None:
                     update_kwargs["upstream_auth_header"] = parsed.upstream_auth_header
+                if parsed.credential_mode is not None:
+                    update_kwargs["credential_mode"] = parsed.credential_mode
                 await server_repo.update(
                     slug=parsed.slug, name=parsed.name, upstream_url=parsed.upstream_url,
                     enabled=parsed.enabled, in_aggregate=parsed.in_aggregate,

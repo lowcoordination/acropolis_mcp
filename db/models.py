@@ -261,6 +261,13 @@ class ServerPolicy(BaseModel):
         return detectors
 
 
+# Issue #134 (upstream token auth): the three mechanisms by which Acropolis can authenticate to
+# an upstream server. Mirrors the DB CHECK in 0015_credential_mode.sql; kept as a module
+# constant (not an enum type) so archon/config_io.py and archon/schemas.py validate against the
+# same literal set without a shared TYPE coupling — same reasoning as _VALID_POLICY_MODES.
+_VALID_CREDENTIAL_MODES = {"none", "static", "token"}
+
+
 class ServerRecord(BaseModel):
     id: int
     slug: str
@@ -285,6 +292,15 @@ class ServerRecord(BaseModel):
     # Never echoed back in API responses that a non-admin could read; see ServerResponse in
     # archon/schemas.py, which deliberately omits this field entirely.
     upstream_auth_header: Optional[str] = None
+    # Issue #134 (upstream token auth): SELECTS the mechanism by which Acropolis authenticates
+    # to this server's upstream — 'none' | 'static' | 'token'. 'static' is the existing
+    # upstream_auth_header literal/reference path, verbatim; 'token' mints a short-lived
+    # audience-bound JWT (argus/tokens.py, injected in argus/pipeline.py) and ignores
+    # upstream_auth_header. Deliberately a bare str with NO field_validator, matching
+    # health_status: the DB CHECK (0015) is the schema-level enforcement, archon/schemas.py (T3)
+    # layers API-level validation, and archon/config_io.py validates on import. Default 'none' =
+    # today's behaviour; no server changes until an operator flips the mode.
+    credential_mode: str = "none"
     # Enterprise #4 (multi-tenancy, issue #5): the project this server belongs to. Nullable at
     # the type level only because a pre-migration/hand-edited row could theoretically have NULL
     # here (see 0011_projects.sql's header comment) — the application always sets this at create
