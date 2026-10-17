@@ -296,6 +296,30 @@ class TokenIssuer:
         for kid in expired:
             del self._previous[kid]
 
+    def replace_keys(self, active_private_key, previous: tuple[tuple[object, float], ...] = ()) -> None:
+        """Atomically swap the signing key and published-keys set IN PLACE.
+
+        This is the rotation hook: the manager (``argus/rotate_key.py``) mutates the SAME issuer
+        object it handed to the pipeline and health poller at boot, so those fixed references pick
+        up a ``rotate-signing-key`` run with no restart and no re-wiring. Replacing the object
+        instead would orphan every collaborator still holding the old one.
+
+        ``ttl_seconds``/``refresh_fraction`` are deliberately NOT touched — they are issuer-wide
+        config, not per-key material. The token cache is cleared so the next mint signs with the
+        new key; tokens already minted under the old key remain verifiable until the old kid is
+        dropped (the overlap window).
+        """
+        if not isinstance(active_private_key, rsa.RSAPrivateKey):
+            raise TokenIssuerConfigError("TokenIssuer requires an RSA private key (RS256)")
+        self._private_key = active_private_key
+        self._public_key = active_private_key.public_key()
+        self._kid = _derive_kid(self._public_key)
+        self._public_jwk = _build_jwk(self._public_key, self._kid)
+        self._previous = {}
+        for prev_key, drop_at in previous:
+            self._add_previous(prev_key, drop_at)
+        self._cache.clear()
+
     async def get_token(self, slug: str) -> str:
         """Return the slug's current token, minting only when necessary (see module docstring's
         cache semantics). Never raises SecretResolutionError — the key is already in memory."""

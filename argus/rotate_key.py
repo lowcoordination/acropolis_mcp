@@ -4,11 +4,12 @@ Two halves live here:
 
 1. **``TokenKeyManager``** — what a RUNNING app uses to hold the live ``TokenIssuer`` and to
    pick up a rotation without a restart. It re-reads the persisted rotation state (the ``settings``
-   table plus the env bootstrap) and rebuilds the issuer only when that state's fingerprint
-   changes. The public JWKS route goes through ``current()``, so a rotation is visible there
-   immediately; token injection (T3) receives the issuer produced by the first ``current()`` at
-   boot, so wiring injection to the manager (so a rotation also flips the signer the pipeline and
-   health poller use) is the rotation-drill follow-up (T6).
+   table plus the env bootstrap) and, when that state's fingerprint changes, mutates the SAME
+   ``TokenIssuer`` object in place (``TokenIssuer.replace_keys``) — the object the lifespan
+   already handed to the pipeline and health poller for token injection. A periodic refresh loop
+   (started by the lifespan) calls ``current()`` every few seconds, so a ``rotate-signing-key
+   --apply`` run flips BOTH the public JWKS route and the injection signer, with no restart and
+   no re-wiring.
 
 2. **``rotate_signing_key``** — the operator-facing rotation sequence, wrapped by the
    ``argus rotate-signing-key`` CLI. It mirrors ``argus/reencrypt.py`` in shape: dry-run by
@@ -37,8 +38,11 @@ stale ``token_signing_previous_*`` rows are harmless and overwritten by the next
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import serialization
@@ -54,11 +58,18 @@ from argus.tokens import (
     _resolve_rsa_private_key,
 )
 
+logger = logging.getLogger("argus.rotate_key")
+
 # Overlap window: drop the old kid after two token TTLs (2 × 600s = 20 min). Pinned to the spec
 # §4 sequence; changing this is a contract change, not a local tuning knob, because the rotation
 # drill (Task 6) and the operator runbook both assume "two TTLs".
 OVERLAP_TTLS = 2
 OVERLAP_SECONDS = OVERLAP_TTLS * TOKEN_TTL_SECONDS
+
+# How often the running app re-reads rotation state in the background (in addition to on-demand
+# reads from the JWKS route). A few seconds of propagation delay is immaterial against the
+# 20-minute overlap window, and it bounds the background loop to ~3 cheap DB reads per tick.
+REFRESH_SECONDS = 5.0
 
 # DB settings-table keys (see module docstring). Kept distinct from the env field
 # `token_signing_key_ref` so the bootstrap (env) and the post-rotation truth (DB) can't be
@@ -118,33 +129,72 @@ async def _store_signing_key(
 
 
 class TokenKeyManager:
-    """Owns the live ``TokenIssuer`` and re-loads it when the persisted rotation state changes.
+    """Owns the live ``TokenIssuer`` and keeps it in sync with the persisted rotation state.
 
-    Constructed synchronously (no I/O); ``current()`` is the single entry point. It re-reads the
-    rotation state and rebuilds the issuer only when that state's fingerprint changes, so a
-    ``rotate-signing-key --apply`` run propagates to a RUNNING app without a restart — the same
-    "rotation without redeploy" property the reencrypt CLI gives the encrypted tier.
+    Constructed synchronously (no I/O); ``current()`` is the single read path, called by the JWKS
+    route and by a periodic ``start()``-launched loop. When the rotation state's fingerprint
+    changes, the manager MUTATES the SAME issuer object in place (``TokenIssuer.replace_keys``)
+    rather than swapping in a new one — so the references the lifespan handed to the pipeline and
+    health poller at boot stay valid, and token injection picks up the rotation with no re-wiring
+    and no restart.
 
-    The first ``current()`` call is also the fail-loud-at-boot point: an unresolvable active key
+    The first ``current()`` call is the fail-loud-at-boot point: an unresolvable active key
     reference raises ``TokenIssuerConfigError`` from here, which the app lifespan lets abort
-    startup exactly like a misconfigured secret provider.
+    startup exactly like a misconfigured secret provider. A rotation-state load that later fails
+    (e.g. a bad ref the CLI just wrote) is caught by the refresh loop and retried on the next
+    tick, leaving the last-good issuer in place for injection until it is corrected.
     """
 
-    def __init__(self, settings, secret_provider: SecretProvider, settings_repo) -> None:
+    def __init__(
+        self,
+        settings,
+        secret_provider: SecretProvider,
+        settings_repo,
+        *,
+        refresh_seconds: float = REFRESH_SECONDS,
+    ) -> None:
         self._settings = settings
         self._provider = secret_provider
         self._repo = settings_repo
+        self._refresh_seconds = refresh_seconds
         self._issuer: TokenIssuer | None = None
         self._fingerprint: tuple | None = None
+        self._task: asyncio.Task | None = None
 
     async def current(self) -> TokenIssuer | None:
-        """Return the current issuer, rebuilding it only when rotation state changed. Returns
-        None when no signing key is configured anywhere (env unset + no DB override)."""
+        """Return the current issuer, refreshing it in place only when rotation state changed.
+        Returns None when no signing key is configured anywhere (env unset + no DB override)."""
         fingerprint = await self._read_state()
         if fingerprint != self._fingerprint:
-            self._issuer = await self._load(fingerprint)
+            await self._refresh(fingerprint)
             self._fingerprint = fingerprint
         return self._issuer
+
+    def start(self) -> None:
+        """Launch the periodic rotation-state refresher (no-op if already running). Called from
+        the app lifespan once the event loop is live."""
+        if self._task is None:
+            self._task = asyncio.create_task(self._refresh_loop())
+
+    async def stop(self) -> None:
+        """Cancel the refresher and wait for it to finish (no-op if never started)."""
+        if self._task is None:
+            return
+        self._task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+
+    async def _refresh_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._refresh_seconds)
+            try:
+                await self.current()
+            except Exception:
+                # A transient failure (DB blip, a bad ref the CLI just wrote) must not kill the
+                # refresher — log it and retry on the next tick. CancelledError is NOT an
+                # Exception, so stop() still propagates cleanly through the cancellation.
+                logger.exception("token rotation-state refresh failed")
 
     async def _read_state(self) -> tuple[str | None, str | None, str | None]:
         active = await self._repo.get(ACTIVE_REF_KEY) or getattr(
@@ -154,10 +204,11 @@ class TokenKeyManager:
         drop_at = await self._repo.get(PREVIOUS_DROP_AT_KEY)
         return (active, previous, drop_at)
 
-    async def _load(self, state: tuple) -> TokenIssuer | None:
+    async def _refresh(self, state: tuple) -> None:
         active_ref, previous_ref, drop_at_raw = state
         if not active_ref:
-            return None
+            self._issuer = None
+            return
         if not is_reference(active_ref):
             raise TokenIssuerConfigError(
                 "token signing key must be a secret-provider reference (enc:v1:... or "
@@ -177,7 +228,12 @@ class TokenKeyManager:
                 # the key is loaded and immediately eligible for drop on the next JWKS/mint.
                 previous_key = await _resolve_rsa_private_key(previous_ref, self._provider)
                 previous.append((previous_key, drop_at))
-        return TokenIssuer(active_key, previous=tuple(previous))
+        if self._issuer is None:
+            self._issuer = TokenIssuer(active_key, previous=tuple(previous))
+        else:
+            # Mutate in place — the SAME object the lifespan handed to the pipeline and health
+            # poller for injection, so those fixed references now sign with the new key too.
+            self._issuer.replace_keys(active_key, tuple(previous))
 
 
 @dataclass

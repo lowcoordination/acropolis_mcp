@@ -300,6 +300,10 @@ def create_app(
         app.state.token_issuer = token_issuer
         pipeline.set_token_issuer(token_issuer)
         health_poller.set_token_issuer(token_issuer)
+        # T4: start the periodic rotation-state refresher so a `rotate-signing-key --apply` run
+        # flips the signer the pipeline/health poller use too (the manager mutates the SAME issuer
+        # object in place), not just the public JWKS route. See TokenKeyManager.start/stop.
+        token_key_manager.start()
         # Issue #106: spend the forkserver's one-time cold-start cost here (measured ~5x a warm
         # match) rather than on whichever request happens to arrive first. Also logs a boot-time
         # warning if even a warm match on this host already eats a large fraction of the
@@ -322,6 +326,9 @@ def create_app(
         try:
             yield
         finally:
+            # Stop the rotation refresher first — it reads the settings table through the db
+            # pools, which the caller closes after this lifespan exits.
+            await token_key_manager.stop()
             await config_source.stop()
             await retention_job.stop()
             await proposal_expiry_job.stop()

@@ -13,8 +13,10 @@ operation the Go ``mcp-authn`` middleware performs — rather than importing the
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import socket
 
 import httpx
 import pytest
@@ -32,7 +34,7 @@ from argus.rotate_key import (
     rotate_signing_key,
 )
 from db.database import Database
-from db.repo import SettingsRepo
+from db.repo import ServerRepo, SettingsRepo
 
 
 def _pem(private_key) -> str:
@@ -202,4 +204,106 @@ async def test_rotation_requires_existing_key(tmp_path, encrypted_key_env):
         assert "ACROPOLIS_TOKEN_SIGNING_KEY_REF" in result.error
         assert result.new_kid is None
     finally:
+        await db.close()
+
+
+class _HeaderCapturingUpstream:
+    """Raw TCP listener standing in for a token-mode upstream — captures the exact Authorization
+    header Acropolis forwards and replies with a bare 200. Same pattern as test_upstream_tokens.py's
+    class of the same name (duplicated — that one is module-private, and copying keeps this file's
+    dependency on its internals at zero)."""
+
+    def __init__(self) -> None:
+        self.received_headers: dict[str, str] = {}
+        self._server: asyncio.AbstractServer | None = None
+        self.url = ""
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        data = await reader.readuntil(b"\r\n\r\n")
+        for line in data.decode(errors="replace").split("\r\n")[1:]:
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                self.received_headers[k.lower()] = v
+        body = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+        writer.write(
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
+        )
+        await writer.drain()
+        writer.close()
+
+    async def start(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", port)
+        self.url = f"http://127.0.0.1:{port}/mcp"
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+
+TOOLS_CALL = {
+    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+    "params": {"name": "echo", "arguments": {"message": "hi"}},
+}
+MCP_HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+
+
+async def test_token_injection_picks_up_rotation(tmp_path, encrypted_key_env):
+    """The remediation test for the rotation handoff: a `rotate-signing-key --apply` flips the
+    signer the PIPELINE uses for token injection, not just the public JWKS route — because the
+    manager mutates the SAME issuer object in place, the references T3 wired at boot stay valid.
+    Proved end-to-end through a real tools/call against a header-capturing upstream."""
+    old_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    old_kid = tokens._derive_kid(old_key.public_key())
+    provider = EncryptedSecretProvider()
+    old_ref = await provider.store("", _pem(old_key))
+
+    upstream = _HeaderCapturingUpstream()
+    await upstream.start()
+
+    settings = Settings(
+        data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False,
+        audit_retention_enabled=False, secret_provider="encrypted",
+        token_signing_key_ref=old_ref,
+    )
+    db = Database(tmp_path)
+    await db.connect()
+    try:
+        app = create_app(settings, db, probe_on_create=False)
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            await ServerRepo(db).create(
+                slug="mcp-fetch", name="Fetch", upstream_url=upstream.url,
+                credential_mode="token",
+            )
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://argus.test"
+            ) as client:
+                # Pre-rotation: injection signs with the boot-time (old) key.
+                r1 = await client.post("/mcp/mcp-fetch", json=TOOLS_CALL, headers=MCP_HEADERS)
+                assert r1.status_code == 200, r1.text
+                first_auth = upstream.received_headers["authorization"]
+                assert _decode(first_auth[len("Bearer "):])[0]["kid"] == old_kid
+
+                # Rotate, then let the manager refresh (what the periodic loop does within 5s).
+                result = await rotate_signing_key(
+                    settings, provider, SettingsRepo(db), dry_run=False
+                )
+                assert result.error is None and result.verified
+                issuer = await app.state.token_key_manager.current()
+                assert issuer is not None and issuer.kid == result.new_kid
+
+                # Post-rotation: the SAME wired object now signs with the new key.
+                r2 = await client.post("/mcp/mcp-fetch", json=TOOLS_CALL, headers=MCP_HEADERS)
+                assert r2.status_code == 200, r2.text
+                second_auth = upstream.received_headers["authorization"]
+                assert _decode(second_auth[len("Bearer "):])[0]["kid"] == result.new_kid
+    finally:
+        await upstream.stop()
         await db.close()
