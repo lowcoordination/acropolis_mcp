@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from db.models import SLUG_RE, DlpCustomPattern, ParamRule, ServerPolicy
+from db.models import SLUG_RE, _VALID_CREDENTIAL_MODES, DlpCustomPattern, ParamRule, ServerPolicy
 
 
 def _validate_slug(slug: str) -> str:
@@ -126,6 +126,12 @@ class ServerCreateRequest(BaseModel):
     # practical here (the gateway needs the plaintext on every proxied call), so instead it's
     # simply never returned by GET/list endpoints — see ServerResponse below.
     upstream_auth_header: Optional[str] = None
+    # Issue #134 (T3): which credential mechanism this server uses on the upstream hop.
+    # 'none' | 'static' | 'token' — see db/migrations/0015's header. 'token' mints an
+    # audience-bound JWT (ignores upstream_auth_header); 'static' resolves the header field;
+    # 'none' is the default (no credential). archon/api.py rejects 'token' when no signing key
+    # is configured (ACROPOLIS_TOKEN_SIGNING_KEY_REF) — this schema only enforces the enum.
+    credential_mode: str = "none"
     # Enterprise #4 (multi-tenancy, issue #5): which project this server belongs to, by slug.
     # Optional in the request shape — omitted (or "default") targets the backfilled default
     # project, so an existing integration/script that never heard of projects keeps working
@@ -142,6 +148,15 @@ class ServerCreateRequest(BaseModel):
     def _check_upstream_url(cls, v: str) -> str:
         return _validate_upstream_url(v)
 
+    @field_validator("credential_mode")
+    @classmethod
+    def _check_credential_mode(cls, v: str) -> str:
+        if v not in _VALID_CREDENTIAL_MODES:
+            raise ValueError(
+                f"credential_mode must be one of {sorted(_VALID_CREDENTIAL_MODES)}, got {v!r}"
+            )
+        return v
+
 
 class ServerUpdateRequest(BaseModel):
     name: Optional[str] = None
@@ -154,11 +169,25 @@ class ServerUpdateRequest(BaseModel):
     # configured credential". This is why it can't just default to None like the other
     # Optional fields above — None is a meaningful value here, not "field omitted".
     upstream_auth_header: Optional[str] = None
+    # Issue #134 (T3): same Optional-None-means-omitted convention as name/upstream_url above —
+    # None = "don't touch the server's current mode", an explicit string changes it. (Distinct
+    # from upstream_auth_header's _UNSET sentinel: there is no meaningful "clear" for a
+    # NOT-NULL column with a real 'none' default, so plain None suffices.)
+    credential_mode: Optional[str] = None
 
     @field_validator("upstream_url")
     @classmethod
     def _check_upstream_url(cls, v: Optional[str]) -> Optional[str]:
         return _validate_upstream_url(v) if v is not None else v
+
+    @field_validator("credential_mode")
+    @classmethod
+    def _check_credential_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_CREDENTIAL_MODES:
+            raise ValueError(
+                f"credential_mode must be one of {sorted(_VALID_CREDENTIAL_MODES)}, got {v!r}"
+            )
+        return v
 
 
 class ServerResponse(BaseModel):
@@ -183,6 +212,9 @@ class ServerResponse(BaseModel):
     # the value. False (not just absent) when has_upstream_auth_header is also False — there is
     # no credential to be a reference to.
     upstream_auth_header_is_reference: bool = False
+    # Issue #134 (T3): the server's credential mechanism. Rendered by the UI so the form can show
+    # which mode is selected; 'token' means upstream_auth_header is ignored on the upstream hop.
+    credential_mode: str = "none"
     # Enterprise #5: mirrors servers.health_reason — set only when health_status == "unhealthy"
     # AND the specific cause was a secret-resolution failure (see stoa/health.py's probe_server).
     # Never contains the resolved plaintext credential.

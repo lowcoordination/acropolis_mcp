@@ -33,6 +33,7 @@ from argus.metering import Metering
 from argus.policy import Decision, evaluate
 from argus.rate_limiter import RateLimiterRegistry
 from argus.toolslist import ToolsCache
+from argus.tokens import TokenIssuer
 from argus.tracing import TracingManager, _DisabledTracingManager
 from db.models import ApiKeyRecord, ServerPolicy, ServerRecord
 from db.repo import ServerRepo, SettingsRepo, UsageRepo
@@ -96,6 +97,7 @@ class Pipeline:
         tracing: Optional[TracingManager] = None,
         usage_repo: Optional[UsageRepo] = None,
         webhook_dispatcher: Optional["WebhookDispatcher"] = None,
+        token_issuer: Optional[TokenIssuer] = None,
     ):
         self._settings = settings
         self._servers = server_repo
@@ -121,8 +123,22 @@ class Pipeline:
         # without a UsageRepo enforces nothing and records nothing.
         self._usage = usage_repo
         self._webhooks = webhook_dispatcher
+        # Issue #134 (T3): the JWT issuer, wired by argus/app.py's lifespan AFTER construction
+        # (TokenIssuer.from_settings resolves the signing key asynchronously, which can only run
+        # once the event loop is live). None = no signing key configured, so _resolve_credential
+        # fails closed for token-mode servers — never forwards without a token. See
+        # set_token_issuer below for the two-phase shape.
+        self._token_issuer = token_issuer
         # NOTE: metering (rate limits, quota, usage rollups) is deliberately NOT assigned here —
         # see the `_metering` property below for why it is derived on access instead.
+
+    def set_token_issuer(self, issuer: Optional[TokenIssuer]) -> None:
+        """Wire the issuer constructed at startup. Called from argus/app.py's lifespan after
+        TokenIssuer.from_settings resolves the signing key; the two-phase shape exists because
+        from_settings is async while __init__ runs in the sync create_app. None = token mode
+        unavailable — _resolve_credential then fails closed rather than forwarding without a
+        token."""
+        self._token_issuer = issuer
 
     @property
     def _metering(self) -> Metering:
@@ -809,8 +825,14 @@ class Pipeline:
         api_key_id: Optional[int], start: float, client_ip: Optional[str],
         origin: Optional[str] = None, bridged: bool = False,
     ) -> Optional[str]:
-        """Resolves `server.upstream_auth_header` (a literal OR a reference) to the plaintext
-        credential that must be sent to the upstream, via the configured SecretProvider.
+        """Resolves the credential that must be sent to the upstream, per ``server.credential_mode``.
+
+        - ``token``  → mints an audience-bound JWT via the startup-wired TokenIssuer (see the
+          branch below) and returns it as ``"Bearer <jwt>"``; ignores ``upstream_auth_header``.
+        - ``static`` / ``none`` → resolves ``upstream_auth_header`` (a literal OR a reference)
+          to plaintext via the configured SecretProvider — the pre-#134 behaviour. ``none`` is
+          the migration default, so a legacy row that still carries a header resolves it
+          (spec: "no behaviour changes until an operator flips it").
 
         Non-negotiable: failure here must be an explicit ERROR, NEVER a silent fall-through to
         forwarding without the credential — that would risk leaking a request to an upstream
@@ -825,6 +847,42 @@ class Pipeline:
         `return e.response` without handle()'s top-level `except RoutingError` double-logging
         the same failure.
         """
+        if server.credential_mode == "token":
+            # Issue #134 (T3): mint an audience-bound JWT and send it as "Bearer <jwt>". This
+            # IGNORES upstream_auth_header entirely. Fail closed on BOTH "no issuer configured"
+            # (a server in token mode while the signing key is absent — the API normally rejects
+            # that, but this is the defense-in-depth half) and any unexpected mint failure: the
+            # same never-forward-without-a-credential guarantee as the secret-resolution path.
+            if self._token_issuer is None:
+                reason = "token signing is not configured (ACROPOLIS_TOKEN_SIGNING_KEY_REF)"
+                raise self._CredentialResolutionFailed(
+                    await self._error(
+                        server_slug=server.slug, tool=tool_name, status=502,
+                        content=rpc_error(rpc_id, reason), reason=reason,
+                        api_key_id=api_key_id, start=start, client_ip=client_ip,
+                        origin=origin, bridged=bridged, endpoint="per-server",
+                        rpc_method=rpc_method,
+                    )
+                )
+            try:
+                token = await self._token_issuer.get_token(server.slug)
+            except Exception:
+                # Unexpected — the key is already in memory, so a mint should never fail. Log
+                # the traceback (key-material-free: get_token never touches the PEM string) but
+                # keep the audit reason generic.
+                logger.exception("token mint failed for server '%s'", server.slug)
+                reason = "token mint failed"
+                raise self._CredentialResolutionFailed(
+                    await self._error(
+                        server_slug=server.slug, tool=tool_name, status=502,
+                        content=rpc_error(rpc_id, reason), reason=reason,
+                        api_key_id=api_key_id, start=start, client_ip=client_ip,
+                        origin=origin, bridged=bridged, endpoint="per-server",
+                        rpc_method=rpc_method,
+                    )
+                )
+            return f"Bearer {token}"
+
         if server.upstream_auth_header is None:
             return None
 
