@@ -5,7 +5,8 @@ Two halves live here:
 1. **``TokenKeyManager``** — what a RUNNING app uses to hold the live ``TokenIssuer`` and to
    pick up a rotation without a restart. It re-reads the persisted rotation state (the ``settings``
    table plus the env bootstrap) and rebuilds the issuer only when that state's fingerprint
-   changes. The JWKS route (and, in Task 3, token injection) go through ``current()``.
+   changes. The public JWKS route goes through ``current()``; token injection (T3) receives the
+   issuer produced by the first ``current()`` at boot.
 
 2. **``rotate_signing_key``** — the operator-facing rotation sequence, wrapped by the
    ``argus rotate-signing-key`` CLI. It mirrors ``argus/reencrypt.py`` in shape: dry-run by
@@ -292,15 +293,12 @@ async def rotate_signing_key(
         token = await reloaded.get_token("__rotation_check__")
         header = json.loads(_b64url_decode(token.split(".")[0]))
         if header.get("kid") != result.new_kid:
-            return RotateResult(
-                **{
-                    **result.__dict__,
-                    "error": "post-rotate verification failed: minted kid does not match the new key",
-                }
+            result.error = (
+                "post-rotate verification failed: minted kid does not match the new key"
             )
+            return result
         result.verified = True
     except TokenIssuerConfigError as exc:
-        return RotateResult(
-            **{**result.__dict__, "error": f"post-rotate verification failed: {exc}"}
-        )
+        result.error = f"post-rotate verification failed: {exc}"
+        return result
     return result
