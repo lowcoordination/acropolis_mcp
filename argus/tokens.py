@@ -1,0 +1,278 @@
+"""JWTs for the Acropolis→upstream hop (issue #134, Task 1).
+
+Acropolis is the ISSUER of the short-lived, audience-bound tokens that the fleet's shared Go
+middleware (``mcp-authn``, Task 5) verifies. This module is the issuer half of that contract;
+the verifier half is the middleware, and the two are pinned to one behaviour by a shared
+conformance-vector file (see the issue's "Conformance note") so a drift between the
+implementations fails a test on either side rather than a rollout.
+
+Algorithm choice — deliberate, recorded here because the spec's Open questions left it open:
+**RS256**, not EdDSA. The deciding constraint is stdlib-compatibility on BOTH sides of the hop:
+this side signs with ``cryptography``'s RSA (RSASSA-PKCS1-v1_5 + SHA-256, already a base
+dependency), and the Go middleware verifies with ``crypto/rsa`` + ``crypto/sha256`` — both part
+of each language's standard library, no extra JWT library required on either side. EdDSA was the
+only serious alternative (smaller signatures, faster), but Go's stdlib has no Ed25519-in-JWS
+helpers and every JWT-capable Go library that adds them drags in a dependency for one signature
+per 10 minutes — a cost with no benefit at this scale. RSA key size: whatever the operator
+provisions (2048+ recommended); the code is size-agnostic.
+
+Token shape (pinned in the issue so the Go middleware could start in parallel):
+
+- header: ``{"alg": "RS256", "typ": "JWT", "kid": <derived>}``
+- claims: ``{"iss": "acropolis", "aud": <server slug>, "exp": now + 600}``
+
+``kid`` is the base64url SHA-256 of the public key's DER SubjectPublicKeyInfo. It is derived
+from the key rather than stored (the keypair is a secret-provider reference, so a restart
+reloads the same material and must derive the same id), deterministic (rotation publishes
+multiple kids and the middleware refetches only on an unknown kid — a random id would break
+that), and never secret (it appears in the token header and the public JWKS). It is NOT an
+RFC 7638 JWK thumbprint — that canonical-JWK hash is unnecessary because the two implementations
+share literal kid strings via conformance vectors rather than recomputing them from the JWK.
+
+Cache semantics — why "a request never blocks on a mint after the first": one token per slug.
+The first request for a slug mints synchronously (the key is already in memory, so this is a
+local RSA sign, not a secret-provider round-trip). Subsequent requests return the cached token;
+once a token is ``REFRESH_FRACTION`` (80%) of the way to expiry, a BACKGROUND task re-mints it
+so a live slug's token is re-issued before it can expire and no later request has to wait on a
+mint. Only two paths mint synchronously: no token yet, and a token that actually expired
+(refresh failed or was starved) — in that case there is no valid token to hand out, so blocking
+is the only honest option. The per-slug ``refreshing`` flag deduplicates the background task so
+a burst of requests inside the refresh window schedules ONE re-mint, not one per request.
+
+``CLOCK_LEEWAY_SECONDS`` is enforced middleware-side; the constant lives HERE so both sides share
+the number via the conformance vectors rather than re-deriving it independently.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+from time import monotonic as _monotonic
+from time import time as _epoch_seconds
+
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+from archon.secrets import SecretProvider, SecretResolutionError, is_reference
+
+# Shared constants — the middleware-side leeway uses the same number via conformance vectors, so
+# changing these here is a cross-repo contract change, not a local tuning knob.
+TOKEN_TTL_SECONDS = 600
+REFRESH_FRACTION = 0.8
+CLOCK_LEEWAY_SECONDS = 30
+
+_ISSUER = "acropolis"
+_ALGORITHM = "RS256"
+_HEADER_TYPE = "JWT"
+_KEY_TYPE = "RSA"
+_KEY_USE = "sig"
+
+
+class TokenIssuerConfigError(Exception):
+    """Raised at construction time when ``token_signing_key_ref`` is set but cannot be resolved
+    to a usable RSA private key.
+
+    Deliberately a separate type from ``SecretResolutionError``: the secret provider already has
+    its own fail-loud contract (one exception type per seam, never a partial value), and wrapping
+    it here lets ``create_app`` (Task 3) report "token signing key misconfigured" as a distinct
+    boot failure from "a server credential couldn't be resolved at call time". Never raised
+    mid-request — ``get_token`` mints with an already-loaded in-memory key, so a misconfiguration
+    surfaces at boot, not on the first tool call.
+    """
+
+
+def _b64url(data: bytes) -> str:
+    """RFC 7515 base64url, unpadded — the on-the-wire form JWT consumers expect."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    """Inverse of ``_b64url`` for tests / the conformance-vector loader. Accepts padded and
+    unpadded input alike."""
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def _int_to_bytes(value: int) -> bytes:
+    """Big-endian, minimal-length encoding of a non-negative integer — exactly what RFC 7518's
+    RSA JWK ``n``/``e`` fields require (no leading zero byte, matching every major JWT library's
+    serialization)."""
+    return value.to_bytes((value.bit_length() + 7) // 8, "big")
+
+
+def _derive_kid(public_key) -> str:
+    """A stable, non-secret key id: base64url(SHA-256(DER SubjectPublicKeyInfo)).
+
+    Must be re-derivable after a restart (same key material → same kid) and never secret (it is
+    published in the token header and the JWKS). SHA-256 of the DER form is collision-resistant
+    for this purpose and trivial to reproduce anywhere if cross-checking is ever needed.
+    """
+    der = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return _b64url(hashlib.sha256(der).digest())
+
+
+def _ref_label(ref: str) -> str:
+    """A log/error-safe rendering of a ``token_signing_key_ref``.
+
+    The ref is EITHER a reference string (``enc:v1:...``/``vault://...``, safe to echo) OR a raw
+    PEM literal under the ``local`` provider — and a PEM literal IS the private key, so it must
+    never appear in an error message or log line. ``is_reference``'s allowlist is the same test
+    the rest of the codebase uses to decide what's safe to display.
+    """
+    return ref if is_reference(ref) else "<PEM literal>"
+
+
+class _CachedToken:
+    """Per-slug cache entry. ``refreshing`` deduplicates the background refresh task so N
+    concurrent requests inside the refresh window schedule ONE re-mint, not N."""
+
+    __slots__ = ("token", "refresh_at", "expires_at", "refreshing")
+
+    def __init__(self, token: str, refresh_at: float, expires_at: float):
+        self.token = token
+        self.refresh_at = refresh_at
+        self.expires_at = expires_at
+        self.refreshing = False
+
+
+class TokenIssuer:
+    """Mints cached, per-slug JWTs for the upstream hop. Construct via ``from_settings``; never
+    pass key material in a form that could be repr'd — the constructor takes an already-loaded
+    ``cryptography`` key object, not a string."""
+
+    def __init__(
+        self,
+        private_key,
+        *,
+        ttl_seconds: float = TOKEN_TTL_SECONDS,
+        refresh_fraction: float = REFRESH_FRACTION,
+    ):
+        if not isinstance(private_key, rsa.RSAPrivateKey):
+            raise TokenIssuerConfigError("TokenIssuer requires an RSA private key (RS256)")
+        if ttl_seconds <= 0:
+            raise TokenIssuerConfigError("ttl_seconds must be positive")
+        if not 0 < refresh_fraction < 1:
+            raise TokenIssuerConfigError("refresh_fraction must be between 0 and 1")
+        self._private_key = private_key
+        self._public_key = private_key.public_key()
+        self._ttl = ttl_seconds
+        self._refresh_after = ttl_seconds * refresh_fraction
+        self._kid = _derive_kid(self._public_key)
+        self._public_jwk = self._build_public_jwk()
+        # One token per slug; values are _CachedToken entries. Never persisted, never logged.
+        self._cache: dict[str, _CachedToken] = {}
+
+    @classmethod
+    async def from_settings(
+        cls, settings, secret_provider: SecretProvider
+    ) -> "TokenIssuer | None":
+        """Build an issuer from ``settings.token_signing_key_ref``, or return None when it is
+        unset (no issuer configured — Task 3 treats that as "token mode is unavailable").
+
+        Resolution happens HERE, at boot, through the same ``SecretProvider`` every other
+        credential uses — so ``enc:v1:``/``vault://`` references work identically, and a
+        misconfigured ref raises ``TokenIssuerConfigError`` before the app starts rather than on
+        the first tool call (the fail-loud-at-boot posture).
+        """
+        ref = getattr(settings, "token_signing_key_ref", None)
+        if not ref:
+            return None
+        try:
+            pem = await secret_provider.resolve(ref)
+        except SecretResolutionError as exc:
+            # Deliberately exc.reason, NOT str(exc): SecretResolutionError's message embeds the
+            # original ref, and for a PEM literal the ref IS the private key. reason is always
+            # key-material-free by construction (see that class's docstring).
+            raise TokenIssuerConfigError(
+                f"token signing key {_ref_label(ref)} is unresolvable: {exc.reason}"
+            ) from exc
+        try:
+            private_key = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+            # These messages are generic ("could not deserialize", "password was not given but
+            # private key is encrypted") — safe to include, and the encrypted-PEM case is exactly
+            # the operator hint we want to surface rather than swallow.
+            raise TokenIssuerConfigError(
+                f"token signing key {_ref_label(ref)} did not resolve to a usable PEM private "
+                f"key: {exc}"
+            ) from exc
+        if not isinstance(private_key, rsa.RSAPrivateKey):
+            raise TokenIssuerConfigError(
+                f"token signing key {_ref_label(ref)} resolved to a non-RSA key; RS256 "
+                "requires an RSA keypair"
+            )
+        return cls(private_key)
+
+    @property
+    def kid(self) -> str:
+        """The issuer's current key id — the value stamped into every token header."""
+        return self._kid
+
+    def jwks(self) -> dict:
+        """The public half of the keypair as a standard JWKS document (``{"keys": [...]}``).
+
+        Contains ONLY public material (``kty``/``n``/``e``/``alg``/``use``/``kid``); the private
+        components (``d``/``p``/``q``/...) are never serialized. Task 4 serves this at
+        ``/.well-known/jwks.json`` unauthenticated — it is public by definition.
+        """
+        return {"keys": [self._public_jwk]}
+
+    async def get_token(self, slug: str) -> str:
+        """Return the slug's current token, minting only when necessary (see module docstring's
+        cache semantics). Never raises SecretResolutionError — the key is already in memory."""
+        now = _monotonic()
+        entry = self._cache.get(slug)
+        if entry is None or now >= entry.expires_at:
+            return self._cache_token(slug, now)
+        if now >= entry.refresh_at and not entry.refreshing:
+            entry.refreshing = True
+            asyncio.create_task(self._refresh(slug))
+        return entry.token
+
+    def _cache_token(self, slug: str, now: float) -> str:
+        token = self._mint(slug)
+        self._cache[slug] = _CachedToken(
+            token=token,
+            refresh_at=now + self._refresh_after,
+            expires_at=now + self._ttl,
+        )
+        return token
+
+    async def _refresh(self, slug: str) -> None:
+        """Background re-mint scheduled once the cached token crosses the refresh threshold. Runs
+        as a fire-and-forget task; the ``finally`` clears the dedupe flag so a later window (or a
+        failed mint) can schedule again."""
+        try:
+            self._cache_token(slug, _monotonic())
+        finally:
+            entry = self._cache.get(slug)
+            if entry is not None:
+                entry.refreshing = False
+
+    def _mint(self, slug: str) -> str:
+        header = {"alg": _ALGORITHM, "typ": _HEADER_TYPE, "kid": self._kid}
+        payload = {"iss": _ISSUER, "aud": slug, "exp": int(_epoch_seconds() + self._ttl)}
+        signing_input = (
+            _b64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("ascii"))
+            + "."
+            + _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("ascii"))
+        )
+        signature = self._private_key.sign(
+            signing_input.encode("ascii"), padding.PKCS1v15(), hashes.SHA256()
+        )
+        return f"{signing_input}.{_b64url(signature)}"
+
+    def _build_public_jwk(self) -> dict:
+        numbers = self._public_key.public_numbers()
+        return {
+            "kty": _KEY_TYPE,
+            "use": _KEY_USE,
+            "alg": _ALGORITHM,
+            "kid": self._kid,
+            "n": _b64url(_int_to_bytes(numbers.n)),
+            "e": _b64url(_int_to_bytes(numbers.e)),
+        }
