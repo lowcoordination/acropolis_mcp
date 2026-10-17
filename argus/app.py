@@ -25,9 +25,9 @@ from argus.pipeline import Pipeline
 from argus.policy import warm_forkserver
 from argus.rate_limiter import RateLimiterRegistry
 from argus.policy_api import build_policy_evaluation_router
+from argus.rotate_key import TokenKeyManager
 from argus.routes import build_data_plane_router
 from argus.toolslist import ToolsCache
-from argus.tokens import TokenIssuer
 from argus.tracing import build_tracing_manager
 from argus.upstream import UpstreamHandshakeCache
 from db.database import Database, PoolExhaustedError
@@ -189,6 +189,11 @@ def create_app(
     # missing admin_token or a bad webhook_url would, rather than surfacing as a mysterious
     # first-request failure.
     secret_provider = build_secret_provider(settings)
+    # Issue #134 Task 4: owns the live TokenIssuer and re-loads it when a `rotate-signing-key`
+    # run persists new rotation state. Constructed (no I/O) here so the JWKS route and T3's
+    # injection share ONE issuer; the first current() call happens in lifespan below as the
+    # fail-loud-at-boot point.
+    token_key_manager = TokenKeyManager(settings, secret_provider, settings_repo)
     # Built once at startup, same shape as secret_provider above — reads ACROPOLIS_OTEL_ENABLED
     # / ACROPOLIS_OTEL_SAMPLE_RATIO from the environment. init() (called in lifespan below, not
     # here) is where the actual OTel SDK / OTLP exporter gets built (or, if
@@ -283,15 +288,22 @@ def create_app(
         # than raising, since tracing is an observability nice-to-have, not a security control
         # the gateway should refuse to start without.
         tracing.init()
-        # Issue #134 (T3): construct the token issuer BEFORE any background job starts. If the
-        # signing key is configured but unresolvable, TokenIssuer.from_settings raises
-        # TokenIssuerConfigError and this lifespan raises — the app refuses to start (fail-loud
-        # at boot, same posture as a misconfigured secret provider). Returns None when no signing
-        # key is configured, in which case credential_mode='token' is rejected at the API layer.
-        token_issuer = await TokenIssuer.from_settings(settings, secret_provider)
+        # Issue #134 (T3 + T4): construct the token issuer BEFORE any background job starts.
+        # T4's TokenKeyManager is the single loader — it resolves the active signing key AND any
+        # in-flight rotation overlap (both published kids during the overlap window), which the
+        # plain TokenIssuer.from_settings cannot see. If the signing key is configured but
+        # unresolvable, current() raises TokenIssuerConfigError and this lifespan raises — the app
+        # refuses to start (fail-loud at boot, same posture as a misconfigured secret provider).
+        # Returns None when no signing key is configured, in which case credential_mode='token'
+        # is rejected at the API layer.
+        token_issuer = await token_key_manager.current()
         app.state.token_issuer = token_issuer
         pipeline.set_token_issuer(token_issuer)
         health_poller.set_token_issuer(token_issuer)
+        # T4: start the periodic rotation-state refresher so a `rotate-signing-key --apply` run
+        # flips the signer the pipeline/health poller use too (the manager mutates the SAME issuer
+        # object in place), not just the public JWKS route. See TokenKeyManager.start/stop.
+        token_key_manager.start()
         # Issue #106: spend the forkserver's one-time cold-start cost here (measured ~5x a warm
         # match) rather than on whichever request happens to arrive first. Also logs a boot-time
         # warning if even a warm match on this host already eats a large fraction of the
@@ -314,6 +326,9 @@ def create_app(
         try:
             yield
         finally:
+            # Stop the rotation refresher first — it reads the settings table through the db
+            # pools, which the caller closes after this lifespan exits.
+            await token_key_manager.stop()
             await config_source.stop()
             await retention_job.stop()
             await proposal_expiry_job.stop()
@@ -360,6 +375,7 @@ def create_app(
     app.state.webhook_dispatcher = webhook_dispatcher
     app.state.config_source = config_source
     app.state.secret_provider = secret_provider
+    app.state.token_key_manager = token_key_manager
     app.state.token_issuer = None  # set in lifespan (async key load); None until then
     app.state.tracing = tracing
     app.state.pipeline = pipeline
@@ -391,6 +407,17 @@ def create_app(
     ))
     app.include_router(build_data_plane_router(pipeline, aggregate_pipeline))
     app.include_router(build_metrics_router(server_repo, audit_repo, config_source))
+
+    # Issue #134 Task 4: the public JWKS route. Deliberately unauthenticated — the public half
+    # of the signing keypair is public by definition, and the fleet's mcp-authn middleware (Task
+    # 5) fetches it to verify tokens. Registered BEFORE the SPA catch-all so it is never shadowed;
+    # returns 404 when no issuer is configured (no key to publish).
+    @app.get("/.well-known/jwks.json", include_in_schema=False)
+    async def jwks_route(request: Request) -> Response:
+        issuer = await request.app.state.token_key_manager.current()
+        if issuer is None:
+            return Response(status_code=404, content="Not Found")
+        return JSONResponse(issuer.jwks())
 
     _mount_web_ui(app)
 
