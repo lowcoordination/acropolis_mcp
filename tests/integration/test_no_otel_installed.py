@@ -7,7 +7,8 @@ a crash).
 A genuine proof, not a code-review claim: builds a REAL, throwaway virtualenv containing only
 this project's base + `dev` dependencies (deliberately excluding the `otel` extra), then runs a
 small script inside THAT venv's own interpreter via subprocess — the only way to actually prove
-"opentelemetry is not importable" rather than asserting it via a mocked ImportError in-process
+"the OpenTelemetry SDK and OTLP exporter are not importable" rather than asserting it via a mocked
+ImportError in-process
 (which tests the code path but not the real-world claim). tests/unit/test_tracing.py's
 import-guard tests are the fast in-process companion to this slower, but more honest, one.
 
@@ -82,9 +83,15 @@ def _run_with_hard_timeout(args: list[str], *, timeout: float, **kwargs) -> subp
 @pytest.fixture(scope="session")
 def no_otel_venv(tmp_path_factory):
     """A real venv with acropolis[dev] installed but NOT acropolis[otel] — proving the base
-    install (what CI's non-otel job and every real user who never opts in actually gets) is
-    genuinely free of the opentelemetry package tree, not just "we didn't add it to
-    dependencies and hope nothing transitively pulls it in"."""
+    install (what CI's non-otel job and every real user who never opts in actually gets) has
+    neither the OpenTelemetry SDK nor the OTLP exporter, not just "we didn't add them to
+    dependencies and hope nothing transitively pulls them in".
+
+    `opentelemetry-api` is deliberately NOT part of that claim: FastAPI >= 0.142 declares it as
+    a hard dependency, so it is present in every base install now (acropolis_mcp#147). The API
+    package is an inert shim — no spans, no export — until an SDK is installed and registered,
+    and argus/tracing.py's only activation path imports the SDK first, so the promise that
+    matters is "SDK and exporter absent => tracing stays off and the app works"."""
     venv_dir = tmp_path_factory.mktemp("no_otel_venv")
     venv.EnvBuilder(with_pip=True, symlinks=True).create(venv_dir)
     python = venv_dir / "bin" / "python"
@@ -110,20 +117,34 @@ def _run_script(python: Path, script: str, env: dict | None = None) -> subproces
 
 
 class TestOtelGenuinelyAbsent:
-    def test_opentelemetry_is_not_importable_in_this_venv(self, no_otel_venv):
-        """Sanity check on the fixture itself — if this fails, the venv build didn't actually
-        exclude the otel extra and every other test in this file is proving nothing."""
-        result = _run_script(no_otel_venv, """
-            import sys
-            try:
-                import opentelemetry  # noqa: F401
-                sys.exit(1)  # FAIL: it's installed
-            except ImportError:
-                sys.exit(0)  # correct: genuinely absent
+    # The modules argus/tracing.py's TracingManager.init() imports to turn tracing on, in the order
+    # it imports them. If ANY of these is importable the venv is not the "no otel extra" install
+    # this file claims to test.
+    SDK_AND_EXPORTER_MODULES = (
+        "opentelemetry.sdk.trace",
+        "opentelemetry.exporter.otlp.proto.http.trace_exporter",
+    )
+
+    def test_otel_sdk_and_exporter_are_not_importable_in_this_venv(self, no_otel_venv):
+        """Sanity check on the fixture itself — if this fails, the venv build pulled in the SDK or
+        exporter (e.g. a new transitive dependency) and every other test in this file is proving
+        nothing. Deliberately does NOT assert on `opentelemetry-api`; see the fixture docstring."""
+        result = _run_script(no_otel_venv, f"""
+            import importlib, sys
+            leaked = []
+            for name in {self.SDK_AND_EXPORTER_MODULES!r}:
+                try:
+                    importlib.import_module(name)
+                except ImportError:
+                    continue  # correct: genuinely absent
+                leaked.append(name)
+            if leaked:
+                print("IMPORTABLE: " + ", ".join(leaked))
+                sys.exit(1)
         """)
         assert result.returncode == 0, (
-            f"opentelemetry IS importable in the 'no otel' venv — fixture is broken.\n"
-            f"stdout={result.stdout}\nstderr={result.stderr}"
+            "the OpenTelemetry SDK/exporter ARE importable in the 'no otel' venv — fixture is "
+            f"broken.\nstdout={result.stdout}\nstderr={result.stderr}"
         )
 
     def test_app_boots_and_serves_with_tracing_disabled(self, no_otel_venv, pg_dsn):
