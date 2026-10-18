@@ -222,6 +222,11 @@ def build_secret_provider(settings) -> "SecretProvider":
             token=settings.vault_token,
             role_id=settings.vault_role_id,
             secret_id=settings.vault_secret_id,
+            secret_id_file=settings.vault_secret_id_file,
+            auth_method=settings.vault_auth_method,
+            k8s_role=settings.vault_k8s_role,
+            k8s_token_file=settings.vault_k8s_token_file,
+            k8s_mount=settings.vault_k8s_mount,
             ttl_seconds=getattr(settings, "vault_ttl_seconds", 60.0),
         )
     raise ValueError(f"unknown secret_provider {provider!r} (expected 'local', 'encrypted', or 'openbao')")

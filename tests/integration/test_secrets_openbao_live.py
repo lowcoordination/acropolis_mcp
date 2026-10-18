@@ -12,6 +12,12 @@ regardless, and the PR description for which of the two ran in the environment t
 """
 from __future__ import annotations
 
+import base64
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import httpx
 import pytest
 
@@ -242,3 +248,208 @@ async def test_delete_removes_secret():
                 await provider.resolve(ref)
         finally:
             await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_approle_secret_id_from_file_and_rotation_against_real_dev_server(tmp_path):
+    """The secret_id comes from a FILE (Docker secret / Kubernetes Secret mount), is stripped of
+    its trailing newline, and is re-read on the next login, so replacing the file rotates the
+    credential with no restart. Real AppRole, real server."""
+    async with run_dev_server() as vault:
+        role_id, first_secret_id = await _enable_approle_and_get_credentials(vault)
+        f = tmp_path / "vault_secret_id"
+        f.write_text(first_secret_id + "\n")
+
+        seed = OpenBaoSecretProvider(base_url=vault.url, token=vault.token, ttl_seconds=0.0)
+        try:
+            await seed.store("vault://secret/acropolis/file-test#token", "Bearer via-file")
+        finally:
+            await seed.aclose()
+
+        provider = OpenBaoSecretProvider(
+            base_url=vault.url, role_id=role_id, secret_id_file=str(f), ttl_seconds=0.0,
+        )
+        try:
+            assert await provider.resolve("vault://secret/acropolis/file-test#token") == "Bearer via-file"
+
+            # Rotate: a new secret_id is issued, the old one revoked, the file replaced.
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                headers = {"X-Vault-Token": vault.token}
+                resp = await client.post(
+                    f"{vault.url}/v1/auth/approle/role/acropolis-test/secret-id", headers=headers)
+                new_secret_id = resp.json()["data"]["secret_id"]
+                resp = await client.post(
+                    f"{vault.url}/v1/auth/approle/role/acropolis-test/secret-id/destroy",
+                    headers=headers, json={"secret_id": first_secret_id})
+                assert resp.status_code in (200, 204), resp.text
+            f.write_text(new_secret_id + "\n")
+            provider._login_token_expires_at = 0.0  # make the next resolve log in again
+
+            assert await provider.resolve("vault://secret/acropolis/file-test#token") == "Bearer via-file"
+        finally:
+            await provider.aclose()
+
+
+# ---------------------------------------------------------------- Kubernetes auth, real OpenBao
+
+def _throwaway_signed_jwt(sub: str) -> str:
+    """A JWT signed with a throwaway RSA key. OpenBao's Kubernetes auth rejects non-asymmetric
+    algorithms (HS256 gets "unexpected signature algorithm") but does not hold the cluster's
+    keys: whether the token is genuine is decided by the Kubernetes TokenReview API, which is what
+    is faked below."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    def b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    # The claim shape a real bound service-account token carries: the identity OpenBao matches
+    # against the role comes from these claims (the nested "kubernetes.io" one on modern clusters),
+    # not from `sub` alone.
+    _, _, namespace, name = sub.split(":")
+    now = int(time.time())
+    claims = {
+        "iss": "https://kubernetes.default.svc", "sub": sub, "aud": ["https://kubernetes.default.svc"],
+        "iat": now, "nbf": now, "exp": now + 3600,
+        "kubernetes.io": {"namespace": namespace, "serviceaccount": {"name": name, "uid": "uid-1"}},
+    }
+    head = b64(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    body = b64(json.dumps(claims).encode())
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    sig = key.sign(f"{head}.{body}".encode(), padding.PKCS1v15(), hashes.SHA256())
+    return f"{head}.{body}.{b64(sig)}"
+
+
+class _FakeKubeAPI:
+    """Just the one endpoint OpenBao calls to validate a login: POST /apis/authentication.k8s.io/
+    v1/tokenreviews. Everything else about Kubernetes is absent."""
+
+    def __init__(self) -> None:
+        self.username = "system:serviceaccount:acropolis:acropolis"
+        self.authenticated = True
+        self.reviewed: list[str] = []
+        self._server: HTTPServer | None = None
+
+    def start(self) -> str:
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                review = json.loads(self.rfile.read(length) or b"{}")
+                outer.reviewed.append(review.get("spec", {}).get("token", ""))
+                status = {"authenticated": outer.authenticated}
+                if outer.authenticated:
+                    # A real API server echoes the audiences it validated the token for.
+                    status["audiences"] = review.get("spec", {}).get("audiences") or [
+                        "https://kubernetes.default.svc"]
+                    status["user"] = {"username": outer.username, "uid": "uid-1",
+                                      "groups": ["system:serviceaccounts", "system:authenticated"]}
+                body = json.dumps({"kind": "TokenReview", "apiVersion": "authentication.k8s.io/v1",
+                                   "status": status}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self._server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{self._server.server_port}"
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+
+
+def _throwaway_ca_pem() -> str:
+    """OpenBao insists on a CA certificate for the Kubernetes API when it is told not to use the
+    pod-local one. The fake API below is plain HTTP, so this is never used to verify anything."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "fake-kube-ca")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode()
+
+
+async def _enable_kubernetes_auth(vault, kube_url: str) -> None:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        headers = {"X-Vault-Token": vault.token}
+        resp = await client.post(f"{vault.url}/v1/sys/auth/kubernetes", headers=headers, json={"type": "kubernetes"})
+        assert resp.status_code in (200, 204), resp.text
+        resp = await client.post(f"{vault.url}/v1/auth/kubernetes/config", headers=headers, json={
+            "kubernetes_host": kube_url, "token_reviewer_jwt": "reviewer-token",
+            "disable_iss_validation": True, "disable_local_ca_jwt": True,
+            "kubernetes_ca_cert": _throwaway_ca_pem()})
+        assert resp.status_code in (200, 204), resp.text
+        resp = await client.put(
+            f"{vault.url}/v1/sys/policies/acl/acropolis-k8s-read", headers=headers,
+            json={"policy": 'path "secret/data/acropolis/*" { capabilities = ["read"] }'})
+        assert resp.status_code in (200, 204), resp.text
+        resp = await client.post(f"{vault.url}/v1/auth/kubernetes/role/acropolis", headers=headers, json={
+            "bound_service_account_names": ["acropolis"],
+            "bound_service_account_namespaces": ["acropolis"],
+            "policies": ["acropolis-k8s-read"], "ttl": "1h"})
+        assert resp.status_code in (200, 204), resp.text
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_auth_against_real_dev_server_with_a_fake_tokenreview(tmp_path):
+    """The REAL server's Kubernetes login protocol and role bindings; only the Kubernetes API
+    server is faked (a real one is not available to a test). Proves: the request shape the client
+    sends is accepted, the returned token works for KV reads, and the role's bindings are enforced."""
+    kube = _FakeKubeAPI()
+    kube_url = kube.start()
+    jwt_file = tmp_path / "token"
+    jwt = _throwaway_signed_jwt("system:serviceaccount:acropolis:acropolis")
+    jwt_file.write_text(jwt + "\n")
+    try:
+        async with run_dev_server() as vault:
+            await _enable_kubernetes_auth(vault, kube_url)
+            seed = OpenBaoSecretProvider(base_url=vault.url, token=vault.token, ttl_seconds=0.0)
+            try:
+                await seed.store("vault://secret/acropolis/k8s-test#token", "Bearer via-k8s")
+            finally:
+                await seed.aclose()
+
+            provider = OpenBaoSecretProvider(
+                base_url=vault.url, auth_method="kubernetes", k8s_role="acropolis",
+                k8s_token_file=str(jwt_file), ttl_seconds=0.0,
+            )
+            try:
+                assert await provider.resolve("vault://secret/acropolis/k8s-test#token") == "Bearer via-k8s"
+                assert kube.reviewed == [jwt], "the server must have asked Kubernetes to review exactly our JWT"
+
+                # Wrong service account: the TokenReview says the token belongs to someone else.
+                kube.username = "system:serviceaccount:other:intruder"
+                provider._login_token_expires_at = 0.0
+                with pytest.raises(SecretResolutionError) as exc:
+                    await provider.resolve("vault://secret/acropolis/k8s-test#token")
+                assert "kubernetes auth login" in str(exc.value).lower()
+                assert jwt not in str(exc.value)
+
+                # Kubernetes says the token is not valid (deleted pod / expired).
+                kube.username, kube.authenticated = "system:serviceaccount:acropolis:acropolis", False
+                with pytest.raises(SecretResolutionError):
+                    await provider.resolve("vault://secret/acropolis/k8s-test#token")
+            finally:
+                await provider.aclose()
+    finally:
+        kube.stop()

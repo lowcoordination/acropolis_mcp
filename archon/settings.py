@@ -106,6 +106,19 @@ class Settings(BaseSettings):
     vault_token: str | None = None
     vault_role_id: str | None = None
     vault_secret_id: str | None = None
+    # How to log in. None = infer from what is set (token, else AppRole), exactly as before;
+    # Kubernetes auth is never inferred and must be selected here.
+    # "token" | "approle" | "kubernetes".
+    vault_auth_method: str | None = None
+    # AppRole secret_id from a FILE (Docker secret, Kubernetes Secret mount, systemd credential)
+    # instead of ACROPOLIS_VAULT_SECRET_ID, so it stays out of /proc/<pid>/environ and
+    # `docker inspect`. Mutually exclusive with vault_secret_id. A path, not a secret.
+    vault_secret_id_file: str | None = None
+    # Kubernetes auth: the OpenBao role, the file holding the pod's service-account token
+    # (re-read on every login because kubelet rotates it in place), and the auth mount name.
+    vault_k8s_role: str | None = None
+    vault_k8s_token_file: str = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    vault_k8s_mount: str = "kubernetes"
     vault_ttl_seconds: float = 60.0
 
     # Issue #134 (Task 1): the signing key Acropolis uses to mint audience-bound JWTs for the
