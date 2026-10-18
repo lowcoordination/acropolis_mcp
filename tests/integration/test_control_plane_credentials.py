@@ -30,7 +30,7 @@ from archon.settings import Settings
 from argus.app import create_app
 from argus.tokens import TokenIssuer
 from db.database import Database
-from db.repo import AuditRepo, ServerRepo
+from db.repo import ServerRepo
 
 from .fixture_token_verifier import verify_request_token
 
