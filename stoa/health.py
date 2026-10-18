@@ -185,7 +185,31 @@ async def probe_server(
     return ("healthy", handshake.protocol_version, discover_json, None)
 
 
-async def check_auth_enforced(client: httpx.AsyncClient, server: ServerRecord) -> Optional[str]:
+# Hard ceiling on the WHOLE tokenless check. httpx's timeout applies to each I/O operation, not to
+# the request, so an upstream that drips bytes just inside it (1 byte every few seconds) would
+# otherwise hold this call open for minutes, and the poll loop is serial: one stalling server would
+# freeze health updates for every other server. Module-level so a test can shrink it.
+AUTH_CHECK_DEADLINE_SECONDS = PROBE_TIMEOUT_SECONDS
+
+
+async def _tokenless_status(url: str, headers: dict, body: dict) -> int:
+    """POST with nothing that could authenticate and return only the status code.
+
+    A fresh client on purpose, not the app's shared one: the shared client has a cookie jar, so a
+    session cookie an upstream set on an earlier AUTHENTICATED response would ride along on this
+    "tokenless" request (observed in the PR #150 security scan). ``trust_env=False`` keeps ``.netrc``
+    credentials and proxy environment variables out of it too, and ``follow_redirects=False`` means a
+    3xx is reported as the answer rather than chased to another host. Streamed, and the body is never
+    read: only the status line matters, and buffering would let a hostile upstream make us hold an
+    arbitrarily large body per probe."""
+    async with httpx.AsyncClient(
+        timeout=PROBE_TIMEOUT_SECONDS, follow_redirects=False, trust_env=False,
+    ) as client:
+        async with client.stream("POST", url, json=body, headers=headers) as resp:
+            return resp.status_code
+
+
+async def check_auth_enforced(server: ServerRecord) -> Optional[str]:
     """Negative probe for a ``credential_mode='token'`` server: send a request with NO credential
     and report whether the upstream refused it.
 
@@ -199,12 +223,19 @@ async def check_auth_enforced(client: httpx.AsyncClient, server: ServerRecord) -
     Returns ``None`` when the upstream refused it (401/403) — the expected, healthy outcome — or
     when the answer is inconclusive (network error, timeout, or a gateway-class 502/503/504: the
     authenticated probe just succeeded, so this is a transient, and a transient must not raise a
-    security alert). Returns a reason string for any other HTTP response. The middleware wraps the whole handler, so an
-    unauthenticated POST to the MCP endpoint is refused BEFORE routing or body parsing; a 200, a
-    404 or a 400 all mean the request got past the gate.
+    security alert). Returns a reason string for any other HTTP response.
+
+    The middleware wraps the whole handler, so an unauthenticated POST to the MCP endpoint is
+    refused BEFORE routing or body parsing; a 200, a 404 or a 400 all mean the request got past the
+    gate.
+
+    What this does NOT prove: that the server verifies signature and audience. A server that
+    refuses a missing token but accepts any bearer value would pass. It also only tests the
+    registered URL, and a compromised upstream can simply answer 401. It closes one specific blind
+    spot (auth silently switched off), not the whole class.
 
     ``ping`` is a no-side-effect MCP method. Nothing is sent that could authenticate: no
-    Authorization header, no token."""
+    Authorization header, no token, no cookie."""
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -212,29 +243,29 @@ async def check_auth_enforced(client: httpx.AsyncClient, server: ServerRecord) -
     }
     body = {"jsonrpc": "2.0", "id": "acropolis-auth-check", "method": "ping"}
     try:
-        resp = await client.post(
-            server.upstream_url, json=body, headers=headers, timeout=PROBE_TIMEOUT_SECONDS,
+        status = await asyncio.wait_for(
+            _tokenless_status(server.upstream_url, headers, body), timeout=AUTH_CHECK_DEADLINE_SECONDS,
         )
-    except httpx.HTTPError as e:
-        logger.info("auth-enforcement check for '%s' was inconclusive: %s", server.slug, e)
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        logger.info(
+            "auth-enforcement check for '%s' was inconclusive: %s", server.slug, e or type(e).__name__,
+        )
         return None
-    if resp.status_code in (401, 403):
+    if status in (401, 403):
         return None
-    if resp.status_code in (502, 503, 504):
+    if status in (502, 503, 504):
         # Gateway-class statuses come from something IN FRONT of the app (an ingress or proxy mid
         # rollout, a restarting pod's Service), never from the middleware, which answers 401
         # before the application can run. They say nothing about auth, so they are the same
         # transient as a dropped connection and must not raise a security alert.
-        logger.info(
-            "auth-enforcement check for '%s' was inconclusive: HTTP %s", server.slug, resp.status_code,
-        )
+        logger.info("auth-enforcement check for '%s' was inconclusive: HTTP %s", server.slug, status)
         return None
     logger.warning(
         "server '%s' is in token mode but answered an unauthenticated request with HTTP %s",
-        server.slug, resp.status_code,
+        server.slug, status,
     )
     return (
-        f"{AUTH_NOT_ENFORCED_PREFIX}an unauthenticated request got HTTP {resp.status_code}, "
+        f"{AUTH_NOT_ENFORCED_PREFIX}an unauthenticated request got HTTP {status}, "
         "expected 401 — it was not refused by token auth"
     )
 
@@ -311,7 +342,7 @@ class HealthPoller(BackgroundLoop):
         # change. Runs only when the authenticated probe passed (otherwise the server is already
         # unhealthy and a second request would add nothing).
         if health_status == "healthy" and server.credential_mode == "token":
-            not_enforced = await check_auth_enforced(self._client, server)
+            not_enforced = await check_auth_enforced(server)
             if not_enforced is not None:
                 health_status, health_reason = "unhealthy", not_enforced
         await self._repo.set_health(

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -41,9 +42,13 @@ class _Upstream:
     has no Authorization header (``None`` = answer it normally, i.e. NOT enforcing). ``drop_unauth``
     closes the connection without answering such a request instead."""
 
-    def __init__(self, unauth_status: Optional[int] = 401, drop_unauth: bool = False) -> None:
+    def __init__(
+        self, unauth_status: Optional[int] = 401, drop_unauth: bool = False, set_cookie: bool = False,
+    ) -> None:
         self.unauth_status = unauth_status
         self.drop_unauth = drop_unauth
+        self.set_cookie = set_cookie
+        self.cookies_seen: list[Optional[str]] = []  # Cookie header of each request, in order
         self.requests: list[tuple[str, Optional[str]]] = []
         self.url = ""
         self._server: asyncio.AbstractServer | None = None
@@ -61,6 +66,7 @@ class _Upstream:
             method = rpc.get("method", "")
             auth = headers.get("authorization")
             self.requests.append((method, auth))
+            self.cookies_seen.append(headers.get("cookie"))
 
             if auth is None and self.drop_unauth:
                 return  # finally: closes the socket with no response
@@ -81,8 +87,10 @@ class _Upstream:
                 status, payload = 202, None
 
             data = json.dumps(payload).encode() if payload is not None else b""
+            cookie_line = "Set-Cookie: sid=SESSION-SET-ON-AUTHED-RESPONSE; Path=/\r\n" if (
+                self.set_cookie and auth is not None) else ""
             writer.write(
-                (f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n"
+                (f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{cookie_line}"
                  f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode() + data
             )
             await writer.drain()
@@ -101,6 +109,14 @@ class _Upstream:
 
     def unauthenticated_pings(self) -> list[tuple[str, Optional[str]]]:
         return [r for r in self.requests if r[0] == "ping" and r[1] is None]
+
+
+class _FakeServer:
+    """check_auth_enforced reads only slug and upstream_url; a full ServerRecord adds nothing here."""
+
+    def __init__(self, upstream_url: str) -> None:
+        self.slug = "fake"
+        self.upstream_url = upstream_url
 
 
 class _WebhookStub:
@@ -269,10 +285,119 @@ async def test_the_negative_probe_carries_no_credential_of_any_kind(db):
             upstream_auth_header="Bearer legacy-secret",
         )
         server = await repo.get("srv")
-        async with httpx.AsyncClient() as client:
-            reason = await check_auth_enforced(client, server)
+        reason = await check_auth_enforced(server)
     finally:
         await up.stop()
 
     assert reason is not None and reason.startswith(AUTH_NOT_ENFORCED_PREFIX)
     assert up.requests == [("ping", None)], up.requests
+
+
+async def test_the_negative_probe_does_not_replay_a_cookie_from_an_earlier_response(db, issuer):
+    """The poller's shared HTTP client keeps a cookie jar. A session cookie the upstream set on the
+    AUTHENTICATED probe must not ride along on the tokenless request, or it is not credential-free
+    (found by the PR #150 security scan: it did, before the check used its own client)."""
+    up = _Upstream(unauth_status=401, set_cookie=True)
+    await up.start()
+    try:
+        server = await _poll(db, up, issuer, credential_mode="token")
+    finally:
+        await up.stop()
+
+    assert server.health_status == "healthy", server
+    pairs = list(zip(up.requests, up.cookies_seen))
+    tokenless = [cookie for (method, auth), cookie in pairs if auth is None]
+    assert tokenless == [None], f"the tokenless probe carried a cookie: {pairs}"
+    # premise: the jar really did hold the cookie by then (the authenticated follow-up carried it)
+    assert any(c and "SESSION-SET-ON-AUTHED-RESPONSE" in c for c in up.cookies_seen), (
+        "premise broken: the shared client never stored the cookie, so this proves nothing"
+    )
+
+
+async def test_a_redirect_is_reported_not_followed():
+    """A 3xx is the upstream's answer, not an invitation to fetch another host."""
+    hits: list[int] = []
+
+    async def target(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        hits.append(1)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    tport = _free_port()
+    tsrv = await asyncio.start_server(target, "127.0.0.1", tport)
+
+    async def redirector(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            f"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{tport}/mcp\r\n"
+            "Content-Length: 0\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        writer.close()
+
+    port = _free_port()
+    srv = await asyncio.start_server(redirector, "127.0.0.1", port)
+    try:
+        reason = await check_auth_enforced(_FakeServer(f"http://127.0.0.1:{port}/mcp"))
+    finally:
+        srv.close()
+        tsrv.close()
+
+    assert reason is not None and "HTTP 302" in reason, reason
+    assert hits == [], "the redirect target was contacted"
+
+
+async def test_the_response_body_is_never_read(monkeypatch):
+    """Only the status line matters. An upstream that sends headers promising a huge body and then
+    stalls must not hold the check (or memory) hostage: it returns as soon as the status arrives."""
+    monkeypatch.setattr(stoa.health, "AUTH_CHECK_DEADLINE_SECONDS", 8.0)  # far above what we assert
+
+    async def staller(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 401 X\r\nContent-Length: 1000000000\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        try:
+            await asyncio.sleep(30)
+        finally:
+            writer.close()
+
+    port = _free_port()
+    srv = await asyncio.start_server(staller, "127.0.0.1", port)
+    t0 = time.monotonic()
+    try:
+        reason = await check_auth_enforced(_FakeServer(f"http://127.0.0.1:{port}/mcp"))
+    finally:
+        srv.close()
+    assert reason is None
+    assert time.monotonic() - t0 < 3.0, "the check waited for a body it does not need"
+
+
+async def test_headers_dripped_slowly_hit_the_overall_deadline(monkeypatch):
+    """httpx's timeout is per I/O operation, so a response dripped one byte at a time can outlast it
+    indefinitely, and the poll loop is serial. The overall deadline bounds it; the answer is
+    inconclusive (no alert)."""
+    monkeypatch.setattr(stoa.health, "AUTH_CHECK_DEADLINE_SECONDS", 1.0)
+
+    async def dripper(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        try:
+            for ch in b"HTTP/1.1 401 X\r\nX-Pad: " + b"a" * 200:
+                writer.write(bytes([ch]))
+                await writer.drain()
+                await asyncio.sleep(0.4)
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    port = _free_port()
+    srv = await asyncio.start_server(dripper, "127.0.0.1", port)
+    t0 = time.monotonic()
+    try:
+        reason = await check_auth_enforced(_FakeServer(f"http://127.0.0.1:{port}/mcp"))
+    finally:
+        srv.close()
+    assert reason is None, "an overrun must be inconclusive, not an alert"
+    assert time.monotonic() - t0 < 3.0, "the overall deadline did not bound the check"
