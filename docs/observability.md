@@ -267,7 +267,7 @@ docker run -p 4318:4318 -v ./otel-config.yaml:/etc/otelcol-contrib/config.yaml \
 The OpenTelemetry **SDK** and **OTLP exporter** (`opentelemetry-sdk`,
 `opentelemetry-exporter-otlp-proto-http`) are **not** base dependencies — they live in the `otel`
 optional-dependencies group (`pip install acropolis[otel]`, or `pip install -e ".[dev,otel]"` for
-a contributor). `opentelemetry-api` is a different case: FastAPI 0.146 and later depend on it, so it
+a contributor). `opentelemetry-api` is a different case: FastAPI 0.142 and later depend on it, so it
 is present in every install whether or not you opt in. On its own it is an inert shim — it records
 and exports nothing until an SDK is registered — and Acropolis only turns tracing on by importing
 the SDK. So the base install stays lean, and — this is the load-bearing claim, not just an

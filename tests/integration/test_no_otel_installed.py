@@ -87,7 +87,7 @@ def no_otel_venv(tmp_path_factory):
     neither the OpenTelemetry SDK nor the OTLP exporter, not just "we didn't add them to
     dependencies and hope nothing transitively pulls them in".
 
-    `opentelemetry-api` is deliberately NOT part of that claim: FastAPI >= 0.146 declares it as
+    `opentelemetry-api` is deliberately NOT part of that claim: FastAPI >= 0.142 declares it as
     a hard dependency, so it is present in every base install now (acropolis_mcp#147). The API
     package is an inert shim — no spans, no export — until an SDK is installed and registered,
     and argus/tracing.py's only activation path imports the SDK first, so the promise that
