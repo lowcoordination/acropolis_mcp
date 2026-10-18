@@ -264,10 +264,13 @@ docker run -p 4318:4318 -v ./otel-config.yaml:/etc/otelcol-contrib/config.yaml \
 
 ## True no-op when off
 
-The OpenTelemetry packages (`opentelemetry-api`, `opentelemetry-sdk`,
+The OpenTelemetry **SDK** and **OTLP exporter** (`opentelemetry-sdk`,
 `opentelemetry-exporter-otlp-proto-http`) are **not** base dependencies — they live in the `otel`
 optional-dependencies group (`pip install acropolis[otel]`, or `pip install -e ".[dev,otel]"` for
-a contributor). The base install stays lean, and — this is the load-bearing claim, not just an
+a contributor). `opentelemetry-api` is a different case: FastAPI 0.146 and later depend on it, so it
+is present in every install whether or not you opt in. On its own it is an inert shim — it records
+and exports nothing until an SDK is registered — and Acropolis only turns tracing on by importing
+the SDK. So the base install stays lean, and — this is the load-bearing claim, not just an
 aspiration — a base install with `ACROPOLIS_OTEL_ENABLED=true` set but the `otel` extra genuinely
 absent **starts and serves requests correctly**, logging a warning and staying inert rather than
 crashing:
@@ -280,9 +283,9 @@ ACROPOLIS_OTEL_ENABLED=true but the 'otel' optional dependency group is not inst
 `tests/integration/test_no_otel_installed.py` proves this the honest way: it builds a real,
 throwaway virtualenv containing `acropolis[dev]` but deliberately **not** `acropolis[otel]`, then
 runs the app inside that venv's own interpreter via subprocess — not a mocked `ImportError`
-in-process, an actual venv where `import opentelemetry` genuinely fails. It covers both the
-default case (tracing disabled, no otel installed — the common case) and the "operator flipped
-the gate without installing the extra" case.
+in-process, an actual venv where `import opentelemetry.sdk` and the OTLP exporter import genuinely
+fail. It covers both the default case (tracing disabled, no SDK installed — the common case) and
+the "operator flipped the gate without installing the extra" case.
 
 With tracing disabled (the default), `argus/tracing.py` never imports `opentelemetry` at all —
 proven in `tests/unit/test_tracing.py` by making the import raise if it's ever attempted.
