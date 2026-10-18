@@ -197,9 +197,9 @@ async def check_auth_enforced(client: httpx.AsyncClient, server: ServerRecord) -
     passing. Only a request that SHOULD be refused can notice.
 
     Returns ``None`` when the upstream refused it (401/403) — the expected, healthy outcome — or
-    when the answer is inconclusive (network error or timeout: the authenticated probe just
-    succeeded, so this is a transient, and a transient must not raise a security alert). Returns
-    a reason string for any other HTTP response. The middleware wraps the whole handler, so an
+    when the answer is inconclusive (network error, timeout, or a gateway-class 502/503/504: the
+    authenticated probe just succeeded, so this is a transient, and a transient must not raise a
+    security alert). Returns a reason string for any other HTTP response. The middleware wraps the whole handler, so an
     unauthenticated POST to the MCP endpoint is refused BEFORE routing or body parsing; a 200, a
     404 or a 400 all mean the request got past the gate.
 
@@ -220,13 +220,22 @@ async def check_auth_enforced(client: httpx.AsyncClient, server: ServerRecord) -
         return None
     if resp.status_code in (401, 403):
         return None
+    if resp.status_code in (502, 503, 504):
+        # Gateway-class statuses come from something IN FRONT of the app (an ingress or proxy mid
+        # rollout, a restarting pod's Service), never from the middleware, which answers 401
+        # before the application can run. They say nothing about auth, so they are the same
+        # transient as a dropped connection and must not raise a security alert.
+        logger.info(
+            "auth-enforcement check for '%s' was inconclusive: HTTP %s", server.slug, resp.status_code,
+        )
+        return None
     logger.warning(
         "server '%s' is in token mode but answered an unauthenticated request with HTTP %s",
         server.slug, resp.status_code,
     )
     return (
         f"{AUTH_NOT_ENFORCED_PREFIX}an unauthenticated request got HTTP {resp.status_code}, "
-        "expected 401 — the server is not verifying Acropolis tokens"
+        "expected 401 — it was not refused by token auth"
     )
 
 

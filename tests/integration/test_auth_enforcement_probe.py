@@ -195,6 +195,22 @@ async def test_any_response_other_than_401_or_403_means_the_gate_was_bypassed(db
     assert f"HTTP {status}" in server.health_reason
 
 
+@pytest.mark.parametrize("status", [502, 503, 504])
+async def test_gateway_class_statuses_are_inconclusive_not_an_alert(db, issuer, status):
+    """502/503/504 come from something in front of the app (ingress mid-rollout, a restarting pod's
+    Service), never from the middleware, which answers 401 before the app runs. They say nothing
+    about auth and must not raise a security alert."""
+    up = _Upstream(unauth_status=status)
+    await up.start()
+    try:
+        server = await _poll(db, up, issuer, credential_mode="token")
+    finally:
+        await up.stop()
+    assert server.health_status == "healthy", (status, server)
+    assert server.health_reason is None
+    assert len(up.unauthenticated_pings()) == 1, "the negative probe was attempted"
+
+
 async def test_network_error_on_the_negative_probe_is_inconclusive_not_an_alert(db, issuer):
     """The authenticated probe just succeeded, so a dropped connection on the second request is a
     transient. It must not raise a security alert."""

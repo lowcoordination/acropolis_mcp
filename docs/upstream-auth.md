@@ -128,7 +128,7 @@ a refusal:
 |---|---|
 | `401` or `403` | enforced; server stays healthy |
 | any other HTTP status (200, 400, 404, 500 …) | `unhealthy`, reason `token auth not enforced: an unauthenticated request got HTTP <n>, expected 401 …`; one webhook on the edge |
-| network error or timeout | inconclusive; no change (the authenticated probe just succeeded, so it is a transient) |
+| network error, timeout, or `502`/`503`/`504` | inconclusive; no change (the authenticated probe just succeeded, and those statuses come from something in front of the app, not from the middleware) |
 
 The middleware wraps the whole handler, so a tokenless POST to the MCP endpoint is refused before
 routing or body parsing; that is why a 404 or 400 counts as "bypassed". The check never runs for
