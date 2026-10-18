@@ -12,6 +12,7 @@ from archon.auth.apikeys import ApiKeyService
 from archon.settings import Settings
 from argus.aggregate import namespace_tool_definition, split_namespaced_tool_name
 from argus.audit import AuditLogger
+from argus.credentials import UpstreamCredentialError
 from argus.discover import synthesize_gateway_discover
 from argus.generation import ClientGeneration
 from argus.jsonrpc import rpc_error, sanitize_rpc_id
@@ -176,10 +177,18 @@ class AggregatePipeline:
             tools = await asyncio.wait_for(
                 self._per_server.tools_cache.get_filtered_tools(
                     server.id, server.upstream_url, policy,
-                    upstream_auth_header=server.upstream_auth_header,
+                    resolve_credential=self._per_server.catalog_credential(server),
                 ),
                 timeout=self._PER_SERVER_DEADLINE_SECONDS,
             )
+        except UpstreamCredentialError as e:
+            # Fail closed for THIS server only: never fetch its catalog unauthenticated, and don't
+            # let one server's missing credential take the whole merged tool list down with it.
+            logger.warning(
+                "server '%s' excluded from the aggregate tools/list: upstream credential could "
+                "not be resolved: %s", server.slug, e.reason,
+            )
+            return []
         except asyncio.TimeoutError:
             logger.warning(
                 "server '%s' timed out after %.0fs fetching tools for the aggregate endpoint "

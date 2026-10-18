@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 import uuid
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -45,6 +45,7 @@ from archon.project_rbac import (
 )
 from archon.secrets import SecretProvider, is_reference, provider_tier_name, store_upstream_auth_header
 from archon.secrets.local import LocalSecretProvider
+from argus.credentials import UpstreamCredentialError, resolve_upstream_credential
 from archon.schemas import (
     AdminEventResponse,
     AuditEventResponse,
@@ -97,6 +98,7 @@ from argus.pipeline import Pipeline
 from argus.quotas import period_start
 from argus.rate_limiter import RateLimiterRegistry, server_key
 from argus.toolslist import ToolsCache
+from argus.tokens import TokenIssuer
 from argus.tracing import TracingManager
 from db.database import utcnow
 from db.repo import (
@@ -223,6 +225,11 @@ def build_control_plane_router(
     project_repo: Optional[ProjectRepo] = None,
     project_member_repo: Optional[ProjectMemberRepo] = None,
     proposal_repo: Optional[ProposalRepo] = None,
+    # Issue #146: the control plane fetches tool catalogs itself and must authenticate to the
+    # upstream exactly as the data plane does. The issuer is created in the app lifespan (async
+    # key load), AFTER this router is built, so it is read lazily through a provider rather than
+    # passed by value; None means "no signing key configured" and token-mode servers fail closed.
+    token_issuer_provider: Optional[Callable[[], Optional[TokenIssuer]]] = None,
 ) -> APIRouter:
     # enterprise #2 (RBAC): the router used to carry ONE blanket
     # dependencies=[Depends(require_admin)] gate — authenticated meant authorized for
@@ -242,6 +249,16 @@ def build_control_plane_router(
     # shadow it for the rest of the closure, breaking any call to the stdlib module made
     # anywhere inside build_control_plane_router after this point.
     secret_backend = secret_provider or LocalSecretProvider()
+
+    def upstream_credential(server):
+        """Deferred credential resolution for ``ToolsCache.get_raw_tools(resolve_credential=...)``:
+        runs only if a fetch really happens, and raises UpstreamCredentialError on failure."""
+        async def resolve():
+            return await resolve_upstream_credential(
+                server, secrets=secret_backend,
+                token_issuer=token_issuer_provider() if token_issuer_provider is not None else None,
+            )
+        return resolve
 
     # Enterprise #9: approval workflows. Built whenever a ProposalRepo is wired (the real app
     # always wires one; tests that don't care about approvals leave it None and get byte-
@@ -402,12 +419,18 @@ def build_control_plane_router(
                     await asyncio.wait_for(
                         tools_cache.get_raw_tools(
                             server.id, server.upstream_url, force_refresh=True,
-                            upstream_auth_header=server.upstream_auth_header,
+                            resolve_credential=upstream_credential(server),
                         ),
                         timeout=PROBE_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
                     pass
+                except UpstreamCredentialError as e:
+                    # Best-effort refresh: poll_one() above already recorded the same credential
+                    # failure as the server's unhealthy reason, which is what the response
+                    # reports. Not forwarding without a credential IS the behaviour; don't 5xx a
+                    # re-probe over it.
+                    logger.info("catalog refresh for '%s' skipped: %s", slug, e.reason)
         project_slugs = await _project_slug_map(project_repo) if project_repo is not None else {}
         return _server_to_response(await server_repo.get(slug), project_slugs)
 
@@ -567,10 +590,17 @@ def build_control_plane_router(
         if tools_cache is None:
             return ServerToolsResponse(fetched_at=None, tools=[])
 
-        tools = await tools_cache.get_raw_tools(
-            server.id, server.upstream_url, force_refresh=force_refresh,
-            upstream_auth_header=server.upstream_auth_header,
-        )
+        try:
+            tools = await tools_cache.get_raw_tools(
+                server.id, server.upstream_url, force_refresh=force_refresh,
+                resolve_credential=upstream_credential(server),
+            )
+        except UpstreamCredentialError as e:
+            # Explicit, not an empty list: an empty Tools card was exactly the silent failure
+            # #146 hid. Same fail-closed posture as the data plane's 502 on a credential failure.
+            raise HTTPException(
+                status_code=502, detail=f"upstream credential could not be resolved: {e.reason}",
+            )
         result = []
         for tool in tools:
             name = tool.get("name", "")

@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 import httpx
 from fastapi import Request, Response
@@ -17,6 +17,7 @@ from archon.secrets.local import LocalSecretProvider
 from archon.settings import Settings
 from argus.audit import AuditLogger
 from argus.bridge import BridgeError, ProtocolBridge
+from argus.credentials import resolve_upstream_credential
 from argus.discover import synthesize_server_discover
 from argus.generation import ClientGeneration, detect_client_generation
 from argus.headers import (
@@ -811,6 +812,19 @@ class Pipeline:
         """Delegates to Metering.record_usage — see there for the "never drifts from the audit
         rows" discipline and the fail-open rationale."""
         await self._metering.record_usage(server, tool_name, api_key_id)
+
+    def catalog_credential(self, server: ServerRecord) -> Callable[[], Awaitable[Optional[str]]]:
+        """Deferred credential for callers that fetch a tool catalog OUTSIDE a client request (the
+        aggregate endpoint's fan-out), for ``ToolsCache.get_raw_tools(resolve_credential=...)``.
+
+        Uses this pipeline's own secret provider and token issuer, read at call time so a
+        late-wired or rotated issuer is honoured. Raises UpstreamCredentialError on failure —
+        see argus/credentials.py for why this sits beside, not under, _resolve_credential."""
+        async def resolve() -> Optional[str]:
+            return await resolve_upstream_credential(
+                server, secrets=self._secrets, token_issuer=self._token_issuer,
+            )
+        return resolve
 
     class _CredentialResolutionFailed(Exception):
         """Internal-only signal carrying the already-built error Response — see
