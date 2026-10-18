@@ -105,7 +105,35 @@ python -m argus rotate-signing-key --apply
 For a zero-401 window, flip the mode **before** enabling the env: Acropolis starts sending tokens
 to an inert upstream, then the upstream starts requiring the tokens already being sent.
 
+Expect the server to read **unhealthy** with `token auth not enforced: …` in that window (see
+"Health: the tokenless check" below). That is the truth: until step 3 is live the upstream is not
+refusing anything. The reason clears on the next poll after the env is in, and it fires one
+unhealthy webhook on the way in. Do the steps back to back, or expect the alert.
+
 Rollback at any point: set `credential_mode='none'` and remove the `TOKEN_*` env.
+
+## Health: the tokenless check
+
+The authenticated health probe proves a server **accepts** a valid token. It cannot show that the
+server would also **refuse** a request with none, and that is the failure that matters:
+`mcp-authn` is fail-open on missing config (no `TOKEN_*` env = pass-through, which is how it ships
+inert). A redeploy from a manifest that lost the env, or a misspelled variable, turns a protected
+server back into an open one while every positive check still passes.
+
+So for every `credential_mode='token'` server that probes healthy, the poller sends one more
+request with **no credential at all** (a `ping` to the MCP endpoint, every poll interval) and expects
+a refusal:
+
+| Answer | Result |
+|---|---|
+| `401` or `403` | enforced; server stays healthy |
+| any other HTTP status (200, 400, 404, 500 …) | `unhealthy`, reason `token auth not enforced: an unauthenticated request got HTTP <n>, expected 401 …`; one webhook on the edge |
+| network error or timeout | inconclusive; no change (the authenticated probe just succeeded, so it is a transient) |
+
+The middleware wraps the whole handler, so a tokenless POST to the MCP endpoint is refused before
+routing or body parsing; that is why a 404 or 400 counts as "bypassed". The check never runs for
+`none` or `static` servers. It does not stop traffic: `health_status` feeds the metrics, the UI and
+the unhealthy webhook, not routing.
 
 ## Third-party exceptions
 

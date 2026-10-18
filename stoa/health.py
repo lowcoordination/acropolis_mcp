@@ -42,6 +42,10 @@ SECRET_RESOLUTION_FAILURE_PREFIX = "secret resolution failed: "
 # from a plain network failure (health_reason None) and from a secret-resolution failure above.
 TOKEN_MINT_FAILURE_PREFIX = "token mint failed: "
 
+# Issue #134 hardening: the reason prefix when a token-mode server ANSWERS a request that carries
+# no credential. See check_auth_enforced.
+AUTH_NOT_ENFORCED_PREFIX = "token auth not enforced: "
+
 
 async def probe_server(
     client: httpx.AsyncClient, handshake_cache: UpstreamHandshakeCache, server: ServerRecord,
@@ -181,6 +185,51 @@ async def probe_server(
     return ("healthy", handshake.protocol_version, discover_json, None)
 
 
+async def check_auth_enforced(client: httpx.AsyncClient, server: ServerRecord) -> Optional[str]:
+    """Negative probe for a ``credential_mode='token'`` server: send a request with NO credential
+    and report whether the upstream refused it.
+
+    The authenticated probe only proves the server accepts a valid token — it says nothing about
+    whether the server would also accept no token. That is the failure that matters here, and
+    mcp-authn is deliberately fail-open on missing config (no ``TOKEN_*`` env = pass-through, so
+    it can ship inert): a redeploy from a manifest that lost the env, or a typo'd variable name,
+    silently turns a protected server back into an open one, and every positive check keeps
+    passing. Only a request that SHOULD be refused can notice.
+
+    Returns ``None`` when the upstream refused it (401/403) — the expected, healthy outcome — or
+    when the answer is inconclusive (network error or timeout: the authenticated probe just
+    succeeded, so this is a transient, and a transient must not raise a security alert). Returns
+    a reason string for any other HTTP response. The middleware wraps the whole handler, so an
+    unauthenticated POST to the MCP endpoint is refused BEFORE routing or body parsing; a 200, a
+    404 or a 400 all mean the request got past the gate.
+
+    ``ping`` is a no-side-effect MCP method. Nothing is sent that could authenticate: no
+    Authorization header, no token."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        MCP_METHOD_HEADER: "ping",
+    }
+    body = {"jsonrpc": "2.0", "id": "acropolis-auth-check", "method": "ping"}
+    try:
+        resp = await client.post(
+            server.upstream_url, json=body, headers=headers, timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as e:
+        logger.info("auth-enforcement check for '%s' was inconclusive: %s", server.slug, e)
+        return None
+    if resp.status_code in (401, 403):
+        return None
+    logger.warning(
+        "server '%s' is in token mode but answered an unauthenticated request with HTTP %s",
+        server.slug, resp.status_code,
+    )
+    return (
+        f"{AUTH_NOT_ENFORCED_PREFIX}an unauthenticated request got HTTP {resp.status_code}, "
+        "expected 401 — the server is not verifying Acropolis tokens"
+    )
+
+
 class HealthPoller(BackgroundLoop):
     """Background task: periodically probes every enabled server and updates its health/
     protocol/discover_json fields via ServerRepo.set_health()."""
@@ -248,6 +297,14 @@ class HealthPoller(BackgroundLoop):
             self._client, self._handshakes, server, secret_provider=self._secrets,
             token_issuer=self._token_issuer,
         )
+        # A token-mode server that probes healthy WITH its token must also refuse a request
+        # WITHOUT one. Protocol/discover data from the good probe is kept; only status and reason
+        # change. Runs only when the authenticated probe passed (otherwise the server is already
+        # unhealthy and a second request would add nothing).
+        if health_status == "healthy" and server.credential_mode == "token":
+            not_enforced = await check_auth_enforced(self._client, server)
+            if not_enforced is not None:
+                health_status, health_reason = "unhealthy", not_enforced
         await self._repo.set_health(
             server.slug, health_status=health_status, upstream_protocol=protocol,
             discover_json=json.dumps(discover_json) if discover_json else None,
