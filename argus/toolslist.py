@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import asyncpg
 
@@ -47,11 +47,24 @@ class ToolsCache:
     async def get_raw_tools(
         self, server_id: int, upstream_url: str, force_refresh: bool = False,
         upstream_auth_header: Optional[str] = None,
+        resolve_credential: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
     ) -> list[dict]:
-        """Returns the server's full (unfiltered) tool list, from cache if fresh or by fetching."""
+        """Returns the server's full (unfiltered) tool list, from cache if fresh or by fetching.
+
+        ``upstream_auth_header`` must already be RESOLVED (plaintext) — the data plane passes the
+        credential its pipeline resolved. Callers that only have the server record (the control
+        plane) pass ``resolve_credential`` instead: it is awaited only when a fetch actually
+        happens, so a cache hit never touches the token issuer or a secret backend, and its
+        result replaces ``upstream_auth_header``. If it raises, the exception propagates — a
+        credential we could not produce must never become an unauthenticated fetch, nor be
+        swallowed into the stale-cache / empty-list fallback below (that was issue #146).
+        """
         rows = await self._cached_rows(server_id)
         if rows and not force_refresh and all(self._is_fresh(r["fetched_at"], r["ttl_ms"]) for r in rows):
             return [json.loads(r["definition_json"]) for r in rows]
+
+        if resolve_credential is not None:
+            upstream_auth_header = await resolve_credential()
 
         try:
             # Unique id per call, not a fixed literal — see argus/upstream.py's _handshake for
@@ -134,10 +147,11 @@ class ToolsCache:
     async def get_filtered_tools(
         self, server_id: int, upstream_url: str, policy: ServerPolicy,
         upstream_auth_header: Optional[str] = None, force_refresh: bool = False,
+        resolve_credential: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
     ) -> list[dict]:
         """Tool list with policy-denied tools removed — what a client is actually allowed to see."""
         tools = await self.get_raw_tools(
             server_id, upstream_url, force_refresh=force_refresh,
-            upstream_auth_header=upstream_auth_header,
+            upstream_auth_header=upstream_auth_header, resolve_credential=resolve_credential,
         )
         return [t for t in tools if tool_is_visible(t["name"], policy)]

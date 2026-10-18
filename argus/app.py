@@ -395,6 +395,7 @@ def create_app(
         secret_provider=secret_provider, tracing=tracing, usage_repo=usage_repo,
         project_repo=project_repo, project_member_repo=project_member_repo,
         proposal_repo=proposal_repo,
+        token_issuer_provider=lambda: app.state.token_issuer,
     ))
     # #122: a SECOND router serving /api/v1, deliberately separate from the control-plane one
     # above. This one is gated by API KEY rather than by session/admin-token + require_role, so
