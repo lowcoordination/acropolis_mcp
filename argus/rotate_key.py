@@ -107,23 +107,25 @@ def _require_signing_capable_provider(provider: SecretProvider) -> None:
 
 
 async def _store_signing_key(
-    provider: SecretProvider, current_ref: str, pem: str, now: float
+    provider: SecretProvider, base_ref: str, pem: str, now: float
 ) -> str:
     """Persist a freshly generated private key through the provider and return its reference.
 
     Tier-specific in the same spirit as ``archon.secrets.store_upstream_auth_header``:
 
     - ``encrypted``: ``store()`` ignores its target and returns an ``enc:v1:`` ciphertext.
-    - ``openbao``: write the new key at the SAME KV path as the current reference but under a
-      generation-specific key name (``key-<epoch>``), so the old key stays resolvable for the
-      overlap window and the next rotation can repeat the same move.
+    - ``openbao``: write the new key at its OWN KV path (``<base>/keys/<epoch>``, field ``key``)
+      rather than a sibling field at the current path. ``OpenBaoSecretProvider.store`` is a
+      whole-object PUT (merge-unaware), so writing a sibling field at the same path silently
+      wipes the previous key mid-rotation — exactly the overlap key the JWKS must keep serving
+      for two TTLs. One key per path also matches that provider's documented convention.
     """
     _require_signing_capable_provider(provider)
     from archon.secrets.openbao import OpenBaoSecretProvider, parse_vault_ref
 
     if isinstance(provider, OpenBaoSecretProvider):
-        vref = parse_vault_ref(current_ref)
-        new_ref = f"vault://{vref.mount}/{vref.path}#key-{int(now)}"
+        vref = parse_vault_ref(base_ref)
+        new_ref = f"vault://{vref.mount}/{vref.path}/keys/{int(now)}#key"
         return await provider.store(new_ref, pem)
     return await provider.store("", pem)
 
@@ -321,7 +323,11 @@ async def rotate_signing_key(
         return result
 
     try:
-        new_ref = await _store_signing_key(secret_provider, active_ref, new_pem, now)
+        # Store relative to the env BOOTSTRAP ref, not the current (possibly already-rotated)
+        # active ref, so rotated keys land at a stable <base>/keys/<epoch> path rather than
+        # nesting deeper on every rotation.
+        base_ref = getattr(settings, "token_signing_key_ref", None) or active_ref
+        new_ref = await _store_signing_key(secret_provider, base_ref, new_pem, now)
     except TokenIssuerConfigError as exc:
         return RotateResult(dry_run=dry_run, error=str(exc))
     except SecretResolutionError as exc:
