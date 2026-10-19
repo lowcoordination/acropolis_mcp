@@ -37,20 +37,59 @@ The API rejects `credential_mode='token'` when no signing key is configured.
 - The public half is derived; JWKS is served at `/.well-known/jwks.json` (unauthenticated).
 - Fail-loud: a configured but unresolvable key aborts startup.
 
-Example (OpenBao + AppRole):
+The signing key lives in OpenBao. Acropolis can log in to OpenBao two ways, both documented in
+[secrets.md](secrets.md#authenticating-to-the-secret-server); this page needs only the key and a
+policy.
+
+Store the key (4096-bit, without touching disk) and write the policy. Rotation writes each new key
+under `<base>/keys/<epoch>`, so the policy must cover the base path **and** `<base>/*`; with only
+the base path, the first rotation fails when it tries to store the new key.
 
 ```bash
-# Store a 4096-bit key without touching disk.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
   | bao kv put kv/cluster/acropolis token-signing-key=-
 
-# Policy + role for the app. Rotation writes new keys under <base>/keys/<epoch>, hence the
-# second path. The provider re-logs-in on lease expiry, so the secret_id is the long-lived
-# credential and the tokens stay short-lived.
 bao policy write acropolis-token-signing - <<'EOF'
 path "kv/data/cluster/acropolis"   { capabilities = ["read", "create", "update"] }
 path "kv/data/cluster/acropolis/*" { capabilities = ["read", "create", "update"] }
 EOF
+```
+
+Acropolis logs in as **one** role, so if the same deployment also resolves other secret references
+(see [secrets.md](secrets.md)), that role's policies must include the paths for those as well as
+the one above; the examples below name a role for the signing key only.
+
+**Kubernetes auth (recommended).** The credential is the pod's own service-account token, which
+Kubernetes issues, expires and rotates, so there is no static secret to leak, back up or forget to
+rotate. Bind a role to the Acropolis service account. The one-time setup (mounting the method,
+`auth/kubernetes/config`) is under "Kubernetes auth" in
+[secrets.md](secrets.md#authenticating-to-the-secret-server).
+
+```bash
+bao write auth/kubernetes/role/acropolis-token-signing \
+  bound_service_account_names=acropolis \
+  bound_service_account_namespaces=acropolis \
+  policies=acropolis-token-signing ttl=1h
+```
+
+Deployment env:
+
+```
+ACROPOLIS_SECRET_PROVIDER=openbao
+ACROPOLIS_VAULT_ADDR=http://openbao.vault-system.svc.cluster.local:8200
+ACROPOLIS_VAULT_AUTH_METHOD=kubernetes
+ACROPOLIS_VAULT_K8S_ROLE=acropolis-token-signing
+ACROPOLIS_TOKEN_SIGNING_KEY_REF=vault://kv/cluster/acropolis#token-signing-key
+```
+
+**AppRole (when Kubernetes auth is not available).** An AppRole `secret_id` is a **long-lived static
+credential**: someone has to create it, store it and rotate it by hand, and anyone who copies it can
+log in until it is revoked. The provider re-logs-in when its token's lease expires, so the OpenBao
+*tokens* stay short-lived, but the `secret_id` does not. Kubernetes auth avoids that credential
+entirely, which is why it is the recommended deployment. Prefer the `_FILE` form of the secret_id
+over an inline variable (the reasons are in secrets.md).
+
+```bash
 bao write auth/approle/role/acropolis-token-signing \
   token_policies=acropolis-token-signing token_ttl=1h token_max_ttl=4h \
   secret_id_ttl=0 token_num_uses=0
@@ -61,8 +100,8 @@ Deployment env:
 ```
 ACROPOLIS_SECRET_PROVIDER=openbao
 ACROPOLIS_VAULT_ADDR=http://openbao.vault-system.svc.cluster.local:8200
-ACROPOLIS_VAULT_ROLE_ID=<from the acropolis-vault Secret>
-ACROPOLIS_VAULT_SECRET_ID=<from the acropolis-vault Secret>
+ACROPOLIS_VAULT_ROLE_ID=<role id>
+ACROPOLIS_VAULT_SECRET_ID_FILE=<path of the mounted secret_id file>
 ACROPOLIS_TOKEN_SIGNING_KEY_REF=vault://kv/cluster/acropolis#token-signing-key
 ```
 
@@ -76,8 +115,9 @@ ACROPOLIS_TOKEN_SIGNING_KEY_REF=vault://kv/cluster/acropolis#token-signing-key
 4. drop the old kid after 20 minutes (two token TTLs).
 
 The running app re-reads rotation state every few seconds and mutates the issuer in place, so no
-restart is needed. Servers cache the JWKS and refetch only on an unknown `kid` — the first
-new-key token triggers one refetch per server. Rotation state lives in the `settings` table
+restart is needed. Servers cache the JWKS and refetch on an unknown `kid` (the first new-key token
+triggers one refetch per server) and also once the cached set is older than `TOKEN_JWKS_MAX_AGE`
+(see the idle-server drill below). Rotation state lives in the `settings` table
 (`token_signing_active_ref`, `token_signing_previous_ref`, `token_signing_previous_drop_at`), so
 an in-flight overlap survives a restart.
 
@@ -91,6 +131,121 @@ python -m argus rotate-signing-key --apply
 # stream tools/calls through the 20-min overlap -> zero failures;
 # the old kid disappears from JWKS at the deadline.
 ```
+
+### Drill: a server that saw no traffic must drop the old key
+
+The overlap drill above proves servers *gain* the new key. It does not prove the other half: that a
+server which saw **no traffic** during the overlap stops trusting the old key afterwards. A server
+that only refetches on an unknown `kid` never would: nothing it receives carries a new `kid`, so it
+keeps the old key for as long as it runs. `mcp-authn` therefore also refetches the JWKS once its
+cached key set is older than `TOKEN_JWKS_MAX_AGE` (default 10 minutes; accepted range 30 seconds to
+24 hours). Run this drill once after any `mcp-authn` upgrade and after changing that variable.
+
+The refetch is **driven by request traffic**: the age of the cache is checked when a request
+arrives. In a running fleet, Acropolis's own health probes
+(about one a minute per server) are that traffic, so every token-mode server refetches roughly every
+`TOKEN_JWKS_MAX_AGE`, whether or not any client uses it.
+
+1. Rotate, and note the two references the command prints (`previous key <ref>` and
+   `active key <ref>`):
+
+   ```bash
+   python -m argus rotate-signing-key --apply
+   ```
+
+2. Wait until the old key has been dropped from JWKS (20 minutes) **plus more than
+   `TOKEN_JWKS_MAX_AGE`** (10 minutes by default): at least 32 minutes after step 1. Every server's
+   cached key set is then either newly fetched without the old key or old enough to be refetched on
+   the next request. Do not send any request signed with the old key before this point; the drill is
+   only meaningful if the cache aged out by itself.
+
+3. Confirm the old `kid` is gone from the public JWKS (`https://acropolis.example.com/.well-known/jwks.json`
+   lists only the active key's `kid`). Then send a token signed by the **old** key to a server, and
+   one signed by the **new** key as a control. Save this probe as `rotation-drill-probe.py`. It runs
+   inside the Acropolis pod, reads the key at `KEY_REF` back from the secret store (so no key
+   material reaches your machine), mints a token for the audience `SLUG`, POSTs a `ping` to
+   `SERVER_URL` and prints only the HTTP status. The token lives 10 minutes and is never printed.
+
+   ```python
+   import asyncio
+   import os
+
+   import httpx
+
+   from archon.secrets import build_secret_provider
+   from archon.settings import Settings
+   from argus.tokens import TokenIssuer, _resolve_rsa_private_key
+
+
+   async def main() -> None:
+       provider = build_secret_provider(Settings())
+       key = await _resolve_rsa_private_key(os.environ["KEY_REF"], provider)
+       token = TokenIssuer(key).mint_uncached(os.environ["SLUG"])
+       headers = {
+           "Authorization": f"Bearer {token}",
+           "Content-Type": "application/json",
+           "Accept": "application/json, text/event-stream",
+           "Mcp-Method": "ping",
+       }
+       body = {"jsonrpc": "2.0", "id": "rotation-drill", "method": "ping"}
+       async with httpx.AsyncClient(trust_env=False, timeout=10, follow_redirects=False) as client:
+           response = await client.post(os.environ["SERVER_URL"], headers=headers, json=body)
+       print(f"HTTP {response.status_code}")
+
+
+   asyncio.run(main())
+   ```
+
+   ```bash
+   # SLUG is the server's audience (its slug); SERVER_URL is its registered URL, exactly as stored.
+   # Keep the quotes: an unquoted URL containing & ; or $( ) is split or expanded by your shell.
+   for ref in "<previous key ref>" "<active key ref>"; do
+     kubectl exec -i deploy/acropolis -- env KEY_REF="$ref" SLUG="<slug>" SERVER_URL="<registered url>" \
+       python - < rotation-drill-probe.py
+   done
+   ```
+
+   The second run sends a token that is **valid for 10 minutes** for that audience, so point
+   `SERVER_URL` only at the server's own registered URL; a token sent anywhere else can be replayed
+   against that server until it expires.
+
+**Expected result.**
+
+| Probe | Result | Meaning |
+|---|---|---|
+| signed by the **previous** key | `HTTP 401` | the server dropped the old key |
+| signed by the **active** key | `HTTP 200` | control: URL, audience and path are right, so the 401 above is about the key and not a typo |
+
+`HTTP 200` for the previous key is a failed drill: that server still trusts a key Acropolis
+stopped publishing. Check that its `mcp-authn` is v0.2.0 or later and that `TOKEN_JWKS_MAX_AGE` is
+not set to hours. If the control is not `200`, the probe is wrong (audience, URL, a gateway in
+between); fix it before reading anything into the first line.
+
+**Confirm the refetch itself in the Acropolis logs.** The JWKS route is served by Acropolis, so
+every server's refetch appears there:
+
+```bash
+kubectl logs deploy/acropolis | grep -c 'GET /.well-known/jwks.json'
+kubectl logs deploy/acropolis --since=1h | grep -c 'GET /.well-known/jwks.json'   # per hour
+```
+
+In a healthy fleet that is about **6 fetches per server per hour** (one per 10-minute max age),
+arriving in staggered bursts every 10 minutes as the servers' caches age out together. A fleet of
+ten servers measured in production gave about 59 per hour. The rate is `3600 / TOKEN_JWKS_MAX_AGE`
+(in seconds) per server, so it changes if you set the variable. Read it over a quiet hour: boots and
+the rotation itself add fetches (each server refetches once on the first new-`kid` token).
+
+**A count of zero** (over a window longer than the max age, with the health poller running) means
+no server is refetching: its cache never ages out, so a key dropped from JWKS **stays trusted** by
+that server. Likely causes are an `mcp-authn` older than v0.2.0, a wrong `TOKEN_JWKS_URL`, or the
+health poller being disabled and no other traffic arriving. A count well below
+`servers x 6` means some servers are not refetching.
+
+What the drill does **not** isolate: while the health poller runs, every server gets a request a
+minute from Acropolis, so no registered server is ever truly traffic-free, and the status codes alone
+cannot tell a refetch caused by a health probe from one caused by the drill's own request. That is
+the deployment's real condition, and the log count is the evidence that refetching happens without
+any client traffic.
 
 ## Enabling it on a server
 
