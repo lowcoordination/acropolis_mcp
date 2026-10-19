@@ -29,6 +29,98 @@ class UpstreamHandshakeError(Exception):
     pass
 
 
+class UpstreamHandshakeTimeout(UpstreamHandshakeError):
+    """The initialize exchange did not finish inside its overall deadline."""
+
+
+class UpstreamHandshakeTooLarge(UpstreamHandshakeError):
+    """The initialize response was larger than HANDSHAKE_MAX_RESPONSE_BYTES, or encoded."""
+
+
+# An initialize result is a few hundred bytes (server info, capabilities). A megabyte is orders of
+# magnitude of headroom and still bounds what one hostile upstream can make us hold per handshake.
+HANDSHAKE_MAX_RESPONSE_BYTES = 1024 * 1024
+
+# The notifications/initialized acknowledgement is fire-and-forget: its answer is never read, and a
+# failure is logged and ignored. It must not be able to hold a handshake (and the per-server lock
+# the handshake runs under) open for the shared client's read budget.
+INITIALIZED_NOTIFICATION_DEADLINE_SECONDS = 10.0
+
+
+class ResponseRejected(Exception):
+    """A bounded read refused an upstream response before or while buffering it."""
+
+
+class ResponseTooLarge(ResponseRejected):
+    pass
+
+
+class UnsupportedContentEncoding(ResponseRejected):
+    pass
+
+
+async def bounded_post(
+    client: httpx.AsyncClient, url: str, *, json: Any, headers: dict,
+    max_bytes: int, deadline: Optional[float] = None,
+) -> httpx.Response:
+    """POST and return the response with its body read, bounded in BOTH size and time.
+
+    httpx's ``timeout`` applies to each I/O operation, not to the request, so an upstream that
+    sends a byte every few seconds never trips it; and ``client.post`` buffers the whole body, so a
+    hostile upstream can make us hold an arbitrarily large one. This streams the body, counts the
+    bytes as they arrive, and stops at ``max_bytes`` (raising ResponseTooLarge), and wraps the whole
+    exchange (connect, headers, body) in ``asyncio.wait_for(deadline)`` (raising TimeoutError).
+    ``deadline=None`` means no overall deadline, i.e. only the client's own per-operation timeouts
+    — used by the data-plane handshake, whose timeouts are deliberately left as they were.
+
+    The size is counted on the wire (``aiter_raw``) and compression is refused: a decoder expands a
+    chunk before we could count it, so a small gzip body could still balloon in memory. The request
+    asks for ``identity``; a response that is encoded anyway is rejected, not decoded.
+
+    Does not follow redirects regardless of the client's setting, so a 3xx comes back as the answer
+    rather than being chased to another host."""
+    request_headers = dict(headers)
+    request_headers["Accept-Encoding"] = "identity"
+
+    async def _exchange() -> httpx.Response:
+        async with client.stream(
+            "POST", url, json=json, headers=request_headers, follow_redirects=False,
+        ) as resp:
+            encoding = resp.headers.get("content-encoding", "").strip().lower()
+            if encoding not in ("", "identity"):
+                raise UnsupportedContentEncoding(f"response uses content-encoding {encoding!r}")
+            declared = resp.headers.get("content-length")
+            if declared is not None and declared.isdigit() and int(declared) > max_bytes:
+                raise ResponseTooLarge(f"response declares {declared} bytes, limit is {max_bytes}")
+            chunks: list[bytes] = []
+            try:
+                # An in-memory transport (httpx.MockTransport) hands back a response whose body
+                # is already materialised and cannot be streamed again. Nothing is buffered on
+                # our account there, so just enforce the cap on what is already held.
+                held = resp.content
+            except httpx.ResponseNotRead:
+                received = 0
+                async for chunk in resp.aiter_raw():
+                    received += len(chunk)
+                    if received > max_bytes:
+                        raise ResponseTooLarge(f"response body exceeded {max_bytes} bytes")
+                    chunks.append(chunk)
+            else:
+                if len(held) > max_bytes:
+                    raise ResponseTooLarge(f"response body exceeded {max_bytes} bytes")
+                chunks.append(held)
+            # content= is taken as the already-decoded body (we refused encodings above), so
+            # .text honours the declared charset without a second decode step.
+            return httpx.Response(
+                resp.status_code, headers=resp.headers, content=b"".join(chunks),
+                request=resp.request,
+            )
+
+    if deadline is None:
+        return await _exchange()
+    return await asyncio.wait_for(_exchange(), timeout=deadline)
+
+
 @dataclass
 class HandshakeResult:
     session_id: Optional[str]
@@ -150,9 +242,18 @@ class UpstreamHandshakeCache:
                 "clientInfo": CLIENT_INFO,
             },
         }
+        # Bounded read: a size cap always (a legitimate initialize result is tiny), and an overall
+        # deadline when the caller passed `timeout` (the health poller). The data plane passes no
+        # timeout and keeps the shared client's own per-operation budgets, unchanged.
         try:
-            kwargs = {"timeout": timeout} if timeout is not None else {}
-            resp = await self._client.post(upstream_url, json=init_body, headers=headers, **kwargs)
+            resp = await bounded_post(
+                self._client, upstream_url, json=init_body, headers=headers,
+                max_bytes=HANDSHAKE_MAX_RESPONSE_BYTES, deadline=timeout,
+            )
+        except asyncio.TimeoutError as e:
+            raise UpstreamHandshakeTimeout(f"initialize did not complete within {timeout}s") from e
+        except ResponseRejected as e:
+            raise UpstreamHandshakeTooLarge(f"initialize response rejected: {e}") from e
         except httpx.HTTPError as e:
             raise UpstreamHandshakeError(f"initialize request failed: {e}") from e
 
@@ -189,13 +290,16 @@ class UpstreamHandshakeCache:
         if session_id:
             notif_headers["Mcp-Session-Id"] = session_id
         try:
-            await self._client.post(
-                upstream_url,
+            await bounded_post(
+                self._client, upstream_url,
                 json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-                headers=notif_headers,
+                headers=notif_headers, max_bytes=HANDSHAKE_MAX_RESPONSE_BYTES,
+                deadline=INITIALIZED_NOTIFICATION_DEADLINE_SECONDS,
             )
-        except httpx.HTTPError as e:
-            logger.warning("notifications/initialized failed (continuing anyway): %s", e)
+        except (httpx.HTTPError, ResponseRejected, asyncio.TimeoutError) as e:
+            logger.warning(
+                "notifications/initialized failed (continuing anyway): %s", e or type(e).__name__,
+            )
 
         return HandshakeResult(
             session_id=session_id, server_info=server_info,
