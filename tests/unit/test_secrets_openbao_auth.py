@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -44,6 +46,7 @@ class _Server:
         self.issued: set[str] = set()
         self.kv: dict[str, dict] = {"secret/data/acropolis/svc": {"token": "the-secret-value"}}
         self.reads_with: list[str] = []  # X-Vault-Token of each KV read, in order
+        self.login_delay = 0.0  # seconds the login endpoint takes to answer (a hang)
         self._lock = threading.Lock()
 
     def new_token(self) -> str:
@@ -72,6 +75,8 @@ def _handler(state: _Server):
             path = self.path.split("/v1/", 1)[1]
             if path.endswith("/login"):
                 state.logins.append((path, body))
+                if state.login_delay:
+                    time.sleep(state.login_delay)
                 if path == "auth/approle/login":
                     ok = (body.get("role_id"), body.get("secret_id")) == (
                         state.approle_creds["role_id"], state.approle_creds["secret_id"])
@@ -79,10 +84,13 @@ def _handler(state: _Server):
                     ok = body.get("role") == state.k8s_role and body.get("jwt") in state.accepted_jwts
                 else:
                     return self._send(404, {"errors": ["no such auth mount"]})
-                if not ok:
-                    return self._send(403, {"errors": ["permission denied"]})
-                return self._send(200, {"auth": {
-                    "client_token": state.new_token(), "lease_duration": state.lease_seconds}})
+                try:
+                    if not ok:
+                        return self._send(403, {"errors": ["permission denied"]})
+                    return self._send(200, {"auth": {
+                        "client_token": state.new_token(), "lease_duration": state.lease_seconds}})
+                except (BrokenPipeError, ConnectionResetError):
+                    return  # the client gave up (a timeout test); nothing to report
             self._send(404, {"errors": []})
 
         def do_GET(self):
@@ -216,6 +224,27 @@ async def test_unusable_token_file_is_an_explicit_error(tmp_path, make_file, exp
         assert state.logins == [], "no login may be attempted without a credential"
 
 
+@pytest.mark.asyncio
+async def test_a_short_read_does_not_silently_truncate_the_credential(tmp_path, monkeypatch):
+    """os.read may legally return fewer bytes than the file holds (network filesystems, signals). A
+    credential cut short is worse than an error: it would be sent as if it were the whole thing."""
+    value = "k8s-jwt-" + "x" * 200
+    jwt = _write(tmp_path / "token", value)
+    import archon.secrets.openbao as mod
+
+    real = mod._read
+    monkeypatch.setattr(mod, "_read", lambda fd, n: real(fd, min(n, 7)))  # 7 bytes at a time
+    with _stub() as (state, url):
+        state.accepted_jwts = {value}
+        p = OpenBaoSecretProvider(url, auth_method="kubernetes", k8s_role="acropolis",
+                                  k8s_token_file=str(jwt), ttl_seconds=0.0)
+        try:
+            assert await p.resolve(REF) == "the-secret-value"
+        finally:
+            await p.aclose()
+        assert state.logins[0][1]["jwt"] == value
+
+
 # --------------------------------------------------------------------- AppRole, inline and file
 
 @pytest.mark.asyncio
@@ -276,6 +305,74 @@ async def test_concurrent_cold_resolves_log_in_once(tmp_path):
             await p.aclose()
         assert results == ["the-secret-value"] * 16
         assert len(state.logins) == 1, f"{len(state.logins)} logins for 16 concurrent resolves"
+
+
+@pytest.mark.asyncio
+async def test_failing_logins_do_not_queue_one_behind_another(tmp_path):
+    """The login is single-flight behind a lock. If every waiter then retried its own login in turn
+    after a failure, 8 requests against a hung login endpoint would take 8 x the request timeout and
+    hammer the endpoint (with Kubernetes auth, the API server). A failure is remembered briefly so the
+    waiters fail fast with the same error."""
+    jwt = _write(tmp_path / "token", "k8s-jwt-1")
+    with _stub() as (state, url):
+        state.accepted_jwts = {"k8s-jwt-1"}
+        state.login_delay = 1.2  # the login endpoint hangs past the 0.3 s request timeout
+        p = OpenBaoSecretProvider(url, auth_method="kubernetes", k8s_role="acropolis",
+                                  k8s_token_file=str(jwt), ttl_seconds=0.0, request_timeout_seconds=0.3)
+        try:
+            start = time.monotonic()
+            results = await asyncio.gather(*[p.resolve(REF) for _ in range(8)], return_exceptions=True)
+            elapsed = time.monotonic() - start
+        finally:
+            await p.aclose()
+        assert all(isinstance(r, SecretResolutionError) for r in results), results
+        assert elapsed < 1.0, f"8 concurrent failing logins took {elapsed:.1f}s: they queued behind each other"
+        assert len(state.logins) == 1, f"{len(state.logins)} login attempts for 8 concurrent resolves"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_login_is_retried_after_the_backoff(tmp_path):
+    jwt = _write(tmp_path / "token", "k8s-jwt-1")
+    with _stub() as (state, url):
+        state.accepted_jwts = set()  # rejected at first
+        p = OpenBaoSecretProvider(url, auth_method="kubernetes", k8s_role="acropolis",
+                                  k8s_token_file=str(jwt), ttl_seconds=0.0)
+        try:
+            with pytest.raises(SecretResolutionError):
+                await p.resolve(REF)
+            state.accepted_jwts = {"k8s-jwt-1"}  # the operator fixes it
+            with pytest.raises(SecretResolutionError):  # still inside the backoff: no new attempt
+                await p.resolve(REF)
+            assert len(state.logins) == 1
+            p._login_failed_until = 0.0  # backoff over
+            assert await p.resolve(REF) == "the-secret-value"
+            assert len(state.logins) == 2
+        finally:
+            await p.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_credential_path_that_is_not_a_regular_file_is_refused_not_blocked_on(tmp_path):
+    """A FIFO with no writer blocks a read forever, and the read happens while the login lock is
+    held, which would freeze every secret resolution. Only regular files are read."""
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    with _stub() as (state, url):
+        p = OpenBaoSecretProvider(url, auth_method="kubernetes", k8s_role="acropolis",
+                                  k8s_token_file=str(fifo), ttl_seconds=0.0)
+        try:
+            with pytest.raises(SecretResolutionError) as exc:
+                await asyncio.wait_for(p.resolve(REF), timeout=3.0)
+        finally:
+            # If a regression left a thread stuck opening the FIFO, release it so the test FAILS
+            # (TimeoutError above) instead of hanging the whole run at event-loop shutdown.
+            try:
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+            await p.aclose()
+        assert "regular file" in exc.value.reason
+        assert state.logins == []
 
 
 # --------------------------------------------------------------------- configuration

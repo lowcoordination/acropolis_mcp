@@ -48,7 +48,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import stat
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -71,6 +73,16 @@ AUTH_METHODS = ("token", "approle", "kubernetes")
 # A credential file holds a token or an id, never a document. The cap stops a mis-pointed path
 # (a log, a device) from being read into memory; a real projected JWT is about 1 KiB.
 MAX_CREDENTIAL_FILE_BYTES = 16 * 1024
+# After a failed login (endpoint down or hung, credential rejected, file missing), further requests
+# fail fast with the same error for this long instead of each retrying in turn behind the login
+# lock. Without it, N waiters against a hung endpoint take N x the request timeout and hammer the
+# endpoint (with Kubernetes auth, the API server). Short, so a fixed credential is picked up quickly.
+LOGIN_FAILURE_BACKOFF_SECONDS = 2.0
+
+def _read(fd: int, n: int) -> bytes:
+    """os.read, as a seam: a test makes it return short reads, which a local file never does."""
+    return os.read(fd, n)
+
 
 # The auth mount name is interpolated into the login URL, so it is restricted the way a Vault
 # path segment list reasonably is: no empty, "." or ".." segments, no query/fragment/whitespace
@@ -216,6 +228,8 @@ class OpenBaoSecretProvider:
         # One login at a time: when the cached token expires, every in-flight request would
         # otherwise log in separately (with Kubernetes auth each login is a TokenReview call).
         self._login_lock = asyncio.Lock()
+        self._login_failed_until: float = 0.0
+        self._login_failure: Optional[tuple[str, str]] = None  # (ref label, reason) of the last failure
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -224,9 +238,27 @@ class OpenBaoSecretProvider:
     async def _read_credential_file(self, path: str, label: str, what: str) -> str:
         """Read a credential from a file, fresh each time. Errors name the path and the problem
         and NEVER include the file's contents."""
-        def read() -> bytes:
-            with open(path, "rb") as f:
-                return f.read(MAX_CREDENTIAL_FILE_BYTES + 1)
+        def read() -> Optional[bytes]:
+            # Opened non-blocking and checked with fstat BEFORE reading: a FIFO with no writer would
+            # otherwise block this thread forever while the login lock is held, freezing every
+            # secret resolution. Only a regular file is a credential file.
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                # os.read may legally return fewer bytes than the file holds (network filesystems,
+                # signals); a silently truncated credential is worse than an error, so read to EOF
+                # or one byte past the cap.
+                chunks, total = [], 0
+                while total <= MAX_CREDENTIAL_FILE_BYTES:
+                    chunk = _read(fd, MAX_CREDENTIAL_FILE_BYTES + 1 - total)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                return b"".join(chunks)
+            finally:
+                os.close(fd)
 
         try:
             raw = await asyncio.to_thread(read)
@@ -234,6 +266,8 @@ class OpenBaoSecretProvider:
             raise SecretResolutionError(
                 label, f"could not read the {what} file {path!r}: {e.strerror or type(e).__name__}"
             ) from e
+        if raw is None:
+            raise SecretResolutionError(label, f"the {what} file {path!r} is not a regular file")
         if len(raw) > MAX_CREDENTIAL_FILE_BYTES:
             raise SecretResolutionError(
                 label, f"the {what} file {path!r} is too large to be a credential "
@@ -280,6 +314,8 @@ class OpenBaoSecretProvider:
         except (ValueError, KeyError, TypeError) as e:
             raise SecretResolutionError(label, f"{name} login response malformed: {e}") from e
         self._login_token = token
+        self._login_failed_until = 0.0
+        self._login_failure = None
         # Refresh a bit before actual expiry so a resolve() never races a just-expired token.
         self._login_token_expires_at = time.monotonic() + max(lease_seconds - 30.0, 5.0)
         return token
@@ -297,7 +333,18 @@ class OpenBaoSecretProvider:
             return token
         async with self._login_lock:
             # Re-check: another request may have logged in while this one waited.
-            return self._cached_login_token() or await self._login()
+            token = self._cached_login_token()
+            if token:
+                return token
+            # ...or may have just failed: fail fast with the same error rather than retry in turn.
+            if self._login_failure and time.monotonic() < self._login_failed_until:
+                raise SecretResolutionError(*self._login_failure)
+            try:
+                return await self._login()
+            except SecretResolutionError as e:
+                self._login_failure = (e.ref, e.reason)
+                self._login_failed_until = time.monotonic() + LOGIN_FAILURE_BACKOFF_SECONDS
+                raise
 
     async def resolve(self, ref: str) -> str:
         cached = self._cache.get(ref)

@@ -190,13 +190,17 @@ bao auth enable kubernetes                       # skip if already mounted
 bao write auth/kubernetes/config \
     kubernetes_host=https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT
 bao policy write acropolis - <<'EOF'
-path "secret/data/acropolis/*" { capabilities = ["read", "create", "update"] }
+path "secret/data/acropolis/*" { capabilities = ["read"] }
 EOF
 bao write auth/kubernetes/role/acropolis \
     bound_service_account_names=acropolis \
     bound_service_account_namespaces=acropolis \
     policies=acropolis ttl=1h
 ```
+
+`read` is all Acropolis needs to resolve references. Add `create` and `update` only if you use
+`python -m argus rotate-signing-key`, which writes each new signing key to its own path under the
+current key's path, so the policy must cover that prefix too.
 
 Pod side:
 
