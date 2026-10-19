@@ -259,6 +259,11 @@ export interface ToolTestResponse {
 export interface ServerToolsResponse {
   fetched_at: string | null
   tools: ServerTool[]
+  // True when a needed upstream fetch failed: `tools` is then the stale cache, or empty because
+  // the fetch failed rather than because the upstream has no tools. `fetch_error` is a short
+  // fixed reason from the gateway (e.g. "upstream answered 401"). Rendered as text only.
+  stale: boolean
+  fetch_error: string | null
 }
 
 export interface ConfigImportAction {
