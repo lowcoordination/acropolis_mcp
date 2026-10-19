@@ -3,14 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from secrets import token_hex
 from typing import Optional
 
 import httpx
 
 from archon.background import BackgroundLoop
-from archon.secrets import SecretProvider, SecretResolutionError
+from archon.secrets import SecretProvider
 from archon.secrets.local import LocalSecretProvider
 from argus.bridge import META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION
+from argus.credentials import (
+    TOKEN_MINT_FAILED,
+    TOKEN_NOT_CONFIGURED,
+    UpstreamCredentialError,
+    resolve_upstream_credential,
+)
 from argus.headers import MCP_METHOD_HEADER
 from argus.tokens import TokenIssuer
 from argus.upstream import (
@@ -48,19 +55,17 @@ PROBE_MAX_RESPONSE_BYTES = 1024 * 1024
 # rest; the bound keeps a large fleet from opening hundreds of sockets in a single burst.
 MAX_CONCURRENT_PROBES = 16
 
-# The reason string stored on servers.health_reason when a probe fails specifically because the
-# configured secret couldn't be resolved — distinguishable, by a human or by test assertions,
-# from a plain network-level probe failure (which leaves health_reason None; see the docstring
-# on probe_server below).
-SECRET_RESOLUTION_FAILURE_PREFIX = "secret resolution failed: "
-
 # Issue #134 (T3): the reason prefix when a token-mode probe can't mint its JWT — distinguishable
-# from a plain network failure (health_reason None) and from a secret-resolution failure above.
+# from a plain network failure (health_reason None) and from a secret-resolution failure.
 TOKEN_MINT_FAILURE_PREFIX = "token mint failed: "
 
 # Issue #134 hardening: the reason prefix when a token-mode server ANSWERS a request that carries
 # no credential. See check_auth_enforced.
 AUTH_NOT_ENFORCED_PREFIX = "token auth not enforced: "
+
+# Issue #156: the reason prefix when a token-mode server REFUSES a request with no token but ACCEPTS a
+# genuinely signed token whose audience is not its own. See check_auth_enforced.
+AUDIENCE_NOT_ENFORCED_PREFIX = "token accepted for the wrong audience: "
 
 # Reasons for a probe that was cut off rather than answered (see PROBE_DEADLINE_SECONDS and
 # PROBE_MAX_RESPONSE_BYTES): distinguishable from a plain outage (health_reason None).
@@ -103,35 +108,27 @@ async def probe_server(
     }
     # A server with a configured upstream credential needs it on the health probe too, or every
     # registered server requiring auth would show permanently unhealthy regardless of whether
-    # tools/call itself works.
+    # tools/call itself works. A token-mode server needs its JWT for the same reason: a probe that
+    # 401s while tools/call works would read permanently unhealthy.
     #
-    # This goes through the configured SecretProvider — resolve() returns the literal unchanged
-    # under `local`, or resolves a `vault://`/`enc:v1:` reference under the other tiers. A
-    # resolution failure must NEVER be treated the same as "no credential configured" (which
-    # would probe unauthenticated and either misreport health or, worse, look healthy against an
-    # upstream that doesn't actually need auth) — it is reported as its own distinguishable
-    # unhealthy reason instead.
-    resolved_auth_header: str | None = None
-    if server.credential_mode == "token":
-        # Issue #134 (T3): a token-mode server needs its JWT on the probe too — a health check
-        # must carry the same credential a real tools/call does, or the server reads permanently
-        # unhealthy (probe 401s) while tools/call itself works. Mint via the startup-wired
-        # issuer; fail closed (unhealthy, distinguishable reason) if it's absent or the mint
-        # fails — never probe unauthenticated and misreport health.
-        if token_issuer is None:
+    # The per-mode rule is argus.credentials.resolve_upstream_credential (issue #155), shared with
+    # the data plane and the control plane; this only maps its failure to an unhealthy reason. A
+    # failure must NEVER be treated the same as "no credential configured" (which would probe
+    # unauthenticated and either misreport health or, worse, look healthy against an upstream that
+    # doesn't actually need auth), so it is reported as its own distinguishable reason.
+    try:
+        resolved_auth_header = await resolve_upstream_credential(
+            server, secrets=secrets, token_issuer=token_issuer,
+        )
+    except UpstreamCredentialError as e:
+        if e.kind == TOKEN_NOT_CONFIGURED:
             return ("unhealthy", None, None, f"{TOKEN_MINT_FAILURE_PREFIX}token signing is not configured")
-        try:
-            resolved_auth_header = f"Bearer {await token_issuer.get_token(server.slug)}"
-        except Exception:
-            logger.exception("probe for '%s' could not mint a token", server.slug)
+        if e.kind == TOKEN_MINT_FAILED:
             return ("unhealthy", None, None, f"{TOKEN_MINT_FAILURE_PREFIX}token mint failed")
-        headers["Authorization"] = resolved_auth_header
-    elif server.upstream_auth_header:
-        try:
-            resolved_auth_header = await secrets.resolve(server.upstream_auth_header)
-        except SecretResolutionError as e:
-            logger.info("probe for '%s' could not resolve its credential: %s", server.slug, e.reason)
-            return ("unhealthy", None, None, f"{SECRET_RESOLUTION_FAILURE_PREFIX}{e.reason}")
+        logger.info("probe for '%s' could not resolve its credential: %s", server.slug, e.reason)
+        # e.reason already reads "secret resolution failed: <reason>".
+        return ("unhealthy", None, None, e.reason)
+    if resolved_auth_header:
         headers["Authorization"] = resolved_auth_header
     discover_body = {
         "jsonrpc": "2.0", "id": "acropolis-discover", "method": "server/discover",
@@ -220,21 +217,29 @@ async def probe_server(
     return ("healthy", handshake.protocol_version, discover_json, None)
 
 
-# Hard ceiling on the WHOLE tokenless check. httpx's timeout applies to each I/O operation, not to
-# the request, so an upstream that drips bytes just inside it (1 byte every few seconds) would
-# otherwise hold this call open for minutes, and the poll loop is serial: one stalling server would
-# freeze health updates for every other server. Module-level so a test can shrink it.
+# Hard ceiling on the WHOLE of each enforcement request (tokenless, wrong-audience). httpx's timeout
+# applies to each I/O operation, not to the request, so an upstream that drips bytes just inside it
+# (1 byte every few seconds) would otherwise hold this call open for minutes, occupying one of the
+# poller's probe slots. Module-level so a test can shrink it.
 AUTH_CHECK_DEADLINE_SECONDS = PROBE_TIMEOUT_SECONDS
 
+# Statuses that mean "refused by the auth gate".
+_REFUSED = (401, 403)
+# Gateway-class statuses come from something IN FRONT of the app (an ingress or proxy mid rollout, a
+# restarting pod's Service), never from the middleware, which answers 401 before the application can
+# run. They say nothing about auth, so they are the same transient as a dropped connection.
+_GATEWAY_TRANSIENT = (502, 503, 504)
 
-async def _tokenless_status(url: str, headers: dict, body: dict) -> int:
-    """POST with nothing that could authenticate and return only the status code.
+
+async def _status_only_post(url: str, headers: dict, body: dict) -> int:
+    """POST and return only the status code. The one request path for every enforcement check.
 
     A fresh client on purpose, not the app's shared one: the shared client has a cookie jar, so a
-    session cookie an upstream set on an earlier AUTHENTICATED response would ride along on this
-    "tokenless" request (observed in the PR #150 security scan). ``trust_env=False`` keeps ``.netrc``
-    credentials and proxy environment variables out of it too, and ``follow_redirects=False`` means a
-    3xx is reported as the answer rather than chased to another host. Streamed, and the body is never
+    session cookie an upstream set on an earlier AUTHENTICATED response would ride along on a
+    request that is meant to carry only what ``headers`` says (observed in the PR #150 security
+    scan). ``trust_env=False`` keeps ``.netrc`` credentials and proxy environment variables out of it
+    too, and ``follow_redirects=False`` means a 3xx is reported as the answer rather than chased to
+    another host (which would also be sent the Authorization header). Streamed, and the body is never
     read: only the status line matters, and buffering would let a hostile upstream make us hold an
     arbitrarily large body per probe."""
     async with httpx.AsyncClient(
@@ -244,32 +249,68 @@ async def _tokenless_status(url: str, headers: dict, body: dict) -> int:
             return resp.status_code
 
 
-async def check_auth_enforced(server: ServerRecord) -> Optional[str]:
-    """Negative probe for a ``credential_mode='token'`` server: send a request with NO credential
-    and report whether the upstream refused it.
+async def _enforcement_status(server: ServerRecord, headers: dict, body: dict, what: str) -> Optional[int]:
+    """The status ``server`` answered an enforcement request with, or ``None`` when the answer is
+    inconclusive: a network error, a timeout past AUTH_CHECK_DEADLINE_SECONDS, or a gateway-class
+    502/503/504. The authenticated probe just succeeded, so each of those is a transient, and a
+    transient must not raise a security alert. ``what`` names the check in the log line only; never
+    pass anything derived from ``headers`` (it may carry a token)."""
+    try:
+        status = await asyncio.wait_for(
+            _status_only_post(server.upstream_url, headers, body), timeout=AUTH_CHECK_DEADLINE_SECONDS,
+        )
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        logger.info(
+            "%s check for '%s' was inconclusive: %s", what, server.slug, e or type(e).__name__,
+        )
+        return None
+    if status in _GATEWAY_TRANSIENT:
+        logger.info("%s check for '%s' was inconclusive: HTTP %s", what, server.slug, status)
+        return None
+    return status
 
-    The authenticated probe only proves the server accepts a valid token — it says nothing about
-    whether the server would also accept no token. That is the failure that matters here, and
-    mcp-authn is deliberately fail-open on missing config (no ``TOKEN_*`` env = pass-through, so
-    it can ship inert): a redeploy from a manifest that lost the env, or a typo'd variable name,
-    silently turns a protected server back into an open one, and every positive check keeps
-    passing. Only a request that SHOULD be refused can notice.
 
-    Returns ``None`` when the upstream refused it (401/403) — the expected, healthy outcome — or
-    when the answer is inconclusive (network error, timeout, or a gateway-class 502/503/504: the
-    authenticated probe just succeeded, so this is a transient, and a transient must not raise a
-    security alert). Returns a reason string for any other HTTP response.
+def _probe_audience() -> str:
+    """An audience no server accepts: random, so it can never collide with a real slug (a server's
+    audience IS its slug) and a server cannot be configured to accept it by accident."""
+    return f"acropolis-health-probe-{token_hex(8)}"
 
-    The middleware wraps the whole handler, so an unauthenticated POST to the MCP endpoint is
-    refused BEFORE routing or body parsing; a 200, a 404 or a 400 all mean the request got past the
-    gate.
 
-    What this does NOT prove: that the server verifies signature and audience. A server that
-    refuses a missing token but accepts any bearer value would pass. It also only tests the
-    registered URL, and a compromised upstream can simply answer 401. It closes one specific blind
-    spot (auth silently switched off), not the whole class.
+async def check_auth_enforced(
+    server: ServerRecord, token_issuer: Optional[TokenIssuer] = None,
+) -> Optional[str]:
+    """Negative probes for a ``credential_mode='token'`` server. Returns ``None`` when the server
+    behaved (or the answer is inconclusive), else a reason string to store as ``health_reason``.
 
-    ``ping`` is a no-side-effect MCP method. Nothing is sent that could authenticate: no
+    1. TOKENLESS. Send a request with NO credential and require 401/403. The authenticated probe
+       only proves the server accepts a valid token — it says nothing about whether the server
+       would also accept no token. That is the failure that matters here, and mcp-authn is
+       deliberately fail-open on missing config (no ``TOKEN_*`` env = pass-through, so it can ship
+       inert): a redeploy from a manifest that lost the env, or a typo'd variable name, silently
+       turns a protected server back into an open one, and every positive check keeps passing. The
+       middleware wraps the whole handler, so an unauthenticated POST to the MCP endpoint is refused
+       BEFORE routing or body parsing; a 200, a 404 or a 400 all mean the request got past the gate.
+
+    2. WRONG AUDIENCE (issue #156; only when ``token_issuer`` is given and step 1 CONCLUSIVELY saw a
+       refusal). A server that refuses a missing token but accepts any well-formed bearer string
+       passes step 1. So send a token that is correctly signed by this Acropolis's issuer but for an
+       audience no server accepts, and require 401/403 again. A 200 means the server is not
+       checking the audience (or the signature). This costs one extra request per token-mode server
+       per poll, and none when step 1 failed or was inconclusive. The token is minted for this one
+       request (``TokenIssuer.mint_uncached``: not cached, so a real request is never handed it),
+       exists only in the request headers, and is never logged, stored or put in the returned
+       reason.
+
+    "Inconclusive" (network error, timeout, or a gateway-class 502/503/504) returns ``None`` for
+    both steps, because a transient must not raise a security alert.
+
+    What this does NOT prove: that the server rejects a token with a valid audience signed by a
+    different key (that would be a second request; alternating the two per poll would make a
+    non-conforming server flap between healthy and unhealthy). It also only tests the registered
+    URL, and a compromised upstream can simply answer 401. It closes specific blind spots (auth
+    silently switched off, audience or signature unchecked), not the whole class.
+
+    ``ping`` is a no-side-effect MCP method. Step 1 sends nothing that could authenticate: no
     Authorization header, no token, no cookie."""
     headers = {
         "Content-Type": "application/json",
@@ -277,31 +318,42 @@ async def check_auth_enforced(server: ServerRecord) -> Optional[str]:
         MCP_METHOD_HEADER: "ping",
     }
     body = {"jsonrpc": "2.0", "id": "acropolis-auth-check", "method": "ping"}
+    status = await _enforcement_status(server, headers, body, "auth-enforcement")
+    if status is None:
+        return None
+    if status not in _REFUSED:
+        logger.warning(
+            "server '%s' is in token mode but answered an unauthenticated request with HTTP %s",
+            server.slug, status,
+        )
+        return (
+            f"{AUTH_NOT_ENFORCED_PREFIX}an unauthenticated request got HTTP {status}, "
+            "expected 401 — it was not refused by token auth"
+        )
+    if token_issuer is None:
+        return None
+
     try:
-        status = await asyncio.wait_for(
-            _tokenless_status(server.upstream_url, headers, body), timeout=AUTH_CHECK_DEADLINE_SECONDS,
-        )
-    except (httpx.HTTPError, asyncio.TimeoutError) as e:
-        logger.info(
-            "auth-enforcement check for '%s' was inconclusive: %s", server.slug, e or type(e).__name__,
-        )
+        probe_token = token_issuer.mint_uncached(_probe_audience())
+    except Exception:
+        # The real token minted a moment ago, so this should not fail; if it does it is not evidence
+        # about the server. Log the traceback only: the exception is from a signing call and does
+        # not carry the token (none exists yet).
+        logger.exception("wrong-audience probe for '%s' could not mint its token", server.slug)
         return None
-    if status in (401, 403):
-        return None
-    if status in (502, 503, 504):
-        # Gateway-class statuses come from something IN FRONT of the app (an ingress or proxy mid
-        # rollout, a restarting pod's Service), never from the middleware, which answers 401
-        # before the application can run. They say nothing about auth, so they are the same
-        # transient as a dropped connection and must not raise a security alert.
-        logger.info("auth-enforcement check for '%s' was inconclusive: HTTP %s", server.slug, status)
+    status = await _enforcement_status(
+        server, {**headers, "Authorization": f"Bearer {probe_token}"},
+        {**body, "id": "acropolis-audience-check"}, "wrong-audience",
+    )
+    if status is None or status in _REFUSED:
         return None
     logger.warning(
-        "server '%s' is in token mode but answered an unauthenticated request with HTTP %s",
+        "server '%s' is in token mode but accepted a token for the wrong audience (HTTP %s)",
         server.slug, status,
     )
     return (
-        f"{AUTH_NOT_ENFORCED_PREFIX}an unauthenticated request got HTTP {status}, "
-        "expected 401 — it was not refused by token auth"
+        f"{AUDIENCE_NOT_ENFORCED_PREFIX}a token signed for a different audience got HTTP {status}, "
+        "expected 401 — the server is not verifying the token's audience"
     )
 
 
@@ -391,11 +443,11 @@ class HealthPoller(BackgroundLoop):
             health_status, protocol, discover_json = "unhealthy", None, None
             health_reason = f"{PROBE_TIMEOUT_PREFIX}probe exceeded {PROBE_DEADLINE_SECONDS:g}s"
         # A token-mode server that probes healthy WITH its token must also refuse a request
-        # WITHOUT one. Protocol/discover data from the good probe is kept; only status and reason
+        # WITHOUT one, and a token for another audience. Protocol/discover data from the good probe is kept; only status and reason
         # change. Runs only when the authenticated probe passed (otherwise the server is already
         # unhealthy and a second request would add nothing).
         if health_status == "healthy" and server.credential_mode == "token":
-            not_enforced = await check_auth_enforced(server)
+            not_enforced = await check_auth_enforced(server, self._token_issuer)
             if not_enforced is not None:
                 health_status, health_reason = "unhealthy", not_enforced
         await self._repo.set_health(

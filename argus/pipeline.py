@@ -12,12 +12,12 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
 from archon.auth.apikeys import ApiKeyService, key_scope_violation
-from archon.secrets import SecretProvider, SecretResolutionError
+from archon.secrets import SecretProvider
 from archon.secrets.local import LocalSecretProvider
 from archon.settings import Settings
 from argus.audit import AuditLogger
 from argus.bridge import BridgeError, ProtocolBridge
-from argus.credentials import resolve_upstream_credential
+from argus.credentials import UpstreamCredentialError, resolve_upstream_credential
 from argus.discover import synthesize_server_discover
 from argus.generation import ClientGeneration, detect_client_generation
 from argus.headers import (
@@ -842,12 +842,11 @@ class Pipeline:
     ) -> Optional[str]:
         """Resolves the credential that must be sent to the upstream, per ``server.credential_mode``.
 
-        - ``token``  → mints an audience-bound JWT via the startup-wired TokenIssuer (see the
-          branch below) and returns it as ``"Bearer <jwt>"``; ignores ``upstream_auth_header``.
-        - ``static`` / ``none`` → resolves ``upstream_auth_header`` (a literal OR a reference)
-          to plaintext via the configured SecretProvider — the pre-#134 behaviour. ``none`` is
-          the migration default, so a legacy row that still carries a header resolves it
-          (spec: "no behaviour changes until an operator flips it").
+        The per-mode rule (token mints a JWT and ignores ``upstream_auth_header``; static/none
+        resolve the header through the SecretProvider) lives in
+        ``argus.credentials.resolve_upstream_credential``, shared with the control plane and the
+        health probe (issue #155). This method only turns its ``UpstreamCredentialError`` into an
+        audited 502.
 
         Non-negotiable: failure here must be an explicit ERROR, NEVER a silent fall-through to
         forwarding without the credential — that would risk leaking a request to an upstream
@@ -862,79 +861,25 @@ class Pipeline:
         `return e.response` without handle()'s top-level `except RoutingError` double-logging
         the same failure.
         """
-        if server.credential_mode == "token":
-            # Issue #134 (T3): mint an audience-bound JWT and send it as "Bearer <jwt>". This
-            # IGNORES upstream_auth_header entirely. Fail closed on BOTH "no issuer configured"
-            # (a server in token mode while the signing key is absent — the API normally rejects
-            # that, but this is the defense-in-depth half) and any unexpected mint failure: the
-            # same never-forward-without-a-credential guarantee as the secret-resolution path.
-            if self._token_issuer is None:
-                reason = "token signing is not configured (ACROPOLIS_TOKEN_SIGNING_KEY_REF)"
-                raise self._CredentialResolutionFailed(
-                    await self._error(
-                        server_slug=server.slug, tool=tool_name, status=502,
-                        content=rpc_error(rpc_id, reason), reason=reason,
-                        api_key_id=api_key_id, start=start, client_ip=client_ip,
-                        origin=origin, bridged=bridged, endpoint="per-server",
-                        rpc_method=rpc_method,
-                    )
-                )
-            try:
-                token = await self._token_issuer.get_token(server.slug)
-            except Exception:
-                # Unexpected — the key is already in memory, so a mint should never fail. Log
-                # the traceback (key-material-free: get_token never touches the PEM string) but
-                # keep the audit reason generic.
-                logger.exception("token mint failed for server '%s'", server.slug)
-                reason = "token mint failed"
-                raise self._CredentialResolutionFailed(
-                    await self._error(
-                        server_slug=server.slug, tool=tool_name, status=502,
-                        content=rpc_error(rpc_id, reason), reason=reason,
-                        api_key_id=api_key_id, start=start, client_ip=client_ip,
-                        origin=origin, bridged=bridged, endpoint="per-server",
-                        rpc_method=rpc_method,
-                    )
-                )
-            return f"Bearer {token}"
-
-        if server.upstream_auth_header is None:
-            return None
-
-        # Only span this when upstream_auth_header is actually a REFERENCE (vault://...,
-        # enc:v1:...) that requires a real resolution round-trip. For the "local"/literal case,
-        # self._secrets.resolve() is a same-process, zero-I/O pass-through (see
-        # archon/secrets/local.py) and a span there would just be noise around a no-op —
-        # manual spans, not blanket auto-instrumentation.
-        from archon.secrets import is_reference
-
-        traced = is_reference(server.upstream_auth_header)
-
-        # SECURITY: e.reason (built here, inside the try, never inside the span's own except
-        # clause) may echo back attacker- or operator-controlled shape (a malformed ref, an HTTP
-        # status code) but must NEVER contain the resolved plaintext — SecretResolutionError's
-        # own contract (see archon/secrets/__init__.py) is that its message is built only from
-        # the reference and a static reason, so this is safe to both audit-log and, when
-        # `traced`, let the span() context manager record as an exception. `_CredentialResolutionFailed`
-        # is deliberately raised OUTSIDE the `with span:` block below (not from within the except
-        # clause) — it's an internal control-flow signal carrying an already-built Response, not
-        # a real failure, and recording it as a span exception would be noise, not signal.
         try:
-            if traced:
-                with self._tracing.span(
+            return await resolve_upstream_credential(
+                server, secrets=self._secrets, token_issuer=self._token_issuer,
+                resolve_span=lambda: self._tracing.span(
                     "secrets.resolve", attributes={"acropolis.server_slug": server.slug},
-                ):
-                    return await self._secrets.resolve(server.upstream_auth_header)
-            return await self._secrets.resolve(server.upstream_auth_header)
-        except SecretResolutionError as e:
-            reason = f"secret resolution failed: {e.reason}"
+                ),
+            )
+        except UpstreamCredentialError as e:
+            # The decision (which mode, which failure) lives in argus.credentials; this plane only
+            # turns it into an audited 502. e.reason is safe to audit-log: it never carries resolved
+            # plaintext or key material. ``_CredentialResolutionFailed`` is raised OUTSIDE any span
+            # (it is control flow carrying an already-built Response, not a real failure).
             raise self._CredentialResolutionFailed(
                 await self._error(
                     server_slug=server.slug, tool=tool_name, status=502,
-                    content=rpc_error(rpc_id, reason),
-                    reason=reason, api_key_id=api_key_id, start=start,
-                    client_ip=client_ip, origin=origin, bridged=bridged,
-                    endpoint="per-server", rpc_method=rpc_method,
+                    content=rpc_error(rpc_id, e.reason), reason=e.reason,
+                    api_key_id=api_key_id, start=start, client_ip=client_ip,
+                    origin=origin, bridged=bridged, endpoint="per-server",
+                    rpc_method=rpc_method,
                 )
             )
 
