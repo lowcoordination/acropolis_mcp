@@ -133,9 +133,105 @@ Configuration (env vars, all under `ACROPOLIS_`):
 | Var | Required | Purpose |
 |---|---|---|
 | `VAULT_ADDR` | yes | Base URL, e.g. `https://vault.example.internal:8200` |
-| `VAULT_TOKEN` | one of these two | Static token auth |
-| `VAULT_ROLE_ID` + `VAULT_SECRET_ID` | | AppRole auth (nice-to-have; logs in once, caches the resulting token for its lease) |
+| `VAULT_TOKEN` | one auth method (see below) | Static token auth |
+| `VAULT_ROLE_ID` + `VAULT_SECRET_ID` or `VAULT_SECRET_ID_FILE` | | AppRole auth (logs in, caches the resulting token for its lease) |
+| `VAULT_AUTH_METHOD` = `kubernetes` + `VAULT_K8S_ROLE` | | Kubernetes auth (no static secret at all) |
+| `VAULT_K8S_TOKEN_FILE` | no (default `/var/run/secrets/kubernetes.io/serviceaccount/token`) | Where the pod's service-account token is read from |
+| `VAULT_K8S_MOUNT` | no (default `kubernetes`) | Name the Kubernetes auth method is mounted under |
 | `VAULT_TTL_SECONDS` | no (default 60) | Resolved-value cache TTL — see below |
+
+#### Authenticating to the secret server
+
+Pick exactly one. Leave `VAULT_AUTH_METHOD` unset and the method is inferred exactly as before
+(a token if one is set, otherwise AppRole), so an existing deployment does not change. Kubernetes
+auth is **never** inferred: it must be selected, so a stray variable cannot change how you log in.
+Giving credentials for more than one method, or half of one, is a startup error, not a surprise at
+first use. None of this ties Acropolis to a platform: the client only makes HTTP requests and
+reads files.
+
+**Static token.** `VAULT_TOKEN`. Simple; the token is long-lived unless you issue it with a TTL.
+
+**AppRole.** `VAULT_ROLE_ID` plus the secret_id, given either inline (`VAULT_SECRET_ID`) or as a
+**file** (`VAULT_SECRET_ID_FILE`, not both). Prefer the file: an environment variable is readable
+through `/proc/<pid>/environ` by any process running as the same user and through
+`docker inspect`, while a mounted file is not in either place. The file is re-read on every
+login, so replacing it rotates the credential without a restart. Trailing newlines are stripped.
+Docker Compose:
+
+```yaml
+services:
+  acropolis:
+    environment:
+      ACROPOLIS_SECRET_PROVIDER: openbao
+      ACROPOLIS_VAULT_ADDR: https://vault.example.internal:8200
+      ACROPOLIS_VAULT_ROLE_ID: 11111111-2222-3333-4444-555555555555   # an id, not a secret
+      ACROPOLIS_VAULT_SECRET_ID_FILE: /run/secrets/vault_secret_id
+    secrets:
+      - vault_secret_id
+secrets:
+  vault_secret_id:
+    file: ./vault_secret_id          # chmod 600, not committed
+```
+
+**Kubernetes auth.** The credential is the pod's own service-account token, which Kubernetes
+issues, expires and rotates. No static secret exists to leak, back up or forget to rotate, and
+deleting the pod, the service account or the OpenBao role cuts access. The pod posts that token and
+a role name to `auth/<mount>/login`; OpenBao has the Kubernetes API validate it (the TokenReview
+API) and checks the role's bindings, then returns a normal token. Acropolis re-reads the token file
+on every login because kubelet rewrites a projected token in place.
+
+OpenBao side (once; a live change, run by an operator; see the
+[OpenBao Kubernetes auth docs](https://openbao.org/docs/auth/kubernetes/) for your version):
+
+```bash
+bao auth enable kubernetes                       # skip if already mounted
+# Run from inside the OpenBao pod, which then uses its own pod token to ask Kubernetes to
+# validate logins (the OpenBao docs' recommended setup when OpenBao runs in the cluster):
+bao write auth/kubernetes/config \
+    kubernetes_host=https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT
+bao policy write acropolis - <<'EOF'
+path "secret/data/acropolis/*" { capabilities = ["read"] }
+EOF
+bao write auth/kubernetes/role/acropolis \
+    bound_service_account_names=acropolis \
+    bound_service_account_namespaces=acropolis \
+    policies=acropolis ttl=1h
+```
+
+`read` is all Acropolis needs to resolve references. Add `create` and `update` only if you use
+`python -m argus rotate-signing-key`, which writes each new signing key to its own path under the
+current key's path, so the policy must cover that prefix too.
+
+Pod side:
+
+```yaml
+spec:
+  serviceAccountName: acropolis
+  containers:
+    - name: acropolis
+      env:
+        - {name: ACROPOLIS_SECRET_PROVIDER,    value: openbao}
+        - {name: ACROPOLIS_VAULT_ADDR,         value: "http://openbao.vault-system.svc:8200"}
+        - {name: ACROPOLIS_VAULT_AUTH_METHOD,  value: kubernetes}
+        - {name: ACROPOLIS_VAULT_K8S_ROLE,     value: acropolis}
+```
+
+The default token path is the standard in-cluster one, so no volume is required. To bound its
+lifetime explicitly, project a token instead and point `ACROPOLIS_VAULT_K8S_TOKEN_FILE` at it
+(`serviceAccountToken` volume with a short `expirationSeconds`). Do not set a custom `audience` on
+the projected token unless you also set the matching `audience` on the OpenBao role; that pairing
+is not exercised by this project's tests.
+
+Transport and files: a `VAULT_ADDR` that is plain `http://` to anything other than localhost logs a
+warning at startup, because the login credential and every secret then travel in clear text (it is
+not blocked, since an in-cluster service is often plain http). Credential files are read
+through symlinks, which is how Kubernetes and Docker lay them out, and must be regular files of at
+most 16 KiB; a UTF-8 BOM and surrounding whitespace are ignored.
+
+What Kubernetes auth does **not** do: it does not stop anyone who can create tokens for the
+service account (`kubectl create token`) or read the pod's filesystem as the same user. It removes
+the long-lived static credential and the places a copy of it ends up; it is not a substitute for
+controlling who is cluster-admin.
 
 **Writing secrets into Vault is a manual, out-of-band step.** Acropolis does not write a literal
 you type into the server form into Vault on your behalf — there's no way to infer what

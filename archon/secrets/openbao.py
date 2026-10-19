@@ -16,10 +16,23 @@ actual data one level under `data` server-side; this client adds that automatica
 reference itself uses the KV v1-shaped path, matching how `vault kv get` addresses it, not the
 raw HTTP path).
 
-Auth: a static token (`ACROPOLIS_VAULT_TOKEN`) is the baseline and the only mode required by the
-plan. AppRole (`ACROPOLIS_VAULT_ROLE_ID` / `ACROPOLIS_VAULT_SECRET_ID`) is supported as a
-nice-to-have — if configured, the client logs in once and caches the resulting token for its
-lease duration.
+Auth, three ways, all opt-in and none tied to a platform (the client only does HTTP and reads
+files):
+
+  * a static token (`ACROPOLIS_VAULT_TOKEN`), the baseline;
+  * AppRole (`ACROPOLIS_VAULT_ROLE_ID` plus the secret_id, inline in `ACROPOLIS_VAULT_SECRET_ID` or
+    read from the file named by `ACROPOLIS_VAULT_SECRET_ID_FILE`, so Docker secrets, Kubernetes
+    Secret mounts and systemd credentials can keep it out of the process environment, where it
+    is readable through /proc/<pid>/environ and `docker inspect`);
+  * Kubernetes auth (`ACROPOLIS_VAULT_AUTH_METHOD=kubernetes` plus `ACROPOLIS_VAULT_K8S_ROLE`),
+    where the credential is the pod's own short-lived service-account token read from a file, so
+    no static secret exists at all. No Kubernetes client library is involved: it is one HTTP POST
+    of a file's contents.
+
+The login token is cached for its lease, and credential files are re-read on EVERY login, because
+the platforms that rotate them (kubelet's projected tokens, a re-mounted Docker secret) rewrite the
+file in place. With no auth method selected, the method is inferred from what is configured, as
+it always was.
 
 Caching: resolved plaintext values are cached for a short TTL (default 60s, see
 `_TTLCache` in `archon/secrets/__init__.py`) — long enough that a normal request burst doesn't
@@ -33,8 +46,12 @@ forwards without one).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
+import os
 import re
+import stat
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -48,6 +65,37 @@ logger = logging.getLogger("archon.secrets.openbao")
 
 DEFAULT_TTL_SECONDS = 60.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
+
+# The in-cluster location Kubernetes projects the pod's service-account token at. A default for
+# convenience, not a dependency: nothing reads it unless Kubernetes auth is selected.
+DEFAULT_K8S_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+DEFAULT_K8S_MOUNT = "kubernetes"
+AUTH_METHODS = ("token", "approle", "kubernetes")
+# A credential file holds a token or an id, never a document. The cap stops a mis-pointed path
+# (a log, a device) from being read into memory; a real projected JWT is about 1 KiB.
+MAX_CREDENTIAL_FILE_BYTES = 16 * 1024
+# After a failed login (endpoint down or hung, credential rejected, file missing), further requests
+# fail fast with the same error for this long instead of each retrying in turn behind the login
+# lock. Without it, N waiters against a hung endpoint take N x the request timeout and hammer the
+# endpoint (with Kubernetes auth, the API server). Short, so a fixed credential is picked up quickly.
+LOGIN_FAILURE_BACKOFF_SECONDS = 2.0
+# The server decides a login token's lease. Cap how long one is trusted from the cache, and treat a
+# non-finite value as unknown: NaN made a token look permanently expired (a login on every request),
+# Infinity pinned a possibly revoked token until restart.
+DEFAULT_LOGIN_LEASE_SECONDS = 3600.0
+MAX_LOGIN_LEASE_SECONDS = 24 * 3600.0
+MAX_MOUNT_NAME_LENGTH = 128
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+def _read(fd: int, n: int) -> bytes:
+    """os.read, as a seam: a test makes it return short reads, which a local file never does."""
+    return os.read(fd, n)
+
+
+# The auth mount name is interpolated into the login URL, so it is restricted the way a Vault
+# path segment list reasonably is: no empty, "." or ".." segments, no query/fragment/whitespace
+# characters, no percent-encoding. Matched with fullmatch: "$" would accept a trailing newline.
+_MOUNT_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$")
 
 _REF_RE = re.compile(r"^vault://(?P<mount>[^/]+)/(?P<path>[^#]+)#(?P<key>.+)$")
 
@@ -90,7 +138,8 @@ def parse_vault_ref(ref: str) -> VaultRef:
 
 class OpenBaoConfigError(Exception):
     """Raised at provider construction time for missing/invalid configuration — a base URL is
-    required, and at least one auth mode (token or AppRole) must be configured."""
+    required, and exactly one consistent auth mode (token, AppRole or Kubernetes) must be
+    configured. Conflicting or half-given credentials fail here, at startup, never at first use."""
 
 
 class OpenBaoSecretProvider:
@@ -106,6 +155,11 @@ class OpenBaoSecretProvider:
         token: Optional[str] = None,
         role_id: Optional[str] = None,
         secret_id: Optional[str] = None,
+        secret_id_file: Optional[str] = None,
+        auth_method: Optional[str] = None,
+        k8s_role: Optional[str] = None,
+        k8s_token_file: str = DEFAULT_K8S_TOKEN_FILE,
+        k8s_mount: str = DEFAULT_K8S_MOUNT,
         client: Optional[httpx.AsyncClient] = None,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -115,15 +169,71 @@ class OpenBaoSecretProvider:
         parsed = urlsplit(base_url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise OpenBaoConfigError(f"base_url must be an http(s) URL, got {base_url!r}")
-        if not token and not (role_id and secret_id):
+
+        if secret_id and secret_id_file:
             raise OpenBaoConfigError(
-                "either a token or both role_id and secret_id (AppRole) must be configured"
+                "set either the AppRole secret_id or secret_id_file, not both"
+            )
+        has_approle = bool(role_id and (secret_id or secret_id_file))
+        inferred = auth_method is None
+        if auth_method is None:
+            # Unchanged historical behaviour: infer from what is configured. Kubernetes auth is
+            # never inferred; it must be selected, so a stray ACROPOLIS_VAULT_K8S_ROLE cannot
+            # change how an existing deployment logs in.
+            if token:
+                auth_method = "token"
+            elif has_approle:
+                auth_method = "approle"
+            else:
+                raise OpenBaoConfigError(
+                    "configure one auth method: a token, or an AppRole (role_id plus secret_id or "
+                    "secret_id_file), or auth_method='kubernetes' with a role"
+                )
+        if auth_method not in AUTH_METHODS:
+            raise OpenBaoConfigError(
+                f"unknown auth_method {auth_method!r} (expected one of {', '.join(AUTH_METHODS)})"
+            )
+        wants = {"token": bool(token), "approle": has_approle, "kubernetes": bool(k8s_role)}
+        if not wants[auth_method]:
+            raise OpenBaoConfigError(
+                f"auth_method {auth_method!r} is selected but its settings are missing or incomplete"
+            )
+        # Conflicts are only an error when the method was SELECTED. With none selected the old
+        # rule stands (a static token wins over AppRole), so no existing deployment changes.
+        conflicting = [] if inferred else [m for m in AUTH_METHODS if m != auth_method and (
+            wants[m] or (m == "approle" and (role_id or secret_id or secret_id_file))
+        )]
+        if conflicting:
+            raise OpenBaoConfigError(
+                f"auth_method {auth_method!r} is selected but credentials for "
+                f"{', '.join(sorted(set(conflicting)))} are also configured; give exactly one"
+            )
+        if auth_method == "kubernetes" and (
+            not _MOUNT_RE.fullmatch(k8s_mount or "") or len(k8s_mount) > MAX_MOUNT_NAME_LENGTH
+        ):
+            raise OpenBaoConfigError(
+                f"k8s_mount must be a plain auth mount name like 'kubernetes' or 'team/k8s', got {k8s_mount!r}"
+            )
+
+        if parsed.scheme == "http" and (parsed.hostname or "") not in _LOOPBACK_HOSTS:
+            # Not blocked: an in-cluster service is often plain http. But the login credential and
+            # every secret then travel in clear text, so it must never be silent. Host and port only:
+            # a URL may carry userinfo, which must not reach a log.
+            logger.warning(
+                "the secret server at %s is reached over plain http: the login credential and every "
+                "secret travel in clear text; use https unless this network is trusted",
+                f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname,
             )
 
         self._base_url = base_url.rstrip("/")
-        self._static_token = token
+        self._auth_method = auth_method
+        self._static_token = token if auth_method == "token" else None
         self._role_id = role_id
         self._secret_id = secret_id
+        self._secret_id_file = secret_id_file
+        self._k8s_role = k8s_role
+        self._k8s_token_file = k8s_token_file
+        self._k8s_mount = k8s_mount
         self._request_timeout = request_timeout_seconds
         # A dedicated client (rather than the app-wide shared http_client) so this provider's
         # short, fixed request timeout can never be affected by — or affect — the generous
@@ -133,44 +243,137 @@ class OpenBaoSecretProvider:
         self._owns_client = client is None
 
         self._cache = _TTLCache(ttl_seconds)
-        self._approle_token: Optional[str] = None
-        self._approle_token_expires_at: float = 0.0
+        self._login_token: Optional[str] = None
+        self._login_token_expires_at: float = 0.0
+        # One login at a time: when the cached token expires, every in-flight request would
+        # otherwise log in separately (with Kubernetes auth each login is a TokenReview call).
+        self._login_lock = asyncio.Lock()
+        self._login_failed_until: float = 0.0
+        self._login_failure: Optional[tuple[str, str]] = None  # (ref label, reason) of the last failure
 
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
 
-    async def _login_approle(self) -> str:
-        assert self._role_id and self._secret_id
+    async def _read_credential_file(self, path: str, label: str, what: str) -> str:
+        """Read a credential from a file, fresh each time. Errors name the path and the problem
+        and NEVER include the file's contents."""
+        def read() -> Optional[bytes]:
+            # Opened non-blocking and checked with fstat BEFORE reading: a FIFO with no writer would
+            # otherwise block this thread forever while the login lock is held, freezing every
+            # secret resolution. Only a regular file is a credential file.
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                # os.read may legally return fewer bytes than the file holds (network filesystems,
+                # signals); a silently truncated credential is worse than an error, so read to EOF
+                # or one byte past the cap.
+                chunks, total = [], 0
+                while total <= MAX_CREDENTIAL_FILE_BYTES:
+                    chunk = _read(fd, MAX_CREDENTIAL_FILE_BYTES + 1 - total)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                return b"".join(chunks)
+            finally:
+                os.close(fd)
+
         try:
-            resp = await self._client.post(
-                f"{self._base_url}/v1/auth/approle/login",
-                json={"role_id": self._role_id, "secret_id": self._secret_id},
-            )
-        except httpx.HTTPError as e:
-            raise SecretResolutionError("<approle-login>", f"AppRole login request failed: {e}") from e
-        if resp.status_code != 200:
+            raw = await asyncio.to_thread(read)
+        except OSError as e:
             raise SecretResolutionError(
-                "<approle-login>", f"AppRole login returned HTTP {resp.status_code}"
+                label, f"could not read the {what} file {path!r}: {e.strerror or type(e).__name__}"
+            ) from e
+        if raw is None:
+            raise SecretResolutionError(label, f"the {what} file {path!r} is not a regular file")
+        if len(raw) > MAX_CREDENTIAL_FILE_BYTES:
+            raise SecretResolutionError(
+                label, f"the {what} file {path!r} is too large to be a credential "
+                       f"(over {MAX_CREDENTIAL_FILE_BYTES} bytes)"
             )
+        try:
+            # utf-8-sig: a BOM (files saved by Windows editors) would otherwise become part of the credential
+            value = raw.decode("utf-8-sig").strip()
+        except UnicodeDecodeError as e:
+            raise SecretResolutionError(label, f"the {what} file {path!r} is not UTF-8 text") from e
+        if not value:
+            raise SecretResolutionError(label, f"the {what} file {path!r} is empty")
+        return value
+
+    async def _login(self) -> str:
+        """Log in by the selected method, cache the resulting token for its lease, return it."""
+        if self._auth_method == "kubernetes":
+            label, name = "<kubernetes-login>", "Kubernetes auth"
+            jwt = await self._read_credential_file(
+                self._k8s_token_file, label, "service-account token"
+            )
+            url = f"{self._base_url}/v1/auth/{self._k8s_mount}/login"
+            payload = {"role": self._k8s_role, "jwt": jwt}
+        else:
+            label, name = "<approle-login>", "AppRole"
+            secret_id = self._secret_id
+            if self._secret_id_file:
+                secret_id = await self._read_credential_file(
+                    self._secret_id_file, label, "AppRole secret_id"
+                )
+            url = f"{self._base_url}/v1/auth/approle/login"
+            payload = {"role_id": self._role_id, "secret_id": secret_id}
+
+        try:
+            resp = await self._client.post(url, json=payload)
+        except httpx.HTTPError as e:
+            raise SecretResolutionError(label, f"{name} login request failed: {e}") from e
+        if resp.status_code != 200:
+            raise SecretResolutionError(label, f"{name} login returned HTTP {resp.status_code}")
         try:
             data = resp.json()
             auth = data["auth"]
             token = auth["client_token"]
-            lease_seconds = float(auth.get("lease_duration") or 3600)
+            lease_seconds = float(auth.get("lease_duration") or DEFAULT_LOGIN_LEASE_SECONDS)
         except (ValueError, KeyError, TypeError) as e:
-            raise SecretResolutionError("<approle-login>", f"AppRole login response malformed: {e}") from e
-        self._approle_token = token
+            raise SecretResolutionError(label, f"{name} login response malformed: {e}") from e
+        # The response is server-controlled. A token that is not a non-empty string would reach
+        # httpx as a header value and escape as a raw TypeError, past the SecretResolutionError
+        # seam every caller relies on.
+        if not isinstance(token, str) or not token.strip():
+            raise SecretResolutionError(label, f"{name} login response malformed: client_token is missing or not a string")
+        if not math.isfinite(lease_seconds):
+            lease_seconds = DEFAULT_LOGIN_LEASE_SECONDS
+        lease_seconds = min(lease_seconds, MAX_LOGIN_LEASE_SECONDS)
+        self._login_token = token
+        self._login_failed_until = 0.0
+        self._login_failure = None
         # Refresh a bit before actual expiry so a resolve() never races a just-expired token.
-        self._approle_token_expires_at = time.monotonic() + max(lease_seconds - 30.0, 5.0)
+        self._login_token_expires_at = time.monotonic() + max(lease_seconds - 30.0, 5.0)
         return token
+
+    def _cached_login_token(self) -> Optional[str]:
+        if self._login_token and time.monotonic() < self._login_token_expires_at:
+            return self._login_token
+        return None
 
     async def _current_token(self) -> str:
         if self._static_token:
             return self._static_token
-        if self._approle_token and time.monotonic() < self._approle_token_expires_at:
-            return self._approle_token
-        return await self._login_approle()
+        token = self._cached_login_token()
+        if token:
+            return token
+        async with self._login_lock:
+            # Re-check: another request may have logged in while this one waited.
+            token = self._cached_login_token()
+            if token:
+                return token
+            # ...or may have just failed: fail fast with the same error rather than retry in turn.
+            if self._login_failure and time.monotonic() < self._login_failed_until:
+                raise SecretResolutionError(*self._login_failure)
+            try:
+                return await self._login()
+            except SecretResolutionError as e:
+                self._login_failure = (e.ref, e.reason)
+                self._login_failed_until = time.monotonic() + LOGIN_FAILURE_BACKOFF_SECONDS
+                raise
 
     async def resolve(self, ref: str) -> str:
         cached = self._cache.get(ref)
