@@ -30,7 +30,7 @@ from argus.upstream import UpstreamHandshakeCache
 from db.database import Database
 from db.repo import ServerRepo
 
-SECRET = "Bearer sk-live-SUPERSECRET-0123456789"
+SECRET = "Bearer test-credential-SUPERSECRET-0123456789"
 HOSTILE_MARKERS = ("SUPERSECRET", "<script>", "leaky-header-value", "BODYMARKER")
 TOOLS = [{"name": "echo", "description": "Echo", "inputSchema": {"type": "object", "properties": {}}}]
 
