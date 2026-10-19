@@ -106,13 +106,13 @@ For a zero-401 window, flip the mode **before** enabling the env: Acropolis star
 to an inert upstream, then the upstream starts requiring the tokens already being sent.
 
 Expect the server to read **unhealthy** with `token auth not enforced: …` in that window (see
-"Health: the tokenless check" below). That is the truth: until step 3 is live the upstream is not
+"Health: the enforcement checks" below). That is the truth: until step 3 is live the upstream is not
 refusing anything. The reason clears on the next poll after the env is in, and it fires one
 unhealthy webhook on the way in. Do the steps back to back, or expect the alert.
 
 Rollback at any point: set `credential_mode='none'` and remove the `TOKEN_*` env.
 
-## Health: the tokenless check
+## Health: the enforcement checks
 
 The authenticated health probe proves a server **accepts** a valid token. It cannot show that the
 server would also **refuse** a request with none, and that is the failure that matters:
@@ -134,6 +134,41 @@ The middleware wraps the whole handler, so a tokenless POST to the MCP endpoint 
 routing or body parsing; that is why a 404 or 400 counts as "bypassed". The check never runs for
 `none` or `static` servers. It does not stop traffic: `health_status` feeds the metrics, the UI and
 the unhealthy webhook, not routing.
+
+### The wrong-audience check
+
+A server that refuses a missing token but accepts **any** bearer string passes the tokenless check.
+So when (and only when) the tokenless request was conclusively refused, the poller sends one more
+`ping`: a token that is correctly signed by this Acropolis's issuer but for an audience no server
+accepts (random, per request, never a real slug). A server that verifies signature and audience
+refuses it; one that does not, accepts it.
+
+| Answer | Result |
+|---|---|
+| `401` or `403` | audience enforced; server stays healthy |
+| any other HTTP status (200, 400, 404, 500 …) | `unhealthy`, reason `token accepted for the wrong audience: a token signed for a different audience got HTTP <n>, expected 401 …`; one webhook on the edge |
+| network error, timeout, or `502`/`503`/`504` | inconclusive; no change |
+
+Cost and safety:
+
+- **One extra request per token-mode server per poll**, and none when the tokenless check failed or
+  was inconclusive (the server is already unhealthy, or already flaky). The checks run inside the
+  server's own probe slot and servers are probed concurrently, so a stalled server delays only
+  itself. Each request has its own 10 s overall deadline, so a server that answers the tokenless
+  request promptly and then stalls the audience one holds its slot at most 10 s longer.
+- Both checks share one request path: a fresh HTTP client (so the poller's cookie jar cannot add a
+  credential), `trust_env=False` (no proxy or `.netrc` from the environment), redirects reported and
+  never followed (a followed redirect would hand the token to another host), the response streamed
+  and only the status line read, under the overall deadline.
+- The probe token is minted for that one request (`TokenIssuer.mint_uncached`, so it never enters
+  the per-slug cache that real requests draw from) and exists only in the request headers. It is not
+  logged, stored or put in `health_reason`.
+
+What the two checks together still do **not** prove: that the server rejects a token with a *valid*
+audience signed by a *different key*. That needs a third request; alternating the two token kinds
+per poll would make a server that fails only one of them flap between healthy and unhealthy, so it
+is left out. They also test only the registered URL, and an upstream that has been compromised can
+simply answer 401.
 
 ## Third-party exceptions
 

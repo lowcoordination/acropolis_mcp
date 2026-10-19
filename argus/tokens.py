@@ -353,6 +353,15 @@ class TokenIssuer:
             if entry is not None:
                 entry.refreshing = False
 
+    def mint_uncached(self, audience: str) -> str:
+        """Mint a correctly-signed token for ``audience`` WITHOUT touching the per-slug cache.
+
+        For the health poller's wrong-audience probe (``stoa.health``), which needs a token that is
+        genuine in every respect except that no server should accept its audience. It must not
+        enter the cache (the next real request for a slug would otherwise be handed a probe token)
+        and the caller must not log or store the result."""
+        return self._mint(audience)
+
     def _mint(self, slug: str) -> str:
         header = {"alg": _ALGORITHM, "typ": _HEADER_TYPE, "kid": self._kid}
         payload = {"iss": _ISSUER, "aud": slug, "exp": int(_epoch_seconds() + self._ttl)}

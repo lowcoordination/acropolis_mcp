@@ -103,11 +103,12 @@ class _AuthEnforcingUpstream:
     def unauthenticated(self) -> list[str]:
         """RPC methods that arrived with a credential the upstream refused.
 
-        The health poller's deliberate tokenless ``ping`` is excluded: since the auth-enforcement
-        check (a token-mode server must REFUSE a request with no token) every probe sends one, by
-        design. This helper is about the catalog fetch carrying its credential, not about that
-        probe, which has its own tests (test_auth_enforcement_probe.py)."""
-        return [m for m, a in self.requests if not self._authorize(a) and not (m == "ping" and a is None)]
+        The health poller's deliberate ``ping`` requests are excluded: since the auth-enforcement
+        checks (a token-mode server must REFUSE a request with no token, and one carrying a token for
+        the wrong audience) every probe sends them, by design, and this upstream correctly refuses
+        both. This helper is about the catalog fetch carrying its credential, not about those probes,
+        which have their own tests (test_auth_enforcement_probe.py). The catalog fetch never pings."""
+        return [m for m, a in self.requests if not self._authorize(a) and m != "ping"]
 
 
 def _settings(tmp_path: Path, **extra) -> Settings:
