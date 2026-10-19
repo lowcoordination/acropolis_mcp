@@ -173,6 +173,15 @@ servers polled every 60s by 5 replicas is 40 probes/minute, not 8. Either raise
 `ACROPOLIS_HEALTH_POLL_INTERVAL_SECONDS` in proportion, or disable polling on all but one
 replica with `ACROPOLIS_HEALTH_POLL_ENABLED=false`.
 
+Within one process the servers are probed concurrently (at most 16 at a time), and a probe is
+bounded in time and size so a slow or hostile upstream cannot delay the others: each HTTP exchange
+has a 10s overall deadline (not merely a per-read timeout), a whole server's probe has 30s, and a
+discover or initialize response over 1 MiB (or one that arrives compressed) is refused. A server cut
+off this way reads `unhealthy` with a reason starting `probe timed out:` or `probe response rejected:`,
+which tells it apart from an ordinary outage (no reason). The same size cap and, on the health
+path, the same deadline apply to the `initialize` handshake. Tool calls and other bridged data-plane
+traffic keep their own timeouts and are not size-capped.
+
 ### What does not change
 
 **Quota enforcement.** Both halves of the quota window live in shared Postgres, so a quota of

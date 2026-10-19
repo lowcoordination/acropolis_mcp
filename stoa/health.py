@@ -16,8 +16,12 @@ from argus.tokens import TokenIssuer
 from argus.upstream import (
     CLIENT_INFO,
     MCP_2026_VERSION,
+    ResponseRejected,
     UpstreamHandshakeCache,
     UpstreamHandshakeError,
+    UpstreamHandshakeTimeout,
+    UpstreamHandshakeTooLarge,
+    bounded_post,
     parse_sse_body,
 )
 from db.models import ServerRecord
@@ -31,6 +35,18 @@ DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 # sized for real tool calls) — a routine check against a briefly-unreachable or restarting
 # upstream should fail fast, not stall the whole poll cycle for every other registered server.
 PROBE_TIMEOUT_SECONDS = 10.0
+# httpx's timeout applies to each I/O operation, not to the exchange: an upstream that sends one
+# byte every few seconds never trips it. So PROBE_TIMEOUT_SECONDS is ALSO enforced as an overall
+# deadline on each probe HTTP exchange (see argus.upstream.bounded_post), and the probe as a whole
+# (discover + initialize fallback + secret/token resolution) gets PROBE_DEADLINE_SECONDS. Both are
+# module-level so a test can shrink them.
+PROBE_DEADLINE_SECONDS = 30.0
+# A server/discover or initialize result is small. This bounds what one hostile upstream can make
+# us buffer per probe (a 64 MiB body was observed to cost ~130 MiB RSS with the buffering client).
+PROBE_MAX_RESPONSE_BYTES = 1024 * 1024
+# How many servers are probed at once. Probes are independent, so one slow server must not delay the
+# rest; the bound keeps a large fleet from opening hundreds of sockets in a single burst.
+MAX_CONCURRENT_PROBES = 16
 
 # The reason string stored on servers.health_reason when a probe fails specifically because the
 # configured secret couldn't be resolved — distinguishable, by a human or by test assertions,
@@ -46,6 +62,11 @@ TOKEN_MINT_FAILURE_PREFIX = "token mint failed: "
 # no credential. See check_auth_enforced.
 AUTH_NOT_ENFORCED_PREFIX = "token auth not enforced: "
 
+# Reasons for a probe that was cut off rather than answered (see PROBE_DEADLINE_SECONDS and
+# PROBE_MAX_RESPONSE_BYTES): distinguishable from a plain outage (health_reason None).
+PROBE_TIMEOUT_PREFIX = "probe timed out: "
+PROBE_RESPONSE_REJECTED_PREFIX = "probe response rejected: "
+
 
 async def probe_server(
     client: httpx.AsyncClient, handshake_cache: UpstreamHandshakeCache, server: ServerRecord,
@@ -59,9 +80,10 @@ async def probe_server(
     (health_status, upstream_protocol, discover_json_dict, health_reason).
 
     `health_reason` is None for a normal healthy probe AND for a normal (network-level)
-    unhealthy probe — it is only ever set when the specific cause was a secret-resolution
-    failure (enterprise #5), so a server whose credential won't resolve reads unhealthy with a
-    reason distinguishable from "upstream is just down", rather than a generic/opaque failure.
+    unhealthy probe — it is only set when the specific cause was a secret-resolution failure
+    (enterprise #5), a token-mint failure, or a response that was cut off (overall deadline or
+    byte cap exceeded), so such a server reads unhealthy with a reason distinguishable from
+    "upstream is just down", rather than a generic/opaque failure.
     Callers (HealthPoller) must not guess a reason from health_status alone; this is the one
     source of truth for whether THIS was a secrets problem.
     """
@@ -130,9 +152,16 @@ async def probe_server(
     }
 
     try:
-        resp = await client.post(
-            server.upstream_url, json=discover_body, headers=headers, timeout=PROBE_TIMEOUT_SECONDS
+        resp = await bounded_post(
+            client, server.upstream_url, json=discover_body, headers=headers,
+            max_bytes=PROBE_MAX_RESPONSE_BYTES, deadline=PROBE_TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError:
+        logger.info("probe for '%s' did not finish within %ss", server.slug, PROBE_TIMEOUT_SECONDS)
+        return ("unhealthy", None, None, f"{PROBE_TIMEOUT_PREFIX}no complete response within {PROBE_TIMEOUT_SECONDS:g}s")
+    except ResponseRejected as e:
+        logger.info("probe for '%s' response rejected: %s", server.slug, e)
+        return ("unhealthy", None, None, f"{PROBE_RESPONSE_REJECTED_PREFIX}{e}")
     except httpx.HTTPError as e:
         logger.info("probe for '%s' failed to connect: %s", server.slug, e)
         return ("unhealthy", None, None, None)
@@ -149,7 +178,7 @@ async def probe_server(
                 if "text/event-stream" in resp.headers.get("content-type", "")
                 else (json.loads(resp.text) if resp.text else None)
             )
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError, RecursionError) as e:
             logger.info("probe for '%s' returned an unparseable 200 response: %s", server.slug, e)
             parsed = None
 
@@ -173,6 +202,12 @@ async def probe_server(
             server.id, server.upstream_url, timeout=PROBE_TIMEOUT_SECONDS,
             upstream_auth_header=resolved_auth_header,
         )
+    except UpstreamHandshakeTimeout as e:
+        logger.info("probe for '%s' failed initialize fallback: %s", server.slug, e)
+        return ("unhealthy", None, None, f"{PROBE_TIMEOUT_PREFIX}no complete response within {PROBE_TIMEOUT_SECONDS:g}s")
+    except UpstreamHandshakeTooLarge as e:
+        logger.info("probe for '%s' failed initialize fallback: %s", server.slug, e)
+        return ("unhealthy", None, None, f"{PROBE_RESPONSE_REJECTED_PREFIX}{e}")
     except UpstreamHandshakeError as e:
         logger.info("probe for '%s' failed initialize fallback: %s", server.slug, e)
         return ("unhealthy", None, None, None)
@@ -312,14 +347,21 @@ class HealthPoller(BackgroundLoop):
         # the set_health() write for one server can never abort the whole cycle and leave every
         # server after it in slug order permanently stale. Defense in depth on top of the
         # guarded parse above, not a substitute for it.
+        #
+        # Servers are probed CONCURRENTLY (bounded by a semaphore), each under its own deadline
+        # (see _probe_and_store). Serial probing meant one slow server delayed every server after
+        # it in slug order by however long it took to give up.
         servers = await self._repo.list()
-        for server in servers:
-            if not server.enabled:
-                continue
-            try:
-                await self._probe_and_store(server)
-            except Exception:
-                logger.exception("health probe failed for server '%s'", server.slug)
+        gate = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+
+        async def _one(server: ServerRecord) -> None:
+            async with gate:
+                try:
+                    await self._probe_and_store(server)
+                except Exception:
+                    logger.exception("health probe failed for server '%s'", server.slug)
+
+        await asyncio.gather(*(_one(server) for server in servers if server.enabled))
 
     async def poll_one(self, slug: str) -> None:
         """Probe a single server immediately, outside the normal poll cycle — used right after
@@ -333,10 +375,21 @@ class HealthPoller(BackgroundLoop):
             await self._probe_and_store(server)
 
     async def _probe_and_store(self, server: ServerRecord) -> None:
-        health_status, protocol, discover_json, health_reason = await probe_server(
-            self._client, self._handshakes, server, secret_provider=self._secrets,
-            token_issuer=self._token_issuer,
-        )
+        # Overall per-server deadline: bounds the probe as a whole (each HTTP exchange inside it
+        # is also bounded individually), so a server that stalls anywhere — a secret provider call
+        # included — becomes "unhealthy, timed out" instead of occupying this slot indefinitely.
+        try:
+            health_status, protocol, discover_json, health_reason = await asyncio.wait_for(
+                probe_server(
+                    self._client, self._handshakes, server, secret_provider=self._secrets,
+                    token_issuer=self._token_issuer,
+                ),
+                timeout=PROBE_DEADLINE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.info("probe for '%s' exceeded its %ss deadline", server.slug, PROBE_DEADLINE_SECONDS)
+            health_status, protocol, discover_json = "unhealthy", None, None
+            health_reason = f"{PROBE_TIMEOUT_PREFIX}probe exceeded {PROBE_DEADLINE_SECONDS:g}s"
         # A token-mode server that probes healthy WITH its token must also refuse a request
         # WITHOUT one. Protocol/discover data from the good probe is kept; only status and reason
         # change. Runs only when the authenticated probe passed (otherwise the server is already
