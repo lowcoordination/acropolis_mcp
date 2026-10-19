@@ -88,10 +88,12 @@ async def bounded_post(
         ) as resp:
             encoding = resp.headers.get("content-encoding", "").strip().lower()
             if encoding not in ("", "identity"):
-                raise UnsupportedContentEncoding(f"response uses content-encoding {encoding!r}")
-            declared = resp.headers.get("content-length")
-            if declared is not None and declared.isdigit() and int(declared) > max_bytes:
-                raise ResponseTooLarge(f"response declares {declared} bytes, limit is {max_bytes}")
+                # Nothing from the upstream's headers is echoed beyond a short, escaped prefix:
+                # these messages end up in a stored health_reason and in logs.
+                raise UnsupportedContentEncoding(f"response uses content-encoding {encoding[:32]!r}")
+            declared = resp.headers.get("content-length", "")
+            if declared.isascii() and declared.isdigit() and int(declared) > max_bytes:
+                raise ResponseTooLarge(f"response declares a body larger than {max_bytes} bytes")
             chunks: list[bytes] = []
             try:
                 # An in-memory transport (httpx.MockTransport) hands back a response whose body
@@ -153,7 +155,9 @@ def parse_sse_body(text: str) -> Optional[dict]:
     for candidate in data_lines:
         try:
             result = json.loads(candidate)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
+            # RecursionError: a hostile body of nothing but "[" fits any size cap and overflows the
+            # parser's stack; it is "not JSON" for our purposes, not a crash.
             continue
     return result
 
@@ -274,7 +278,7 @@ class UpstreamHandshakeCache:
             parsed = parse_sse_body(resp.text) if "text/event-stream" in resp.headers.get(
                 "content-type", ""
             ) else (json.loads(resp.text) if resp.text else None)
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, RecursionError) as e:
             raise UpstreamHandshakeError(f"initialize returned an unparseable response: {e}") from e
 
         if parsed is None or "result" not in parsed:

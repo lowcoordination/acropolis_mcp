@@ -185,6 +185,13 @@ async def endless_sse(up: _Raw, rpc: dict, w: asyncio.StreamWriter) -> None:
         await w.drain()
 
 
+async def nested_json(up: _Raw, rpc: dict, w: asyncio.StreamWriter) -> None:
+    """Under the byte cap, but deep enough to overflow the JSON parser's recursion limit."""
+    body = b"[" * 900_000
+    w.write((f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body)
+    await w.drain()
+
+
 async def gzip_bomb(up: _Raw, rpc: dict, w: asyncio.StreamWriter) -> None:
     """~64 KiB on the wire, ~64 MiB once inflated. A decoder would expand it before we could count."""
     body = gzip.compress(b"\x00" * (64 * 1024 * 1024), compresslevel=9)
@@ -346,6 +353,41 @@ async def test_hostile_response_shapes_are_unhealthy_with_a_reason_and_do_not_bl
     assert servers["a-bad"].health_reason.startswith(prefix), servers["a-bad"].health_reason
     assert servers["b-good"].health_status == "healthy"
     assert elapsed < 6, f"cycle took {elapsed:.1f}s"
+
+
+async def test_deeply_nested_json_reads_unhealthy_instead_of_freezing_the_row(db):
+    """RecursionError is not a ValueError. Uncaught, it escaped probe_server and the server's health
+    row was simply never written: a stale 'healthy' that no webhook would ever correct."""
+    bad = _Raw(nested_json)
+    await bad.start()
+    hooks = _Webhooks()
+    try:
+        repo = ServerRepo(db)
+        await repo.create(slug="nest", name="n", upstream_url=bad.url)
+        await repo.set_health("nest", health_status="healthy")
+        async with httpx.AsyncClient() as client:
+            poller = HealthPoller(repo, client, UpstreamHandshakeCache(client), webhook_dispatcher=hooks)
+            await asyncio.wait_for(poller.poll_once(), timeout=15)
+        server = await repo.get("nest")
+    finally:
+        await _stop(bad)
+    assert server.health_status == "unhealthy", server
+    assert hooks.unhealthy == ["nest"]
+
+
+async def test_reasons_do_not_echo_upstream_header_text(db):
+    async def long_encoding(up: _Raw, rpc: dict, w: asyncio.StreamWriter) -> None:
+        w.write(b"HTTP/1.1 200 OK\r\nContent-Encoding: " + b"Z" * 5000 + b"\r\nContent-Length: 0\r\n\r\n")
+        await w.drain()
+
+    bad = _Raw(long_encoding)
+    await bad.start()
+    try:
+        servers, _ = await _poll(db, {"enc": bad})
+    finally:
+        await _stop(bad)
+    assert servers["enc"].health_reason.startswith(PROBE_RESPONSE_REJECTED_PREFIX)
+    assert len(servers["enc"].health_reason) < 120, len(servers["enc"].health_reason)
 
 
 async def test_redirect_is_not_followed(db):

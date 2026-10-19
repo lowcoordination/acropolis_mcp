@@ -178,7 +178,7 @@ async def probe_server(
                 if "text/event-stream" in resp.headers.get("content-type", "")
                 else (json.loads(resp.text) if resp.text else None)
             )
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError, RecursionError) as e:
             logger.info("probe for '%s' returned an unparseable 200 response: %s", server.slug, e)
             parsed = None
 
