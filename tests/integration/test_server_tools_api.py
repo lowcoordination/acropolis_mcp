@@ -109,7 +109,12 @@ async def test_get_tools_dead_upstream_returns_empty_not_500(tmp_path: Path):
         async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as c:
             resp = await c.get("/api/v1/servers/dead/tools")
             assert resp.status_code == 200
-            assert resp.json() == {"fetched_at": None, "tools": []}
+            # #154: still 200 with an empty list (not a 500), but now says the fetch FAILED, so
+            # the UI can tell this from an upstream that genuinely has no tools.
+            assert resp.json() == {
+                "fetched_at": None, "tools": [], "stale": True,
+                "fetch_error": "upstream fetch failed (BridgeError 502)",
+            }
     await db.close()
 
 

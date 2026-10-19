@@ -254,6 +254,11 @@ class ServerToolsResponse(BaseModel):
     # the endpoint's old untyped bare-list response.
     fetched_at: Optional[str]
     tools: list[ServerToolResponse]
+    # Additive: True when a needed upstream fetch failed, so `tools` is the stale cache (or empty
+    # because the fetch failed, not because the upstream has none). `fetch_error` is then a short
+    # fixed reason such as "upstream answered 401" — never upstream-controlled text.
+    stale: bool = False
+    fetch_error: Optional[str] = None
 
 
 class ToolTestRequest(BaseModel):

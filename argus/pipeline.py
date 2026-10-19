@@ -670,7 +670,8 @@ class Pipeline:
             return e.response
         policy = await self._servers.get_policy(server.id)
         tools = await self._tools_cache.get_filtered_tools(
-            server.id, server.upstream_url, policy, upstream_auth_header=resolved_auth_header
+            server.id, server.upstream_url, policy, upstream_auth_header=resolved_auth_header,
+            server_slug=server.slug,
         )
         await self._audit.log(
             server_slug=server.slug, tool=None, decision="PASSTHROUGH",
