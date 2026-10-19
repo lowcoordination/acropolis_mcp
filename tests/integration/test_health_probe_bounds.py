@@ -354,7 +354,7 @@ async def test_redirect_is_not_followed(db):
     await target.start()
 
     async def redirect(up: _Raw, rpc: dict, w: asyncio.StreamWriter) -> None:
-        w.write(f"HTTP/1.1 302 Found\r\nLocation: {target.url}\r\nContent-Length: 0\r\n\r\n".encode())
+        w.write(f"HTTP/1.1 307 Temporary Redirect\r\nLocation: {target.url}\r\nContent-Length: 0\r\n\r\n".encode())
         await w.drain()
 
     red = _Raw(redirect)
