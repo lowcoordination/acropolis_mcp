@@ -55,6 +55,10 @@ path "kv/data/cluster/acropolis/*" { capabilities = ["read", "create", "update"]
 EOF
 ```
 
+Acropolis logs in as **one** role, so if the same deployment also resolves other secret references
+(see [secrets.md](secrets.md)), that role's policies must include the paths for those as well as
+the one above; the examples below name a role for the signing key only.
+
 **Kubernetes auth (recommended).** The credential is the pod's own service-account token, which
 Kubernetes issues, expires and rotates, so there is no static secret to leak, back up or forget to
 rotate. Bind a role to the Acropolis service account. The one-time setup (mounting the method,
@@ -194,11 +198,16 @@ arrives. In a running fleet, Acropolis's own health probes
 
    ```bash
    # SLUG is the server's audience (its slug); SERVER_URL is its registered URL, exactly as stored.
+   # Keep the quotes: an unquoted URL containing & ; or $( ) is split or expanded by your shell.
    for ref in "<previous key ref>" "<active key ref>"; do
-     kubectl exec -i deploy/acropolis -- env KEY_REF="$ref" SLUG=<slug> SERVER_URL=<registered url> \
+     kubectl exec -i deploy/acropolis -- env KEY_REF="$ref" SLUG="<slug>" SERVER_URL="<registered url>" \
        python - < rotation-drill-probe.py
    done
    ```
+
+   The second run sends a token that is **valid for 10 minutes** for that audience, so point
+   `SERVER_URL` only at the server's own registered URL; a token sent anywhere else can be replayed
+   against that server until it expires.
 
 **Expected result.**
 
