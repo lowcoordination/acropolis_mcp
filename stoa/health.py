@@ -8,9 +8,15 @@ from typing import Optional
 import httpx
 
 from archon.background import BackgroundLoop
-from archon.secrets import SecretProvider, SecretResolutionError
+from archon.secrets import SecretProvider
 from archon.secrets.local import LocalSecretProvider
 from argus.bridge import META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION
+from argus.credentials import (
+    TOKEN_MINT_FAILED,
+    TOKEN_NOT_CONFIGURED,
+    UpstreamCredentialError,
+    resolve_upstream_credential,
+)
 from argus.headers import MCP_METHOD_HEADER
 from argus.tokens import TokenIssuer
 from argus.upstream import (
@@ -48,14 +54,8 @@ PROBE_MAX_RESPONSE_BYTES = 1024 * 1024
 # rest; the bound keeps a large fleet from opening hundreds of sockets in a single burst.
 MAX_CONCURRENT_PROBES = 16
 
-# The reason string stored on servers.health_reason when a probe fails specifically because the
-# configured secret couldn't be resolved — distinguishable, by a human or by test assertions,
-# from a plain network-level probe failure (which leaves health_reason None; see the docstring
-# on probe_server below).
-SECRET_RESOLUTION_FAILURE_PREFIX = "secret resolution failed: "
-
 # Issue #134 (T3): the reason prefix when a token-mode probe can't mint its JWT — distinguishable
-# from a plain network failure (health_reason None) and from a secret-resolution failure above.
+# from a plain network failure (health_reason None) and from a secret-resolution failure.
 TOKEN_MINT_FAILURE_PREFIX = "token mint failed: "
 
 # Issue #134 hardening: the reason prefix when a token-mode server ANSWERS a request that carries
@@ -103,35 +103,27 @@ async def probe_server(
     }
     # A server with a configured upstream credential needs it on the health probe too, or every
     # registered server requiring auth would show permanently unhealthy regardless of whether
-    # tools/call itself works.
+    # tools/call itself works. A token-mode server needs its JWT for the same reason: a probe that
+    # 401s while tools/call works would read permanently unhealthy.
     #
-    # This goes through the configured SecretProvider — resolve() returns the literal unchanged
-    # under `local`, or resolves a `vault://`/`enc:v1:` reference under the other tiers. A
-    # resolution failure must NEVER be treated the same as "no credential configured" (which
-    # would probe unauthenticated and either misreport health or, worse, look healthy against an
-    # upstream that doesn't actually need auth) — it is reported as its own distinguishable
-    # unhealthy reason instead.
-    resolved_auth_header: str | None = None
-    if server.credential_mode == "token":
-        # Issue #134 (T3): a token-mode server needs its JWT on the probe too — a health check
-        # must carry the same credential a real tools/call does, or the server reads permanently
-        # unhealthy (probe 401s) while tools/call itself works. Mint via the startup-wired
-        # issuer; fail closed (unhealthy, distinguishable reason) if it's absent or the mint
-        # fails — never probe unauthenticated and misreport health.
-        if token_issuer is None:
+    # The per-mode rule is argus.credentials.resolve_upstream_credential (issue #155), shared with
+    # the data plane and the control plane; this only maps its failure to an unhealthy reason. A
+    # failure must NEVER be treated the same as "no credential configured" (which would probe
+    # unauthenticated and either misreport health or, worse, look healthy against an upstream that
+    # doesn't actually need auth), so it is reported as its own distinguishable reason.
+    try:
+        resolved_auth_header = await resolve_upstream_credential(
+            server, secrets=secrets, token_issuer=token_issuer,
+        )
+    except UpstreamCredentialError as e:
+        if e.kind == TOKEN_NOT_CONFIGURED:
             return ("unhealthy", None, None, f"{TOKEN_MINT_FAILURE_PREFIX}token signing is not configured")
-        try:
-            resolved_auth_header = f"Bearer {await token_issuer.get_token(server.slug)}"
-        except Exception:
-            logger.exception("probe for '%s' could not mint a token", server.slug)
+        if e.kind == TOKEN_MINT_FAILED:
             return ("unhealthy", None, None, f"{TOKEN_MINT_FAILURE_PREFIX}token mint failed")
-        headers["Authorization"] = resolved_auth_header
-    elif server.upstream_auth_header:
-        try:
-            resolved_auth_header = await secrets.resolve(server.upstream_auth_header)
-        except SecretResolutionError as e:
-            logger.info("probe for '%s' could not resolve its credential: %s", server.slug, e.reason)
-            return ("unhealthy", None, None, f"{SECRET_RESOLUTION_FAILURE_PREFIX}{e.reason}")
+        logger.info("probe for '%s' could not resolve its credential: %s", server.slug, e.reason)
+        # e.reason already reads "secret resolution failed: <reason>".
+        return ("unhealthy", None, None, e.reason)
+    if resolved_auth_header:
         headers["Authorization"] = resolved_auth_header
     discover_body = {
         "jsonrpc": "2.0", "id": "acropolis-discover", "method": "server/discover",
