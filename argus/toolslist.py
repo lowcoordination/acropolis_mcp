@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional
 
@@ -12,7 +14,24 @@ from argus.policy import tool_is_visible
 from db.database import Database, acquire_with_timeout, utcnow
 from db.models import ServerPolicy
 
+logger = logging.getLogger("argus.toolslist")
+
 DEFAULT_TTL_MS = 300_000  # 5 minutes — used for 2025-generation upstreams, which carry no ttlMs
+
+
+@dataclass(frozen=True)
+class ToolsFetchResult:
+    """A tool list plus whether it can be trusted as current.
+
+    ``stale`` is True when a fetch was needed and failed, so ``tools`` is whatever the cache
+    still held (possibly nothing). ``error`` is then a SHORT FIXED reason built only from our
+    own values (a status code or an exception class name) — never upstream body, header or
+    exception text, which an untrusted upstream controls and which may echo a credential.
+    A genuinely empty upstream is ``tools == [] and not stale and error is None``.
+    """
+    tools: list[dict]
+    stale: bool = False
+    error: Optional[str] = None
 
 
 class ToolsCache:
@@ -48,8 +67,25 @@ class ToolsCache:
         self, server_id: int, upstream_url: str, force_refresh: bool = False,
         upstream_auth_header: Optional[str] = None,
         resolve_credential: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+        server_slug: Optional[str] = None,
     ) -> list[dict]:
-        """Returns the server's full (unfiltered) tool list, from cache if fresh or by fetching.
+        """The tool list only. Data-plane callers use this: a failed fetch degrades to the stale
+        cache or ``[]`` rather than an error. Callers that must tell "no tools" from "fetch
+        failed" (the control plane) use ``get_raw_tools_result``."""
+        return (await self.get_raw_tools_result(
+            server_id, upstream_url, force_refresh=force_refresh,
+            upstream_auth_header=upstream_auth_header, resolve_credential=resolve_credential,
+            server_slug=server_slug,
+        )).tools
+
+    async def get_raw_tools_result(
+        self, server_id: int, upstream_url: str, force_refresh: bool = False,
+        upstream_auth_header: Optional[str] = None,
+        resolve_credential: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+        server_slug: Optional[str] = None,
+    ) -> ToolsFetchResult:
+        """Returns the server's full (unfiltered) tool list, from cache if fresh or by fetching,
+        with whether a needed fetch failed (see ``ToolsFetchResult``).
 
         ``upstream_auth_header`` must already be RESOLVED (plaintext) — the data plane passes the
         credential its pipeline resolved. Callers that only have the server record (the control
@@ -61,7 +97,7 @@ class ToolsCache:
         """
         rows = await self._cached_rows(server_id)
         if rows and not force_refresh and all(self._is_fresh(r["fetched_at"], r["ttl_ms"]) for r in rows):
-            return [json.loads(r["definition_json"]) for r in rows]
+            return ToolsFetchResult([json.loads(r["definition_json"]) for r in rows])
 
         if resolve_credential is not None:
             upstream_auth_header = await resolve_credential()
@@ -74,25 +110,42 @@ class ToolsCache:
                 rpc_id=f"acropolis-toolslist-{uuid.uuid4()}", params={},
                 upstream_auth_header=upstream_auth_header,
             )
-        except BridgeError:
+        except BridgeError as e:
             # Upstream unreachable (connection refused, handshake failed, etc.) — serve stale
             # cache if we have any, rather than propagating a 500 to whoever's asking for the
             # tool list (a data-plane client, or the Archon UI's server-detail page).
-            if rows:
-                return [json.loads(r["definition_json"]) for r in rows]
-            return []
+            return self._failed(
+                rows, server_id, server_slug,
+                f"upstream fetch failed ({type(e).__name__} {e.status_code})",
+            )
 
         if status != 200 or "result" not in body:
-            # Upstream responded, but not usefully — same fallback as above.
-            if rows:
-                return [json.loads(r["definition_json"]) for r in rows]
-            return []
+            # Upstream responded, but not usefully (e.g. 401 for a rejected token) — same
+            # fallback as above.
+            reason = (
+                f"upstream answered {status}" if status != 200
+                else "upstream answered without a result"
+            )
+            return self._failed(rows, server_id, server_slug, reason)
 
         tools = body["result"].get("tools", [])
         ttl_ms = body["result"].get("ttlMs")
         cache_scope = body["result"].get("cacheScope")
         await self._store(server_id, tools, ttl_ms, cache_scope)
-        return tools
+        return ToolsFetchResult(tools)
+
+    def _failed(
+        self, rows: list[asyncpg.Record], server_id: int, server_slug: Optional[str], reason: str,
+    ) -> ToolsFetchResult:
+        # `reason` is built from our own values only (status int / exception class name), so it
+        # is safe both to log and to hand to an API client. Never log the upstream body, headers
+        # or the exception message: an untrusted upstream controls them.
+        logger.warning(
+            "tools/list fetch for server %s failed: %s; serving %s",
+            server_slug or f"id={server_id}", reason,
+            f"{len(rows)} stale cached tool(s)" if rows else "an empty list",
+        )
+        return ToolsFetchResult([json.loads(r["definition_json"]) for r in rows], stale=True, error=reason)
 
     async def _store(
         self, server_id: int, tools: list[dict], ttl_ms: Optional[int], cache_scope: Optional[str]
@@ -148,10 +201,12 @@ class ToolsCache:
         self, server_id: int, upstream_url: str, policy: ServerPolicy,
         upstream_auth_header: Optional[str] = None, force_refresh: bool = False,
         resolve_credential: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+        server_slug: Optional[str] = None,
     ) -> list[dict]:
         """Tool list with policy-denied tools removed — what a client is actually allowed to see."""
         tools = await self.get_raw_tools(
             server_id, upstream_url, force_refresh=force_refresh,
             upstream_auth_header=upstream_auth_header, resolve_credential=resolve_credential,
+            server_slug=server_slug,
         )
         return [t for t in tools if tool_is_visible(t["name"], policy)]

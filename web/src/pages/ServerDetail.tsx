@@ -277,13 +277,25 @@ function ParamRuleEditor({
   )
 }
 
+// Error detail for the Tools card. Always rendered as a JSX text child (never as HTML): the
+// message is the gateway's own reason string, which for an upstream failure is a short fixed
+// phrase, but this stays text-only regardless.
+function describeError(err: unknown): string {
+  if (err instanceof ApiError) return `HTTP ${err.status} — ${err.message}`
+  return err instanceof Error ? err.message : 'Something went wrong'
+}
+
 export function ServerDetail() {
   const { slug } = useParams<{ slug: string }>()
   const queryClient = useQueryClient()
 
   const { data: server } = useServer(slug ?? '')
   const { data: policy, isLoading: policyLoading } = useServerPolicy(slug ?? '')
-  const { data: toolsResponse, isLoading: toolsLoading } = useServerTools(slug ?? '')
+  const {
+    data: toolsResponse,
+    isLoading: toolsLoading,
+    error: toolsError,
+  } = useServerTools(slug ?? '')
   const tools = toolsResponse?.tools
   const probeServer = useProbeServer(slug ?? '')
   const refreshTools = useRefreshServerTools(slug ?? '')
@@ -589,9 +601,27 @@ export function ServerDetail() {
             Loading tools…
           </p>
         )}
-        {tools && tools.length === 0 && (
+        {toolsError && (
+          <p role="alert" className="p-4 text-sm break-words" style={{ color: 'var(--danger)' }}>
+            Could not load tools: {describeError(toolsError)}
+          </p>
+        )}
+        {refreshTools.error && (
+          <p role="alert" className="p-4 text-sm break-words" style={{ color: 'var(--danger)' }}>
+            Refresh from upstream failed: {describeError(refreshTools.error)}
+          </p>
+        )}
+        {toolsResponse?.stale && (
+          <p role="status" className="p-4 text-sm break-words" style={{ color: 'var(--danger)' }}>
+            {tools && tools.length > 0
+              ? 'Showing the last cached tool list — the latest fetch from the upstream failed'
+              : 'The tool list is empty because the fetch from the upstream failed'}
+            {toolsResponse.fetch_error ? `: ${toolsResponse.fetch_error}` : '.'}
+          </p>
+        )}
+        {tools && tools.length === 0 && !toolsResponse?.stale && !toolsError && (
           <p className="p-4 text-sm" style={{ color: 'var(--text-muted)' }}>
-            No tools found — the upstream may be unreachable, or hasn't been probed yet.
+            No tools found — the upstream reported none.
           </p>
         )}
         {tools && tools.length > 0 && (

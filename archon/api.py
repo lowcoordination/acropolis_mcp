@@ -419,7 +419,7 @@ def build_control_plane_router(
                     await asyncio.wait_for(
                         tools_cache.get_raw_tools(
                             server.id, server.upstream_url, force_refresh=True,
-                            resolve_credential=upstream_credential(server),
+                            resolve_credential=upstream_credential(server), server_slug=slug,
                         ),
                         timeout=PROBE_TIMEOUT_SECONDS,
                     )
@@ -591,9 +591,9 @@ def build_control_plane_router(
             return ServerToolsResponse(fetched_at=None, tools=[])
 
         try:
-            tools = await tools_cache.get_raw_tools(
+            fetched = await tools_cache.get_raw_tools_result(
                 server.id, server.upstream_url, force_refresh=force_refresh,
-                resolve_credential=upstream_credential(server),
+                resolve_credential=upstream_credential(server), server_slug=slug,
             )
         except UpstreamCredentialError as e:
             # Explicit, not an empty list: an empty Tools card was exactly the silent failure
@@ -602,7 +602,7 @@ def build_control_plane_router(
                 status_code=502, detail=f"upstream credential could not be resolved: {e.reason}",
             )
         result = []
-        for tool in tools:
+        for tool in fetched.tools:
             name = tool.get("name", "")
             if policy.mode == "allowlist":
                 status = "allowed" if name in policy.allowed else "denied"
@@ -620,7 +620,9 @@ def build_control_plane_router(
                 input_schema=tool.get("inputSchema"),
             ))
         fetched_at = await tools_cache.fetched_at(server.id)
-        return ServerToolsResponse(fetched_at=fetched_at, tools=result)
+        return ServerToolsResponse(
+            fetched_at=fetched_at, tools=result, stale=fetched.stale, fetch_error=fetched.error,
+        )
 
     if pipeline is not None:
         @router.post(

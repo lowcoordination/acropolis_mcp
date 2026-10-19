@@ -178,6 +178,7 @@ class AggregatePipeline:
                 self._per_server.tools_cache.get_filtered_tools(
                     server.id, server.upstream_url, policy,
                     resolve_credential=self._per_server.catalog_credential(server),
+                    server_slug=server.slug,
                 ),
                 timeout=self._PER_SERVER_DEADLINE_SECONDS,
             )

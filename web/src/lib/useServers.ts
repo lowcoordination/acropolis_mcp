@@ -38,7 +38,10 @@ export function useRefreshServerTools(slug: string) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: () => serversApi.getTools(slug, { force_refresh: true }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['servers', slug, 'tools'] }),
+    // Seed the query with this response instead of invalidating it: a refetch without
+    // force_refresh is served from the cache and would drop the stale/fetch_error report that
+    // this forced fetch just produced.
+    onSuccess: (data) => queryClient.setQueryData(['servers', slug, 'tools'], data),
   })
 }
 
