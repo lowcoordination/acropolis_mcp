@@ -51,8 +51,9 @@ jobs:
       # 15 min covers the full local suite (~5-9 min healthy) plus
       # tests/integration/test_no_otel_installed.py's no_otel_venv fixture, which builds a
       # SECOND from-scratch venv and pip-installs into it mid-suite (a real, deliberate design —
-      # proving OTel is genuinely uninstallable rather than mocking the ImportError — not
-      # something to remove). That fixture is now hardened against the specific failure this
+      # proving the OpenTelemetry SDK and the OTLP exporter are genuinely absent from the base
+      # install rather than mocking the ImportError; opentelemetry-api is not absent, because
+      # FastAPI depends on it — not something to remove). That fixture is now hardened against the specific failure this
       # incident hit (see its own _run_with_hard_timeout — a plain subprocess.run's timeout
       # doesn't reliably reap pip's own grandchild processes under degraded runner network
       # conditions); this step timeout is the outer backstop in case a future hang isn't one

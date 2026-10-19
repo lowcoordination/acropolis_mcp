@@ -37,20 +37,55 @@ The API rejects `credential_mode='token'` when no signing key is configured.
 - The public half is derived; JWKS is served at `/.well-known/jwks.json` (unauthenticated).
 - Fail-loud: a configured but unresolvable key aborts startup.
 
-Example (OpenBao + AppRole):
+The signing key lives in OpenBao. Acropolis can log in to OpenBao two ways, both documented in
+[secrets.md](secrets.md#authenticating-to-the-secret-server); this page needs only the key and a
+policy.
+
+Store the key (4096-bit, without touching disk) and write the policy. Rotation writes each new key
+under `<base>/keys/<epoch>`, so the policy must cover the base path **and** `<base>/*`; with only
+the base path, the first rotation fails when it tries to store the new key.
 
 ```bash
-# Store a 4096-bit key without touching disk.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
   | bao kv put kv/cluster/acropolis token-signing-key=-
 
-# Policy + role for the app. Rotation writes new keys under <base>/keys/<epoch>, hence the
-# second path. The provider re-logs-in on lease expiry, so the secret_id is the long-lived
-# credential and the tokens stay short-lived.
 bao policy write acropolis-token-signing - <<'EOF'
 path "kv/data/cluster/acropolis"   { capabilities = ["read", "create", "update"] }
 path "kv/data/cluster/acropolis/*" { capabilities = ["read", "create", "update"] }
 EOF
+```
+
+**Kubernetes auth (recommended).** The credential is the pod's own service-account token, which
+Kubernetes issues, expires and rotates, so there is no static secret to leak, back up or forget to
+rotate. Bind a role to the Acropolis service account. The one-time setup (mounting the method,
+`auth/kubernetes/config`) is under "Kubernetes auth" in
+[secrets.md](secrets.md#authenticating-to-the-secret-server).
+
+```bash
+bao write auth/kubernetes/role/acropolis-token-signing \
+  bound_service_account_names=acropolis \
+  bound_service_account_namespaces=acropolis \
+  policies=acropolis-token-signing ttl=1h
+```
+
+Deployment env:
+
+```
+ACROPOLIS_SECRET_PROVIDER=openbao
+ACROPOLIS_VAULT_ADDR=http://openbao.vault-system.svc.cluster.local:8200
+ACROPOLIS_VAULT_AUTH_METHOD=kubernetes
+ACROPOLIS_VAULT_K8S_ROLE=acropolis-token-signing
+ACROPOLIS_TOKEN_SIGNING_KEY_REF=vault://kv/cluster/acropolis#token-signing-key
+```
+
+**AppRole (when Kubernetes auth is not available).** An AppRole `secret_id` is a **long-lived static
+credential**: someone has to create it, store it and rotate it by hand, and anyone who copies it can
+log in until it is revoked. The provider re-logs-in when its token's lease expires, so the OpenBao
+*tokens* stay short-lived, but the `secret_id` does not. Kubernetes auth avoids that credential
+entirely, which is why it is the recommended deployment. Prefer the `_FILE` form of the secret_id
+over an inline variable (the reasons are in secrets.md).
+
+```bash
 bao write auth/approle/role/acropolis-token-signing \
   token_policies=acropolis-token-signing token_ttl=1h token_max_ttl=4h \
   secret_id_ttl=0 token_num_uses=0
@@ -61,8 +96,8 @@ Deployment env:
 ```
 ACROPOLIS_SECRET_PROVIDER=openbao
 ACROPOLIS_VAULT_ADDR=http://openbao.vault-system.svc.cluster.local:8200
-ACROPOLIS_VAULT_ROLE_ID=<from the acropolis-vault Secret>
-ACROPOLIS_VAULT_SECRET_ID=<from the acropolis-vault Secret>
+ACROPOLIS_VAULT_ROLE_ID=<role id>
+ACROPOLIS_VAULT_SECRET_ID_FILE=<path of the mounted secret_id file>
 ACROPOLIS_TOKEN_SIGNING_KEY_REF=vault://kv/cluster/acropolis#token-signing-key
 ```
 
