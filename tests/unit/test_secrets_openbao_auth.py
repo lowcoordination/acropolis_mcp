@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import threading
 import time
@@ -47,6 +48,7 @@ class _Server:
         self.kv: dict[str, dict] = {"secret/data/acropolis/svc": {"token": "the-secret-value"}}
         self.reads_with: list[str] = []  # X-Vault-Token of each KV read, in order
         self.login_delay = 0.0  # seconds the login endpoint takes to answer (a hang)
+        self.login_override: bytes | None = None  # raw body for an otherwise-successful login
         self._lock = threading.Lock()
 
     def new_token(self) -> str:
@@ -87,6 +89,13 @@ def _handler(state: _Server):
                 try:
                     if not ok:
                         return self._send(403, {"errors": ["permission denied"]})
+                    if state.login_override is not None:
+                        raw = state.login_override
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        return
                     return self._send(200, {"auth": {
                         "client_token": state.new_token(), "lease_duration": state.lease_seconds}})
                 except (BrokenPipeError, ConnectionResetError):
@@ -375,6 +384,94 @@ async def test_a_credential_path_that_is_not_a_regular_file_is_refused_not_block
         assert state.logins == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    b'{"auth": {"client_token": null, "lease_duration": 3600}}',
+    b'{"auth": {"client_token": 12345, "lease_duration": 3600}}',
+    b'{"auth": {"client_token": {"a": 1}, "lease_duration": 3600}}',
+    b'{"auth": {"client_token": "", "lease_duration": 3600}}',
+    b'{"auth": {"client_token": "   ", "lease_duration": 3600}}',
+    b'{"auth": {"lease_duration": 3600}}',
+])
+async def test_a_malformed_login_token_is_a_secret_resolution_error(tmp_path, body):
+    """The server controls this response. A non-string token used to reach httpx as a header value
+    and escape as a raw TypeError, past the SecretResolutionError seam the callers rely on."""
+    jwt = _write(tmp_path / "token", "k8s-jwt-1")
+    with _stub() as (state, url):
+        state.accepted_jwts = {"k8s-jwt-1"}
+        state.login_override = body
+        p = OpenBaoSecretProvider(url, auth_method="kubernetes", k8s_role="acropolis",
+                                  k8s_token_file=str(jwt), ttl_seconds=0.0)
+        try:
+            with pytest.raises(SecretResolutionError) as exc:
+                await p.resolve(REF)
+        finally:
+            await p.aclose()
+        assert "malformed" in exc.value.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease", [b"NaN", b"Infinity", b"-Infinity", b"1e400", b"999999999"])
+async def test_a_non_finite_lease_cannot_disable_caching_or_pin_a_token_forever(tmp_path, lease):
+    """NaN made the token look permanently expired, so every request logged in again (a login per
+    request against the secret server or the Kubernetes API). Infinity pinned a revoked token until
+    restart. Both are server-controlled."""
+    jwt = _write(tmp_path / "token", "k8s-jwt-1")
+    with _stub() as (state, url):
+        state.accepted_jwts = {"k8s-jwt-1"}
+        state.login_override = b'{"auth": {"client_token": "tok-1", "lease_duration": ' + lease + b'}}'
+        state.issued.add("tok-1")
+        p = OpenBaoSecretProvider(url, auth_method="kubernetes", k8s_role="acropolis",
+                                  k8s_token_file=str(jwt), ttl_seconds=0.0)
+        try:
+            for _ in range(4):
+                assert await p.resolve(REF) == "the-secret-value"
+            remaining = p._login_token_expires_at - time.monotonic()
+        finally:
+            await p.aclose()
+        assert len(state.logins) == 1, f"{len(state.logins)} logins for 4 resolves: the token was not cached"
+        assert 0 < remaining <= 24 * 3600 + 5, f"cached for {remaining:.0f}s"
+
+
+@pytest.mark.asyncio
+async def test_a_utf8_bom_in_a_credential_file_is_ignored(tmp_path):
+    """Files saved by Windows editors start with a BOM; kept, it silently becomes part of the
+    credential and the login fails with an unexplained 403."""
+    jwt = tmp_path / "token"
+    jwt.write_bytes(b"\xef\xbb\xbfk8s-jwt-1\r\n")
+    with _stub() as (state, url):
+        state.accepted_jwts = {"k8s-jwt-1"}
+        p = OpenBaoSecretProvider(url, auth_method="kubernetes", k8s_role="acropolis",
+                                  k8s_token_file=str(jwt), ttl_seconds=0.0)
+        try:
+            assert await p.resolve(REF) == "the-secret-value"
+        finally:
+            await p.aclose()
+
+
+@pytest.mark.parametrize("url,warns", [
+    ("http://10.1.2.3:8200", True),
+    ("http://openbao.vault-system.svc:8200", True),
+    ("https://vault.example.internal:8200", False),
+    ("http://127.0.0.1:8200", False),
+    ("http://localhost:8200", False),
+    ("http://[::1]:8200", False),
+])
+def test_plain_http_to_a_remote_secret_server_is_warned_about(url, warns, caplog):
+    """The login credential and every secret travel in clear text. Not blocked (an in-cluster
+    service is often plain http), but never silent."""
+    with caplog.at_level(logging.WARNING, logger="archon.secrets.openbao"):
+        OpenBaoSecretProvider(url, token="t")
+    assert any("plain http" in r.getMessage() for r in caplog.records) is warns
+
+
+def test_the_plain_http_warning_never_prints_credentials_embedded_in_the_url(caplog):
+    with caplog.at_level(logging.WARNING, logger="archon.secrets.openbao"):
+        OpenBaoSecretProvider("http://admin:HUNTER2-PASSWORD@10.1.2.3:8200", token="t")
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "plain http" in text and "HUNTER2-PASSWORD" not in text and "admin" not in text
+
+
 # --------------------------------------------------------------------- configuration
 
 @pytest.mark.parametrize("kwargs", [
@@ -403,6 +500,12 @@ def test_the_auth_mount_cannot_escape_the_auth_namespace(mount):
     """The mount name is interpolated into the login URL."""
     with pytest.raises(OpenBaoConfigError):
         OpenBaoSecretProvider("http://127.0.0.1:8200", auth_method="kubernetes", k8s_role="r", k8s_mount=mount)
+
+
+def test_an_absurdly_long_mount_name_is_rejected():
+    with pytest.raises(OpenBaoConfigError):
+        OpenBaoSecretProvider("http://127.0.0.1:8200", auth_method="kubernetes", k8s_role="r", k8s_mount="a" * 129)
+    OpenBaoSecretProvider("http://127.0.0.1:8200", auth_method="kubernetes", k8s_role="r", k8s_mount="a" * 128)
 
 
 @pytest.mark.parametrize("mount", ["kubernetes", "k8s-prod", "team_a.k8s", "k8s/prod"])

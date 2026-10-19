@@ -222,6 +222,12 @@ lifetime explicitly, project a token instead and point `ACROPOLIS_VAULT_K8S_TOKE
 the projected token unless you also set the matching `audience` on the OpenBao role; that pairing
 is not exercised by this project's tests.
 
+Transport and files: a `VAULT_ADDR` that is plain `http://` to anything other than localhost logs a
+warning at startup, because the login credential and every secret then travel in clear text (it is
+not blocked, since an in-cluster service is often plain http). Credential files are read
+through symlinks, which is how Kubernetes and Docker lay them out, and must be regular files of at
+most 16 KiB; a UTF-8 BOM and surrounding whitespace are ignored.
+
 What Kubernetes auth does **not** do: it does not stop anyone who can create tokens for the
 service account (`kubectl create token`) or read the pod's filesystem as the same user. It removes
 the long-lived static credential and the places a copy of it ends up; it is not a substitute for

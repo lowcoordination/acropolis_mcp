@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import stat
@@ -78,6 +79,13 @@ MAX_CREDENTIAL_FILE_BYTES = 16 * 1024
 # lock. Without it, N waiters against a hung endpoint take N x the request timeout and hammer the
 # endpoint (with Kubernetes auth, the API server). Short, so a fixed credential is picked up quickly.
 LOGIN_FAILURE_BACKOFF_SECONDS = 2.0
+# The server decides a login token's lease. Cap how long one is trusted from the cache, and treat a
+# non-finite value as unknown: NaN made a token look permanently expired (a login on every request),
+# Infinity pinned a possibly revoked token until restart.
+DEFAULT_LOGIN_LEASE_SECONDS = 3600.0
+MAX_LOGIN_LEASE_SECONDS = 24 * 3600.0
+MAX_MOUNT_NAME_LENGTH = 128
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 def _read(fd: int, n: int) -> bytes:
     """os.read, as a seam: a test makes it return short reads, which a local file never does."""
@@ -200,9 +208,21 @@ class OpenBaoSecretProvider:
                 f"auth_method {auth_method!r} is selected but credentials for "
                 f"{', '.join(sorted(set(conflicting)))} are also configured; give exactly one"
             )
-        if auth_method == "kubernetes" and not _MOUNT_RE.fullmatch(k8s_mount or ""):
+        if auth_method == "kubernetes" and (
+            not _MOUNT_RE.fullmatch(k8s_mount or "") or len(k8s_mount) > MAX_MOUNT_NAME_LENGTH
+        ):
             raise OpenBaoConfigError(
                 f"k8s_mount must be a plain auth mount name like 'kubernetes' or 'team/k8s', got {k8s_mount!r}"
+            )
+
+        if parsed.scheme == "http" and (parsed.hostname or "") not in _LOOPBACK_HOSTS:
+            # Not blocked: an in-cluster service is often plain http. But the login credential and
+            # every secret then travel in clear text, so it must never be silent. Host and port only:
+            # a URL may carry userinfo, which must not reach a log.
+            logger.warning(
+                "the secret server at %s is reached over plain http: the login credential and every "
+                "secret travel in clear text; use https unless this network is trusted",
+                f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname,
             )
 
         self._base_url = base_url.rstrip("/")
@@ -274,7 +294,8 @@ class OpenBaoSecretProvider:
                        f"(over {MAX_CREDENTIAL_FILE_BYTES} bytes)"
             )
         try:
-            value = raw.decode("utf-8").strip()
+            # utf-8-sig: a BOM (files saved by Windows editors) would otherwise become part of the credential
+            value = raw.decode("utf-8-sig").strip()
         except UnicodeDecodeError as e:
             raise SecretResolutionError(label, f"the {what} file {path!r} is not UTF-8 text") from e
         if not value:
@@ -310,9 +331,17 @@ class OpenBaoSecretProvider:
             data = resp.json()
             auth = data["auth"]
             token = auth["client_token"]
-            lease_seconds = float(auth.get("lease_duration") or 3600)
+            lease_seconds = float(auth.get("lease_duration") or DEFAULT_LOGIN_LEASE_SECONDS)
         except (ValueError, KeyError, TypeError) as e:
             raise SecretResolutionError(label, f"{name} login response malformed: {e}") from e
+        # The response is server-controlled. A token that is not a non-empty string would reach
+        # httpx as a header value and escape as a raw TypeError, past the SecretResolutionError
+        # seam every caller relies on.
+        if not isinstance(token, str) or not token.strip():
+            raise SecretResolutionError(label, f"{name} login response malformed: client_token is missing or not a string")
+        if not math.isfinite(lease_seconds):
+            lease_seconds = DEFAULT_LOGIN_LEASE_SECONDS
+        lease_seconds = min(lease_seconds, MAX_LOGIN_LEASE_SECONDS)
         self._login_token = token
         self._login_failed_until = 0.0
         self._login_failure = None
