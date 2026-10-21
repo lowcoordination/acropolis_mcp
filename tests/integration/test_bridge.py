@@ -252,3 +252,168 @@ async def test_bridge_substitutes_an_id_only_when_the_caller_sent_none():
         )
 
     assert seen_upstream_ids == [1], "an absent id must still get the fallback"
+
+
+# --- Issue #163: 2026 per-request _meta must not cross the bridge ---------------------------
+
+_META_NS = "io.modelcontextprotocol/"
+
+
+def _recording_upstream(seen: list[dict]):
+    """MockTransport handler for a 2025-generation upstream that records every tools/call
+    request as {"headers", "params"} exactly as it crossed the wire."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        method = payload.get("method")
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0", "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {}, "serverInfo": {"name": "stub", "version": "0"},
+                    },
+                },
+                headers={"mcp-session-id": "session-1"},
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(200, json={})
+        if method in ("tools/call", "tools/list"):
+            seen.append({"headers": dict(request.headers), "params": payload.get("params")})
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": payload["id"], "result": {"content": []}},
+            )
+        raise AssertionError(f"unexpected method: {method}")
+    return handler
+
+
+def _full_2026_meta() -> dict:
+    return {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {"elicitation": {}},
+        "io.modelcontextprotocol/clientInfo": {"name": "example-client", "version": "1.0"},
+    }
+
+
+async def _bridged_call(params: dict, meta: dict | None = None, method: str = "tools/call"):
+    seen: list[dict] = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_recording_upstream(seen))) as client:
+        bridge = ProtocolBridge(client, UpstreamHandshakeCache(client))
+        status, body = await bridge.bridge_call(
+            server_id=1, upstream_url="http://stub.invalid/mcp", rpc_method=method,
+            rpc_id=1, params=params, meta=meta,
+        )
+    return status, body, seen
+
+
+async def test_bridge_strips_2026_meta_keys_but_keeps_progress_token():
+    params = {
+        "name": "echo", "arguments": {"message": "hi"},
+        "_meta": {**_full_2026_meta(), "progressToken": "tok-1"},
+    }
+    status, _, seen = await _bridged_call(params)
+
+    assert status == 200
+    assert len(seen) == 1
+    # The upstream saw the 2025 header, and no 2026 per-request keys to contradict it.
+    assert seen[0]["headers"]["mcp-protocol-version"] == "2025-06-18"
+    assert seen[0]["params"]["_meta"] == {"progressToken": "tok-1"}
+    assert seen[0]["params"]["name"] == "echo"
+    assert seen[0]["params"]["arguments"] == {"message": "hi"}
+
+
+async def test_bridge_drops_meta_entirely_when_only_namespaced_keys():
+    params = {"name": "echo", "arguments": {}, "_meta": _full_2026_meta()}
+    status, _, seen = await _bridged_call(params)
+
+    assert status == 200
+    assert "_meta" not in seen[0]["params"]
+
+
+async def test_bridge_keeps_other_namespaced_meta_keys():
+    # Only the three 2026 per-request keys are stripped, not the whole io.modelcontextprotocol/ prefix.
+    params = {"name": "echo", "arguments": {}, "_meta": {**_full_2026_meta(), "example.com/trace": "t"}}
+    _, _, seen = await _bridged_call(params)
+
+    assert seen[0]["params"]["_meta"] == {"example.com/trace": "t"}
+
+
+async def test_bridge_does_not_mutate_callers_params():
+    import copy
+
+    params = {
+        "name": "echo", "arguments": {"message": "hi"},
+        "_meta": {**_full_2026_meta(), "progressToken": "tok-1"},
+    }
+    snapshot = copy.deepcopy(params)
+    nested_meta = params["_meta"]
+
+    await _bridged_call(params)
+
+    assert params == snapshot
+    assert params["_meta"] is nested_meta
+    assert META_PROTOCOL_VERSION in params["_meta"]
+
+
+async def test_bridge_does_not_mutate_params_when_meta_is_only_namespaced():
+    import copy
+
+    params = {"name": "echo", "arguments": {}, "_meta": _full_2026_meta()}
+    snapshot = copy.deepcopy(params)
+
+    await _bridged_call(params)
+
+    assert params == snapshot
+
+
+async def test_bridge_params_without_meta_are_forwarded_unchanged():
+    params = {"name": "echo", "arguments": {"message": "hi"}}
+    _, _, seen = await _bridged_call(params)
+
+    assert seen[0]["params"] == params
+
+
+async def test_bridge_tolerates_non_dict_meta():
+    # Malformed client input must not crash the bridge; it is forwarded as-is for the upstream
+    # to reject, exactly as before.
+    params = {"name": "echo", "arguments": {}, "_meta": "oops"}
+    status, _, seen = await _bridged_call(params)
+
+    assert status == 200
+    assert seen[0]["params"]["_meta"] == "oops"
+
+
+async def test_bridge_strips_meta_on_tools_list_too():
+    status, _, seen = await _bridged_call({"_meta": _full_2026_meta()}, method="tools/list")
+
+    assert status == 200
+    assert "_meta" not in (seen[0]["params"] or {})
+
+
+async def test_bridge_checks_client_version_in_params_meta():
+    """Issue #163 'Also check': 2026 clients carry the version in params._meta (the health
+    probe's envelope, tests/integration/test_health_poller.py), not the top-level body _meta.
+    An unsupported version there must be rejected like it is when passed via `meta`."""
+    params = {"name": "echo", "arguments": {}, "_meta": {META_PROTOCOL_VERSION: "1999-01-01"}}
+    seen: list[dict] = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_recording_upstream(seen))) as client:
+        bridge = ProtocolBridge(client, UpstreamHandshakeCache(client))
+        with pytest.raises(BridgeError) as exc_info:
+            await bridge.bridge_call(
+                server_id=1, upstream_url="http://stub.invalid/mcp", rpc_method="tools/call",
+                rpc_id=1, params=params,
+            )
+    assert exc_info.value.status_code == 400
+    assert seen == []
+
+
+@pytest.mark.parametrize("params", [[1, 2], "x", 7])
+async def test_bridge_forwards_non_dict_params_unchanged(params):
+    """JSON-RPC allows array params and the pipeline does not type-check them. The #163 _meta
+    handling must not turn those into an unhandled AttributeError (a 500); before #163 they were
+    forwarded as-is, and they still are."""
+    status, _, seen = await _bridged_call(params)
+
+    assert status == 200
+    assert seen[0]["params"] == params
