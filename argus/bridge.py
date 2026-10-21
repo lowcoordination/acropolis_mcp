@@ -29,6 +29,28 @@ _2025_ONLY_LIFECYCLE_METHODS = frozenset({"initialize", "notifications/initializ
 _UNSUPPORTED_2026_METHODS = frozenset({"subscriptions/listen"})
 
 
+_2026_REQUEST_META_KEYS = (META_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_CLIENT_INFO)
+
+
+def _strip_2026_request_meta(params: dict) -> dict:
+    """Return params for the 2025 upstream: a copy without the 2026 per-request _meta keys.
+
+    The upstream is spoken to as 2025-06-18 (see the MCP-Protocol-Version header built in
+    bridge_call); leaving the client's 2026 protocolVersion in _meta makes strict upstreams
+    (go-sdk) reject the request for a header/_meta mismatch (#163). Never mutates the caller's
+    dict: `_meta` is rebuilt, not edited in place. Other keys (e.g. progressToken) are kept;
+    an emptied _meta is dropped. A non-dict _meta is left for the upstream to judge.
+    """
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return params
+    kept = {k: v for k, v in meta.items() if k not in _2026_REQUEST_META_KEYS}
+    out = {k: v for k, v in params.items() if k != "_meta"}
+    if kept:
+        out["_meta"] = kept
+    return out
+
+
 class BridgeError(Exception):
     def __init__(self, status_code: int, body: str):
         self.status_code = status_code
@@ -67,7 +89,14 @@ class ProtocolBridge:
         GEN_2026 bridged path (see the fork comment in Pipeline._process): protocol
         translation. The passthrough counterpart is Pipeline._forward (argus/pipeline.py).
         """
-        meta = meta or {}
+        params = params or {}
+        # 2026 clients carry the per-request version in params._meta (docs/protocol-bridging.md;
+        # the same envelope the health probe sends). Pipeline also passes the top-level body
+        # `_meta` as `meta`; keep honouring it as a fallback.
+        params_meta = params.get("_meta")
+        if not isinstance(params_meta, dict):
+            params_meta = {}
+        meta = {**(meta or {}), **params_meta}
 
         if rpc_method in _2025_ONLY_LIFECYCLE_METHODS:
             raise BridgeError(
@@ -108,7 +137,7 @@ class ProtocolBridge:
             "jsonrpc": "2.0",
             "id": sanitized_id if sanitized_id is not None else 1,
             "method": rpc_method,
-            "params": params,
+            "params": _strip_2026_request_meta(params),
         }
 
         # §26 fix (review 2026-08-04): a 404 (session expired/invalid upstream-side) used to
