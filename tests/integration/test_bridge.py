@@ -406,3 +406,14 @@ async def test_bridge_checks_client_version_in_params_meta():
             )
     assert exc_info.value.status_code == 400
     assert seen == []
+
+
+@pytest.mark.parametrize("params", [[1, 2], "x", 7])
+async def test_bridge_forwards_non_dict_params_unchanged(params):
+    """JSON-RPC allows array params and the pipeline does not type-check them. The #163 _meta
+    handling must not turn those into an unhandled AttributeError (a 500); before #163 they were
+    forwarded as-is, and they still are."""
+    status, _, seen = await _bridged_call(params)
+
+    assert status == 200
+    assert seen[0]["params"] == params

@@ -32,7 +32,7 @@ _UNSUPPORTED_2026_METHODS = frozenset({"subscriptions/listen"})
 _2026_REQUEST_META_KEYS = (META_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_CLIENT_INFO)
 
 
-def _strip_2026_request_meta(params: dict) -> dict:
+def _strip_2026_request_meta(params: Any) -> Any:
     """Return params for the 2025 upstream: a copy without the 2026 per-request _meta keys.
 
     The upstream is spoken to as 2025-06-18 (see the MCP-Protocol-Version header built in
@@ -41,6 +41,8 @@ def _strip_2026_request_meta(params: dict) -> dict:
     dict: `_meta` is rebuilt, not edited in place. Other keys (e.g. progressToken) are kept;
     an emptied _meta is dropped. A non-dict _meta is left for the upstream to judge.
     """
+    if not isinstance(params, dict):
+        return params
     meta = params.get("_meta")
     if not isinstance(meta, dict):
         return params
@@ -93,7 +95,9 @@ class ProtocolBridge:
         # 2026 clients carry the per-request version in params._meta (docs/protocol-bridging.md;
         # the same envelope the health probe sends). Pipeline also passes the top-level body
         # `_meta` as `meta`; keep honouring it as a fallback.
-        params_meta = params.get("_meta")
+        # JSON-RPC also allows array params (and the pipeline does not type-check them), so a
+        # non-dict carries no _meta and is forwarded untouched, as it was before #163.
+        params_meta = params.get("_meta") if isinstance(params, dict) else None
         if not isinstance(params_meta, dict):
             params_meta = {}
         meta = {**(meta or {}), **params_meta}
