@@ -93,6 +93,16 @@ class Detector:
     # reject near-misses the regex alone can't rule out. Returning False means "not a real
     # finding" — the match is discarded entirely, not just downgraded.
     validator: Optional[Callable[[str], bool]] = None
+    # Optional sub-span to replace instead of the whole match (issue #165). Detectors that
+    # need context to fire (the `password=` in `DB_PASSWORD=...`, the `scheme://user:` in a
+    # DSN) redact only the secret part, so the output still says what was there.
+    replace_span: Optional[Callable[[re.Match], tuple[int, int]]] = None
+
+
+def _group_span(group: int) -> Callable[[re.Match], tuple[int, int]]:
+    def _span(m: re.Match) -> tuple[int, int]:
+        return m.span(group)
+    return _span
 
 
 def _card_validator(matched: str) -> bool:
@@ -130,6 +140,34 @@ def _high_entropy_validator(matched: str) -> bool:
     # all-lowercase, one character class — doesn't fire regardless of its letter-frequency
     # entropy, while a real generated token (mixed case + digits, typical of API keys) does.
     return _shannon_entropy(matched) >= 3.5 and _char_classes(matched) >= 3
+
+
+def _bearer_validator(matched: str) -> bool:
+    # The token is the last whitespace-separated field of the match. Prose like "Bearer
+    # authentication..." is one character class; a real token mixes at least two.
+    return _char_classes(matched.split()[-1]) >= 2
+
+
+# Values that sit after `password:` / `token=` without being secrets: config booleans, nulls,
+# and small counts (`max_token: 4096`).
+_NON_SECRET_ASSIGNMENT_VALUE = re.compile(r"^(?:true|false|null|none|nil|[0-9]{1,6})$", re.IGNORECASE)
+
+
+def _secret_assignment_validator(matched: str) -> bool:
+    m = _SECRET_ASSIGNMENT_RE.match(matched)
+    return m is not None and not _NON_SECRET_ASSIGNMENT_VALUE.match(m.group(1))
+
+
+# ReDoS notes for the five response-era patterns (issue #165). Every quantifier is bounded,
+# and no repeated character class can also match the literal that follows it, so each start
+# position has at most one way to consume its input. The keyword-led secret_assignment pattern
+# deliberately does not match the key's prefix (`DB_` in `DB_PASSWORD`): matching a variable-
+# length prefix that shares letters with the keywords is the ambiguous-overlap shape the email
+# detector's comment describes. Both fuzz tests in tests/unit/test_dlp.py cover these.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)"
+    r"[\"']?[ \t]{0,8}[:=][ \t]{0,8}[\"']?([^\s\"',;&]{1,512})"
+)
 
 
 # Built-in detectors, keyed by stable name (used in dlp_detectors config, audit rows, and
@@ -192,6 +230,52 @@ BUILTIN_DETECTORS: dict[str, Detector] = {
         pattern=re.compile(r"\b[A-Za-z0-9_\-/+=]{20,128}\b"),
         validator=_high_entropy_validator,
     ),
+    "bearer_token": Detector(
+        name="bearer_token",
+        label="HTTP Bearer token",
+        # RFC 6750 b64token alphabet, 16-4096 chars after the scheme word. Only the token is
+        # replaced, so `Authorization: Bearer [REDACTED:bearer_token]` stays readable.
+        pattern=re.compile(r"(?i:\bbearer)[ \t]{1,8}([A-Za-z0-9._~+/-]{16,4096}={0,8})"),
+        validator=_bearer_validator,
+        replace_span=_group_span(1),
+    ),
+    "jwt": Detector(
+        name="jwt",
+        label="JSON Web Token",
+        # Three base64url segments; the header is JSON, so it starts `eyJ`. '.' is never in a
+        # repeated class, so the segments split one way only. Lookarounds instead of \b so a
+        # segment ending in '-' is not left behind.
+        pattern=re.compile(
+            r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,8192}\.[A-Za-z0-9_-]{8,2048}(?![A-Za-z0-9_-])"
+        ),
+    ),
+    "github_token": Detector(
+        name="github_token",
+        label="GitHub token (classic or fine-grained)",
+        pattern=re.compile(
+            r"(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,251}|github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59})(?![A-Za-z0-9_])"
+        ),
+    ),
+    "secret_assignment": Detector(
+        name="secret_assignment",
+        label="Secret-named key with a value (password=, token:, ...)",
+        # The key must END at the keyword (`password_policy=` does not fire, because `_policy`
+        # sits between the keyword and the separator). The validator drops booleans, nulls and
+        # small integers. Only the value is replaced.
+        pattern=_SECRET_ASSIGNMENT_RE,
+        validator=_secret_assignment_validator,
+        replace_span=_group_span(1),
+    ),
+    "url_credentials": Detector(
+        name="url_credentials",
+        label="Password in a URL (scheme://user:password@host)",
+        # The user part excludes ':' and '@', so the first ':' after `://` splits user from
+        # password exactly once. Only the password is replaced.
+        pattern=re.compile(
+            r"(?i)\b[a-z][a-z0-9+.-]{1,31}://[^\s:/?#@]{1,256}:([^\s/?#@]{1,256})@"
+        ),
+        replace_span=_group_span(1),
+    ),
 }
 
 
@@ -227,7 +311,8 @@ async def _scan_value_with_detector(text: str, detector: Detector) -> list[Findi
         candidate = m.group(0)
         if detector.validator is not None and not detector.validator(candidate):
             continue
-        findings.append(Finding(detector=detector.name, start=m.start(), end=m.end(), matched_text=candidate))
+        start, end = detector.replace_span(m) if detector.replace_span is not None else m.span()
+        findings.append(Finding(detector=detector.name, start=start, end=end, matched_text=text[start:end]))
     return findings
 
 
@@ -272,14 +357,34 @@ async def _scan_value_with_custom_pattern(text: str, spec: CustomPatternSpec) ->
     ]
 
 
+def _merge_spans(findings: list[Finding]) -> list[tuple[int, int, str]]:
+    """Collapse overlapping or nested findings into disjoint (start, end, detector) spans. The
+    earliest-starting finding names the merged span (the longest one on a tie)."""
+    merged: list[list] = []
+    for f in sorted(findings, key=lambda f: (f.start, -f.end)):
+        if merged and f.start < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], f.end)
+        else:
+            merged.append([f.start, f.end, f.detector])
+    return [(s, e, d) for s, e, d in merged]
+
+
 def _apply_redactions(text: str, findings: list[Finding]) -> str:
-    """Replace each finding's span with a placeholder naming the detector, working back-to-
-    front so earlier spans' offsets stay valid as later ones are substituted in."""
-    ordered = sorted(findings, key=lambda f: f.start, reverse=True)
-    out = text
-    for f in ordered:
-        out = out[: f.start] + REDACTED_PLACEHOLDER.format(detector=f.detector) + out[f.end :]
-    return out
+    """Replace each finding's span with a placeholder naming the detector.
+
+    SECURITY (issue #165): spans are merged first. The earlier version spliced back-to-front
+    using offsets into the ORIGINAL string, so when one finding sat inside another, the inner
+    placeholder shifted the text and the outer splice cut at the wrong place, leaving the tail
+    of the outer match in the output (test_nested_findings_never_leak_the_outer_span). Built
+    from disjoint spans, every offset refers to the original text."""
+    parts: list[str] = []
+    pos = 0
+    for start, end, detector in _merge_spans(findings):
+        parts.append(text[pos:start])
+        parts.append(REDACTED_PLACEHOLDER.format(detector=detector))
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)
 
 
 @dataclass

@@ -374,3 +374,164 @@ async def _scan_helper(text: str, detectors: dict[str, str]) -> list[Finding]:
     # Reconstruct approximate finding count/detector identity from match_count/detector for
     # assertions that only need "did detector X fire N times", which is all these tests check.
     return [Finding(detector=result.detector, start=0, end=0, matched_text="") for _ in range(result.match_count)]
+
+
+# ---------------------------------------------------------------------------
+# Response DLP (issue #165): five detectors for secrets that show up in logs and ConfigMaps.
+# Fake tokens are assembled at runtime so no literal token-shaped string sits in the source
+# (keeps secret scanners and push protection quiet; the values are not real credentials).
+# ---------------------------------------------------------------------------
+
+import base64 as _b64
+import json as _json
+
+
+def _b64url(obj) -> str:
+    return _b64.urlsafe_b64encode(_json.dumps(obj).encode()).rstrip(b"=").decode()
+
+
+_FAKE_JWT = ".".join([
+    _b64url({"alg": "HS256", "typ": "JWT"}),
+    _b64url({"sub": "1234567890", "name": "dlp-test", "iat": 1516239022}),
+    "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+])
+_FAKE_GHP = "gh" + "p_" + "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5"
+_FAKE_GH_PAT = "github" + "_pat_" + "11ABCDEFG0123456789abc" + "_" + ("Zx9" * 19 + "Qw")
+
+
+async def _redact(text: str, name: str) -> str | None:
+    result = await scan_value(text, {name: "redact"}, [])
+    return result.redacted_value if result.action == "redact" else None
+
+
+def test_fake_tokens_have_the_real_shapes():
+    assert len(_FAKE_GHP) == 40
+    assert len(_FAKE_GH_PAT) == len("github_pat_") + 82
+    assert _FAKE_JWT.count(".") == 2 and _FAKE_JWT.startswith("eyJ")
+
+
+async def test_bearer_token_redacts_only_the_token():
+    out = await _redact("Authorization: Bearer abc.DEF-123_xyz.789", "bearer_token")
+    assert out == "Authorization: Bearer [REDACTED:bearer_token]"
+
+
+@pytest.mark.parametrize("text", [
+    "the bearer of bad news",
+    "Bearer authentication is described in RFC 6750",
+    "Bearer short_tok3n",
+])
+async def test_bearer_token_near_misses(text):
+    assert await _redact(text, "bearer_token") is None
+
+
+async def test_jwt_redacts_whole_token():
+    out = await _redact(f"token issued: {_FAKE_JWT} (expires 1h)", "jwt")
+    assert out == "token issued: [REDACTED:jwt] (expires 1h)"
+
+
+@pytest.mark.parametrize("text", [
+    "commit 4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39",
+    "eyJhbGciOi",
+    "eyJhbGciOiJIUzI1NiJ9 alone",
+])
+async def test_jwt_near_misses(text):
+    assert await _redact(text, "jwt") is None
+
+
+async def test_github_classic_token_redacted():
+    out = await _redact(f"GH={_FAKE_GHP} done", "github_token")
+    assert out == "GH=[REDACTED:github_token] done"
+
+
+async def test_github_fine_grained_pat_redacted():
+    out = await _redact(f"using {_FAKE_GH_PAT}", "github_token")
+    assert out == "using [REDACTED:github_token]"
+
+
+async def test_github_token_near_miss():
+    assert await _redact("ghp_short and gho_ also short", "github_token") is None
+
+
+async def test_secret_assignment_redacts_value_keeps_key():
+    out = await _redact("DB_PASSWORD=hunter2hunter2", "secret_assignment")
+    assert out == "DB_PASSWORD=[REDACTED:secret_assignment]"
+
+
+async def test_secret_assignment_json_style():
+    out = await _redact('{"client_secret": "x9Qz7LmN2pR4"}', "secret_assignment")
+    assert out == '{"client_secret": "[REDACTED:secret_assignment]"}'
+
+
+@pytest.mark.parametrize("text", [
+    "password_policy=strict",
+    "token_count: 5",
+    "max_token: 4096",
+    '"secret": true',
+    "password: null",
+    "PWD=/home/app",
+    "secretName: app-credentials-ref",
+])
+async def test_secret_assignment_near_misses(text):
+    assert await _redact(text, "secret_assignment") is None
+
+
+async def test_url_credentials_redacts_password_only():
+    out = await _redact("dsn postgres://app:s3cr3t@db:5432/x ok", "url_credentials")
+    assert out == "dsn postgres://app:[REDACTED:url_credentials]@db:5432/x ok"
+
+
+@pytest.mark.parametrize("text", [
+    "https://user@host/path",
+    "https://host:8080/path@x",
+    "see https://example.com/a:b",
+])
+async def test_url_credentials_near_misses(text):
+    assert await _redact(text, "url_credentials") is None
+
+
+_NEW_DETECTORS = ("bearer_token", "jwt", "github_token", "secret_assignment", "url_credentials")
+
+
+async def test_png_base64_fires_none_of_the_new_detectors():
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg"
+    text = (png * 3)[:200]
+    for name in _NEW_DETECTORS:
+        assert await _redact(text, name) is None, name
+
+
+def test_new_detectors_registered():
+    for name in _NEW_DETECTORS:
+        assert name in BUILTIN_DETECTORS
+
+
+def test_all_builtin_detector_patterns_resist_structured_fuzz():
+    """Same bound as the randomized fuzz above, but the alphabet carries the separators the
+    response detectors key on (`:` `/` `@` `=` quotes, `Bearer`, `eyJ`), so their bounded
+    quantifiers are actually exercised rather than failing on the first character."""
+    import random
+
+    rng = random.Random(4321)
+    tokens = list("abcXYZ019._-:/@=\"' \t") + ["Bearer ", "eyJ", "password=", "://", "ghp_", "token: "]
+    for name, detector in BUILTIN_DETECTORS.items():
+        for _ in range(15):
+            n = rng.randint(500, 20000)
+            text = "".join(rng.choices(tokens, k=n))
+            start = time.monotonic()
+            list(detector.pattern.finditer(text))
+            elapsed = time.monotonic() - start
+            assert elapsed < 1.0, f"detector {name!r} took {elapsed:.2f}s on structured fuzz len={len(text)}"
+
+
+async def test_nested_findings_never_leak_the_outer_span():
+    """Two findings where one sits inside the other. Before span merging, back-to-front
+    splicing used offsets from the original string after the inner placeholder had shifted
+    them, and the tail of the outer match survived into the output."""
+    outer = CustomPatternSpec(name="outer", pattern=r"KEY[0-9]{20}END", action="redact")
+    inner = CustomPatternSpec(name="i", pattern=r"[0-9]{3}", action="redact")
+    secret = "KEY01234567890123456789END"
+    result = await scan_value(f"x {secret} y", {}, [outer, inner])
+    assert result.action == "redact"
+    assert "END" not in result.redacted_value
+    for digit_run in ("4567", "6789", "0123"):
+        assert digit_run not in result.redacted_value
+    assert result.redacted_value == "x [REDACTED:outer] y"

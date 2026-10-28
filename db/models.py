@@ -171,6 +171,8 @@ _VALID_DLP_ACTIONS = {"allow", "redact", "block"}
 # above).
 _VALID_DLP_DETECTOR_NAMES = {
     "credit_card", "email", "us_ssn", "aws_access_key", "private_key_pem", "high_entropy_string",
+    # Issue #165 (response DLP): secrets as they appear in logs and ConfigMaps.
+    "bearer_token", "jwt", "github_token", "secret_assignment", "url_credentials",
 }
 _MAX_CUSTOM_PATTERN_LENGTH = 200
 
