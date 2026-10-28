@@ -33,6 +33,16 @@ from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
 from argus.metering import Metering
 from argus.policy import Decision, evaluate
 from argus.rate_limiter import RateLimiterRegistry
+from argus import sse
+from argus.response_dlp import (
+    HARD_CEILING_FACTOR,
+    HARD_LIMIT_MARKER,
+    UNPARSEABLE_MARKER,
+    ResponseScan,
+    marker_message,
+    response_dlp_enabled,
+    scan_result,
+)
 from argus.toolslist import ToolsCache
 from argus.tokens import TokenIssuer
 from argus.tracing import TracingManager, _DisabledTracingManager
@@ -380,6 +390,9 @@ class Pipeline:
         rpc_method: str = ""
         tool_name: Optional[str] = None
         client_ip = _client_ip(request)
+        # Issue #165: set only for a tools/call whose server opted in to response DLP; None
+        # keeps _forward's streaming byte proxy exactly as it was.
+        scan_policy: Optional[ServerPolicy] = None
 
         if request.method == "POST" and body_bytes:
             try:
@@ -456,6 +469,8 @@ class Pipeline:
                     )
                     if outcome.blocked_response is not None:
                         return outcome.blocked_response
+                    if outcome.policy is not None and response_dlp_enabled(outcome.policy, rpc_method):
+                        scan_policy = outcome.policy
 
                     # DLP redact: the redacted body MUST be what actually leaves the process —
                     # re-serialize the JSON-RPC envelope with the redacted arguments substituted
@@ -483,7 +498,10 @@ class Pipeline:
             )
         except self._CredentialResolutionFailed as e:
             return e.response
-        return await self._forward(request, server, path, body_bytes, resolved_auth_header)
+        return await self._forward(
+            request, server, path, body_bytes, resolved_auth_header,
+            scan_policy=scan_policy, rpc_id=rpc_id,
+        )
 
     async def _evaluate_with_tracing(
         self, tool_name: str, arguments: dict, server: ServerRecord, policy: ServerPolicy,
@@ -689,6 +707,8 @@ class Pipeline:
         client_ip: Optional[str] = None, origin: Optional[str] = None,
     ) -> Response:
         api_key_id = key_record.id if key_record is not None else None
+        # Issue #165: set only for a tools/call whose server opted in to response DLP.
+        scan_policy: Optional[ServerPolicy] = None
         if rpc_method == "tools/call":
             tool_name = params.get("name")
             outcome = await self._enforce(
@@ -697,6 +717,8 @@ class Pipeline:
             )
             if outcome.blocked_response is not None:
                 return outcome.blocked_response
+            if outcome.policy is not None and response_dlp_enabled(outcome.policy, rpc_method):
+                scan_policy = outcome.policy
 
             # DLP redact: the bridged path forwards `params` directly to
             # ProtocolBridge.bridge_call rather than raw body bytes, so redaction here means
@@ -745,7 +767,22 @@ class Pipeline:
                 endpoint="per-server", rpc_method=rpc_method,
             )
 
+        if scan_policy is not None:
+            body, _scan = await self._scan_message(body, scan_policy, rpc_id)
         return Response(content=json.dumps(body), status_code=status, media_type="application/json")
+
+    async def _scan_message(
+        self, message: Any, policy: ServerPolicy, rpc_id: Any,
+    ) -> tuple[Any, ResponseScan]:
+        """Issue #165: scan one parsed upstream response. Any failure inside the scan fails
+        closed to a marker; the caller never forwards the message it passed in."""
+        try:
+            scan = await scan_result(message, policy)
+        except Exception:  # noqa: BLE001 — fail closed on anything; never log the message
+            logger.exception("response DLP scan failed — replacing the response with a marker")
+            marker = marker_message(sanitize_rpc_id(rpc_id), UNPARSEABLE_MARKER)
+            return marker, ResponseScan(result=marker, detectors_fired=[], match_count=0, truncated=True)
+        return scan.result, scan
 
     async def _check_header_consistency(
         self, request: Request, rpc_method: str, body_name: Optional[str],
@@ -885,7 +922,8 @@ class Pipeline:
 
     async def _forward(
         self, request: Request, server: ServerRecord, path: str, body_bytes: bytes,
-        resolved_auth_header: Optional[str] = None,
+        resolved_auth_header: Optional[str] = None, *,
+        scan_policy: Optional[ServerPolicy] = None, rpc_id: Any = None,
     ) -> Response:
         # GEN_2025 passthrough path (see the fork comment in _process): raw byte proxy to the
         # upstream. The bridged counterpart is ProtocolBridge.bridge_call (argus/bridge.py).
@@ -912,6 +950,13 @@ class Pipeline:
                 (k, v) for k, v in forward_headers if k.lower() != b"authorization"
             ]
             forward_headers.append((b"authorization", resolved_auth_header.encode()))
+
+        # Issue #165: the scan path reads the body as sent, so ask for it uncompressed. Decoding
+        # a compressed body in memory would let a small upstream payload expand past the hard
+        # ceiling before it is counted; an upstream that compresses anyway fails closed below.
+        if scan_policy is not None:
+            forward_headers = [(k, v) for k, v in forward_headers if k.lower() != b"accept-encoding"]
+            forward_headers.append((b"accept-encoding", b"identity"))
 
         # traceparent/tracestate are added here — deliberately, inside upstream.forward's
         # span, and ONLY here. argus/headers.py's strip_hop_by_hop already removed any
@@ -946,7 +991,81 @@ class Pipeline:
                 raise RoutingError(502, rpc_error(None, f"upstream request failed: {e}"))
             forward_span.set_attribute("http.status_code", r.status_code)
 
-        return StreamingResponse(
-            r.aiter_raw(), status_code=r.status_code,
-            headers=filter_response_headers(r.headers), background=BackgroundTask(r.aclose),
+        if scan_policy is None:
+            return StreamingResponse(
+                r.aiter_raw(), status_code=r.status_code,
+                headers=filter_response_headers(r.headers), background=BackgroundTask(r.aclose),
+            )
+        response, _scan = await self._scan_passthrough_response(r, scan_policy, rpc_id)
+        return response
+
+    async def _scan_passthrough_response(
+        self, r: httpx.Response, policy: ServerPolicy, rpc_id: Any,
+    ) -> tuple[Response, ResponseScan]:
+        """Issue #165: buffer, parse, scan and rebuild one passthrough tools/call response.
+
+        Never forwards unscanned bytes: past the hard ceiling, on a compressed or unparseable
+        body, or on any scan failure, the client gets a marker result instead. Never fails the
+        call: those markers are HTTP 200 tools/call results."""
+        headers = {
+            k: v for k, v in filter_response_headers(r.headers).items()
+            if k.lower() not in ("content-length", "content-encoding", "transfer-encoding")
+        }
+        ceiling = HARD_CEILING_FACTOR * policy.response_dlp_max_bytes
+        buf = bytearray()
+        try:
+            async for chunk in r.aiter_raw():
+                buf += chunk
+                if len(buf) > ceiling:
+                    return self._marker_response(rpc_id, HARD_LIMIT_MARKER, headers)
+        except httpx.HTTPError:
+            return self._marker_response(rpc_id, UNPARSEABLE_MARKER, headers)
+        finally:
+            await r.aclose()
+
+        if not buf:
+            return Response(content=b"", status_code=r.status_code, headers=headers), ResponseScan(
+                result=None, detectors_fired=[], match_count=0, truncated=False,
+            )
+        encoding = r.headers.get("content-encoding", "identity").strip().lower()
+        content_type = r.headers.get("content-type", "").split(";")[0].strip().lower()
+        try:
+            if encoding not in ("", "identity"):
+                raise ValueError("compressed upstream body")
+            if content_type == "application/json" or content_type.endswith("+json"):
+                message = json.loads(bytes(buf))
+                scanned, scan = await self._scan_message(message, policy, rpc_id)
+                if scan.match_count == 0 and not scan.truncated:
+                    out = bytes(buf)
+                else:
+                    out = json.dumps(scanned, separators=(",", ":")).encode("utf-8")
+            elif content_type == "text/event-stream":
+                events = sse.parse_events(bytes(buf))
+                with_data = [ev for ev in events if ev.data is not None]
+                messages = [json.loads(ev.data) for ev in with_data]
+                scanned, scan = await self._scan_message(messages, policy, rpc_id)
+                if not isinstance(scanned, list):
+                    # _scan_message failed closed to a single marker message.
+                    return self._marker_response(rpc_id, UNPARSEABLE_MARKER, headers)
+                for ev, before, after in zip(with_data, messages, scanned):
+                    if after != before:
+                        ev.replace_data(json.dumps(after, separators=(",", ":")))
+                out = sse.serialize(events)
+            else:
+                raise ValueError(f"unscannable content type {content_type!r}")
+        except Exception:  # noqa: BLE001 — fail closed on anything (bad JSON, half SSE event,
+            # RecursionError from a deeply nested body). Logged without the body.
+            logger.warning("response DLP could not parse the upstream response — replacing it with a marker")
+            return self._marker_response(rpc_id, UNPARSEABLE_MARKER, headers)
+        return Response(content=out, status_code=r.status_code, headers=headers), scan
+
+    @staticmethod
+    def _marker_response(
+        rpc_id: Any, text: str, headers: dict[str, str],
+    ) -> tuple[Response, ResponseScan]:
+        marker = marker_message(sanitize_rpc_id(rpc_id), text)
+        kept = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+        return (
+            Response(content=json.dumps(marker), status_code=200, media_type="application/json", headers=kept),
+            ResponseScan(result=marker, detectors_fired=[], match_count=0, truncated=True),
         )
