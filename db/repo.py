@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Optional
 
 import asyncpg
@@ -13,6 +14,7 @@ from .database import Database, acquire_with_timeout, utcnow
 from .models import (
     AdminEventRecord,
     ApiKeyRecord,
+    RESPONSE_DLP_MAX_BYTES_DEFAULT,
     DlpCustomPattern,
     ParamRule,
     ProjectMemberRecord,
@@ -53,32 +55,54 @@ _CLASS_GATEWAY = "gateway"
 # (server_policies.dlp_config, migration 0008_gateway_dlp_config.sql) rather than further
 # normalized tables — see that migration's comment for why JSON-in-a-column (not per-detector
 # rows) is the call made here.
-def _encode_dlp_config(
-    detectors: dict[str, str], custom_patterns: list[DlpCustomPattern]
-) -> Optional[str]:
-    if not detectors and not custom_patterns:
+@dataclass(frozen=True)
+class DlpConfig:
+    detectors: dict[str, str]
+    custom_patterns: list[DlpCustomPattern]
+    # Issue #165: response DLP, keys `response_detectors` / `response_max_bytes` in the same
+    # JSON. A row written before #165 has neither key and decodes to off.
+    response_detectors: dict[str, str]
+    response_max_bytes: int
+
+
+def _encode_dlp_config(policy: ServerPolicy) -> Optional[str]:
+    response_set = bool(policy.response_dlp_detectors) or (
+        policy.response_dlp_max_bytes != RESPONSE_DLP_MAX_BYTES_DEFAULT
+    )
+    if not policy.dlp_detectors and not policy.dlp_custom_patterns and not response_set:
         # Keep the common (DLP entirely unconfigured) case as a NULL column rather than a
         # literal '{"detectors": {}, "custom_patterns": []}' string — cosmetic, but matches
         # this schema's existing convention of NULL-for-unset over empty-JSON-for-unset
         # (e.g. server_policies.rate_limit, tool_policies.rate_limit).
         return None
-    return json.dumps({
-        "detectors": detectors,
-        "custom_patterns": [p.model_dump() for p in custom_patterns],
-    })
+    data: dict = {
+        "detectors": policy.dlp_detectors,
+        "custom_patterns": [p.model_dump() for p in policy.dlp_custom_patterns],
+    }
+    # Only written when set, so an argument-only policy encodes to exactly the JSON it did
+    # before #165 (test_argument_only_policy_encodes_exactly_as_before).
+    if policy.response_dlp_detectors:
+        data["response_detectors"] = policy.response_dlp_detectors
+    if policy.response_dlp_max_bytes != RESPONSE_DLP_MAX_BYTES_DEFAULT:
+        data["response_max_bytes"] = policy.response_dlp_max_bytes
+    return json.dumps(data)
 
 
-def _decode_dlp_config(raw: Optional[str]) -> tuple[dict[str, str], list[DlpCustomPattern]]:
+def _decode_dlp_config(raw: Optional[str]) -> DlpConfig:
+    off = DlpConfig({}, [], {}, RESPONSE_DLP_MAX_BYTES_DEFAULT)
     if not raw:
-        return {}, []
+        return off
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning("server_policies.dlp_config contained invalid JSON — treating as unset")
-        return {}, []
-    detectors = data.get("detectors") or {}
-    custom_patterns = [DlpCustomPattern(**p) for p in (data.get("custom_patterns") or [])]
-    return detectors, custom_patterns
+        return off
+    return DlpConfig(
+        detectors=data.get("detectors") or {},
+        custom_patterns=[DlpCustomPattern(**p) for p in (data.get("custom_patterns") or [])],
+        response_detectors=data.get("response_detectors") or {},
+        response_max_bytes=data.get("response_max_bytes") or RESPONSE_DLP_MAX_BYTES_DEFAULT,
+    )
 
 
 class ServerNotFoundError(Exception):
@@ -597,15 +621,17 @@ class ServerRepo(_PoolAccess):
         result = {}
         for sid in server_ids:
             row = policy_rows.get(sid)
-            dlp_detectors, dlp_custom_patterns = _decode_dlp_config(row["dlp_config"] if row else None)
+            dlp = _decode_dlp_config(row["dlp_config"] if row else None)
             result[sid] = ServerPolicy(
                 mode=row["mode"] if row else "passthrough",
                 rate_limit=row["rate_limit"] if row else None,
                 allowed=allowed_by_id[sid],
                 denied=denied_by_id[sid],
                 param_rules=param_rules_by_id[sid],
-                dlp_detectors=dlp_detectors,
-                dlp_custom_patterns=dlp_custom_patterns,
+                dlp_detectors=dlp.detectors,
+                dlp_custom_patterns=dlp.custom_patterns,
+                response_dlp_detectors=dlp.response_detectors,
+                response_dlp_max_bytes=dlp.response_max_bytes,
             )
         return result
 
@@ -628,7 +654,7 @@ class ServerRepo(_PoolAccess):
         # native here. Only the placeholders changed.
         # Covered by tests/integration/test_postgres_races.py::TestPolicyWriteRace, which asserts
         # a concurrent reader NEVER observes a partially-applied policy.
-        dlp_config_json = _encode_dlp_config(policy.dlp_detectors, policy.dlp_custom_patterns)
+        dlp_config_json = _encode_dlp_config(policy)
         async with self._write() as conn:
             async with conn.transaction():
                 await conn.execute(

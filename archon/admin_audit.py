@@ -70,6 +70,17 @@ def _policy_diff(current: ServerPolicy, incoming: ServerPolicy) -> list[str]:
             f"dlp_custom_patterns: {len(current.dlp_custom_patterns)} -> "
             f"{len(incoming.dlp_custom_patterns)} configured"
         )
+    # Issue #165: response DLP settings. Turning a response detector off, or to allow, weakens
+    # what the gateway's callers can read back, so it is a delta like any other policy field.
+    if current.response_dlp_detectors != incoming.response_dlp_detectors:
+        deltas.append(
+            f"response_dlp_detectors: {len(current.response_dlp_detectors)} -> "
+            f"{len(incoming.response_dlp_detectors)} configured"
+        )
+    if current.response_dlp_max_bytes != incoming.response_dlp_max_bytes:
+        deltas.append(
+            f"response_dlp_max_bytes: {current.response_dlp_max_bytes} -> {incoming.response_dlp_max_bytes}"
+        )
     return deltas
 
 
@@ -86,6 +97,8 @@ def _serialize_policy(policy: ServerPolicy) -> dict[str, Any]:
         },
         "dlp_detectors": dict(sorted(policy.dlp_detectors.items())),
         "dlp_custom_patterns": [p.model_dump() for p in policy.dlp_custom_patterns],
+        "response_dlp_detectors": dict(sorted(policy.response_dlp_detectors.items())),
+        "response_dlp_max_bytes": policy.response_dlp_max_bytes,
     }
 
 
