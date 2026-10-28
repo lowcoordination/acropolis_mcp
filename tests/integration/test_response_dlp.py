@@ -448,3 +448,121 @@ class TestPassthroughHostileBodies:
         await client.post("/mcp/logs/mcp", json=_call(),
                           headers={"Accept-Encoding": "gzip", "Accept": "application/json"})
         assert upstream.request_headers["tools/call"]["accept-encoding"] == "gzip"
+
+
+# ---------------------------------------------------------------------------- Task 6: audit
+
+pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter  # noqa: E402
+
+from argus.tracing import TracingManager  # noqa: E402
+from db.repo import AuditRepo  # noqa: E402
+
+
+@pytest.fixture
+async def traced_env(tmp_path: Path, upstream):
+    settings = Settings(data_dir=str(tmp_path), auth_mode="open", health_poll_enabled=False,
+                        audit_retention_enabled=False)
+    db = Database(tmp_path)
+    await db.connect()
+    repo = ServerRepo(db)
+    server = await repo.create(slug="logs", name="Logs", upstream_url=upstream.url)
+    app = create_app(settings, db)
+    exporter = InMemorySpanExporter()
+    manager = TracingManager(enabled=True, sample_ratio=1.0)
+    manager.init(exporter=exporter)
+    app.state.pipeline._tracing = manager
+    app.state.bridge._tracing = manager
+    app.state.tracing = manager
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://argus.test") as client:
+            yield client, repo, server, db, exporter
+    await db.close()
+
+
+def _spans_text(exporter: InMemorySpanExporter) -> str:
+    return json.dumps([
+        {"name": s.name, "attributes": dict(s.attributes or {}),
+         "events": [{"name": e.name, "attributes": dict(e.attributes or {})} for e in s.events]}
+        for s in exporter.get_finished_spans()
+    ], default=str)
+
+
+class TestAuditInvariant:
+    async def test_values_never_reach_audit_logs_or_spans(self, traced_env, upstream, caplog):
+        client, repo, server, db, exporter = traced_env
+        caplog.set_level("DEBUG")
+        await _set_response_dlp(repo, server, ALL_NEW_REDACT)
+        upstream.script["tools/call"] = lambda req: json_reply(_planted_result(req["id"]))
+
+        r1 = await passthrough(client, _call(rpc_id=1))
+        r2 = await bridged(client, _call(rpc_id=2))
+        _assert_no_secret(r1.text)
+        _assert_no_secret(r2.text)
+
+        await asyncio.sleep(0.5)
+        rows = await AuditRepo(db).query(server_slug="logs")
+        dumped = json.dumps([dict(r) for r in rows], default=str)
+        _assert_no_secret(dumped)
+        _assert_no_secret(caplog.text)
+        spans = _spans_text(exporter)
+        _assert_no_secret(spans)
+
+        calls = [dict(r) for r in rows if r["rpc_method"] == "tools/call" and r["decision"] == "ALLOWED"]
+        assert len(calls) == 2, calls
+        for row in calls:
+            assert row["response_dlp_detectors_fired"] == ",".join(sorted(PLANTED))
+            assert row["response_dlp_match_count"] == len(PLANTED)
+            assert row["response_truncated"] is False
+        assert {row["bridged"] for row in calls} == {True, False}
+
+        assert '"acropolis.response_dlp.match_count": 5' in spans
+        assert "response.dlp_scan" in spans
+
+    async def test_off_leaves_the_three_columns_null(self, traced_env, upstream):
+        client, repo, server, db, _ = traced_env
+        upstream.script["tools/call"] = lambda req: json_reply(_planted_result(req["id"]))
+        await passthrough(client, _call())
+        await asyncio.sleep(0.5)
+        rows = [dict(r) for r in await AuditRepo(db).query(server_slug="logs")
+                if r["rpc_method"] == "tools/call"]
+        assert rows and all(
+            r["response_dlp_detectors_fired"] is None and r["response_dlp_match_count"] is None
+            and r["response_truncated"] is None for r in rows
+        )
+
+    async def test_truncation_is_recorded(self, traced_env, upstream):
+        client, repo, server, db, _ = traced_env
+        await _set_response_dlp(repo, server, ALL_NEW_REDACT)
+        upstream.script["tools/call"] = lambda req: Reply([b'{"jsonrpc":"2.0","id":1,"res'])
+        await passthrough(client, _call())
+        await asyncio.sleep(0.5)
+        rows = [dict(r) for r in await AuditRepo(db).query(server_slug="logs")
+                if r["rpc_method"] == "tools/call"]
+        assert rows[0]["response_truncated"] is True
+        assert rows[0]["response_dlp_detectors_fired"] == ""
+
+    async def test_audit_api_exposes_names_as_a_list(self, traced_env, upstream):
+        client, repo, server, db, _ = traced_env
+        await _set_response_dlp(repo, server, ALL_NEW_REDACT)
+        upstream.script["tools/call"] = lambda req: json_reply(_planted_result(req["id"]))
+        await passthrough(client, _call())
+        await asyncio.sleep(0.5)
+        resp = await client.get("/api/v1/audit", params={"server_slug": "logs"})
+        assert resp.status_code == 200
+        _assert_no_secret(resp.text)
+        row = next(e for e in resp.json() if e["rpc_method"] == "tools/call")
+        assert row["response_dlp_detectors_fired"] == sorted(PLANTED)
+        assert row["response_dlp_match_count"] == 5
+
+
+def test_audit_event_response_forbids_unknown_fields():
+    from archon.schemas import AuditEventResponse
+
+    base = dict(id=1, ts="t", server_slug=None, api_key_id=None, client_ip=None, endpoint=None,
+                rpc_method=None, tool=None, decision="ALLOWED", rule=None, matched=None, reason=None,
+                args_summary=None, bridged=False, status_code=None, latency_ms=None)
+    AuditEventResponse(**base)
+    with pytest.raises(ValueError):
+        AuditEventResponse(**base, response_dlp_matched_value="x")

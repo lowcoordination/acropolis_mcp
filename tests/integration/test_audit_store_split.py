@@ -33,7 +33,7 @@ import pytest
 
 from archon.settings import Settings
 from argus.app import create_app
-from db.database import MIGRATIONS, Database, _version_from_filename, utcnow
+from db.database import AUDIT_MIGRATIONS, MIGRATIONS, Database, _version_from_filename, utcnow
 from db.repo import AuditRepo, ServerRepo
 
 from .fastmcp_fixture import run_fastmcp_server
@@ -130,7 +130,7 @@ async def test_split_audit_store_routes_writes_and_reads(postgres_admin_dsn, tmp
             assert await audit_repo.count_since(since) == 1
 
             # Independent migration bookkeeping: the audit database has its own schema_migrations
-            # (version 1 = audit/0001_audit_init.sql); the config database keeps 0001..0012.
+            # (audit/0001.., derived from AUDIT_MIGRATIONS); the config database keeps its own.
             conn = await asyncpg.connect(audit_dsn)
             try:
                 audit_versions = {r["version"] for r in await conn.fetch("SELECT version FROM schema_migrations")}
@@ -142,7 +142,7 @@ async def test_split_audit_store_routes_writes_and_reads(postgres_admin_dsn, tmp
             finally:
                 await conn.close()
 
-            assert audit_versions == {1}
+            assert audit_versions == {_version_from_filename(f) for f in AUDIT_MIGRATIONS}
             assert config_versions == {_version_from_filename(f) for f in MIGRATIONS}
         finally:
             await db.close()

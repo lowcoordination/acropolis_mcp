@@ -558,6 +558,22 @@ class AuditEventResponse(BaseModel):
     dlp_detector: Optional[str] = None  # enterprise #10 — which detector fired, if any
     dlp_action: Optional[str] = None  # "block" | "redact" — never the matched/redacted value
     dlp_match_count: Optional[int] = None
+    # Issue #165 (response DLP): names and counts only. None when response DLP was off.
+    response_dlp_detectors_fired: Optional[list[str]] = None
+    response_dlp_match_count: Optional[int] = None
+    response_truncated: Optional[bool] = None
+
+    # A new audit_events column must be added here on purpose: GET /audit builds this model from
+    # SELECT *, so an unknown column is a loud failure instead of a field that leaks or vanishes.
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("response_dlp_detectors_fired", mode="before")
+    @classmethod
+    def _split_detectors(cls, value):
+        # Stored comma-joined (TEXT); '' means scanned and nothing fired.
+        if isinstance(value, str):
+            return [name for name in value.split(",") if name]
+        return value
 
 
 class AdminEventResponse(BaseModel):

@@ -871,6 +871,7 @@ class AuditRepo(_PoolAccess):
             "ts", "server_slug", "api_key_id", "client_ip", "endpoint", "rpc_method", "tool",
             "decision", "rule", "matched", "reason", "args_summary", "bridged", "status_code",
             "latency_ms", "origin", "dlp_detector", "dlp_action", "dlp_match_count",
+            "response_dlp_detectors_fired", "response_dlp_match_count", "response_truncated",
         )
         _defaults = {"bridged": False}
         placeholders = ", ".join(f"${i}" for i in range(1, len(columns) + 1))
