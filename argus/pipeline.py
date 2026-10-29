@@ -39,6 +39,7 @@ from argus.response_dlp import (
     HARD_LIMIT_MARKER,
     UNPARSEABLE_MARKER,
     ResponseScan,
+    loads_strict,
     marker_message,
     response_dlp_enabled,
     scan_result,
@@ -1087,7 +1088,7 @@ class Pipeline:
             if encoding not in ("", "identity"):
                 raise ValueError("compressed upstream body")
             if content_type == "application/json" or content_type.endswith("+json"):
-                message = json.loads(bytes(buf))
+                message = loads_strict(bytes(buf))
                 scanned, scan = await self._scan_message(message, policy, rpc_id)
                 if scan.match_count == 0 and not scan.truncated:
                     out = bytes(buf)
@@ -1096,7 +1097,7 @@ class Pipeline:
             elif content_type == "text/event-stream":
                 events = sse.parse_events(bytes(buf))
                 with_data = [ev for ev in events if ev.data is not None]
-                messages = [json.loads(ev.data) for ev in with_data]
+                messages = [loads_strict(ev.data) for ev in with_data]
                 scanned, scan = await self._scan_message(messages, policy, rpc_id)
                 if not isinstance(scanned, list):
                     # _scan_message failed closed to a single marker message.

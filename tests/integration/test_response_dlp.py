@@ -424,6 +424,26 @@ class TestPassthroughHostileBodies:
         assert resp.status_code == 200
         assert UNPARSEABLE_MARKER in resp.text
 
+    @pytest.mark.parametrize("kind", ["json", "sse"])
+    async def test_duplicate_key_fails_closed(self, env, upstream, kind):
+        """A repeated key parses last-wins: the scan sees only the clean copy, finds nothing,
+        and the original bytes (secret in the first copy) would go out unscanned. Found by a
+        payload probe on the compose stack."""
+        client, repo, server, _ = env
+        await _set_response_dlp(repo, server, ALL_NEW_REDACT)
+        message = ('{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"%s",'
+                   '"text":"clean"}],"isError":false}}' % _FAKE_GHP)
+        if kind == "json":
+            reply = Reply([message.encode()])
+        else:
+            reply = Reply([f"event: message\ndata: {message}\n\n".encode()],
+                          content_type="text/event-stream")
+        upstream.script["tools/call"] = lambda req: reply
+        resp = await passthrough(client, _call())
+        assert resp.status_code == 200
+        _assert_no_secret(resp.text)
+        assert UNPARSEABLE_MARKER in resp.text
+
     async def test_compressed_upstream_fails_closed(self, env, upstream):
         import gzip
         client, repo, server, _ = env

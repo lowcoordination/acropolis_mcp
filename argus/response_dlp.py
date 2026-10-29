@@ -18,6 +18,7 @@ Rules it enforces (docs/dlp.md, "Responses"):
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,22 @@ class ResponseScan:
     detectors_fired: list[str]      # sorted, unique; names only
     match_count: int
     truncated: bool
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key in JSON object")
+        out[key] = value
+    return out
+
+
+def loads_strict(data: "str | bytes") -> Any:
+    """json.loads that refuses a repeated object key. json.loads keeps the last copy, so a scan
+    of the parsed value would miss a secret in an earlier copy, and the passthrough path forwards
+    the original bytes when nothing fired. The caller treats the ValueError as unparseable."""
+    return json.loads(data, object_pairs_hook=_reject_duplicate_keys)
 
 
 def format_limit(limit: int) -> str:
