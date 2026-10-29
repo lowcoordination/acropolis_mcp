@@ -132,11 +132,26 @@ async def main() -> None:
 # --------------------------------------------------------------------------- response DLP
 
 RESPONSE_ITERATIONS = {10: iters(300, 5), 100: iters(150, 5), 1000: iters(30, 2)}
-RESPONSE_GATE_MS = 11.0  # spec Verification 7: 2x the 5.5 ms projection at 100 KB
 
+# Spec Verification 7, as revised by Amendment 1 (approved 2026-10-29). The original rule (all 11
+# built-ins, 100 KB p99 <= 11 ms) came from an extrapolation that the six argument-era detectors
+# alone already miss. The gate now measures the set Hephaestus's servers ship with, plus a
+# linearity check that catches a pattern starting to backtrack.
+SECRETS_7 = (
+    "bearer_token", "jwt", "github_token", "secret_assignment", "url_credentials",
+    "aws_access_key", "private_key_pem",
+)
+GATE_SECRETS_100KB_P99_MS = 15.0
+GATE_SECRETS_1MB_MAX_MS = 150.0
+GATE_ALL_LINEARITY = 12.0  # all 11: 1 MB p50 / 100 KB p50
+
+# Budget above the largest size, so these measure scanning, not truncation.
 ALL_BUILTINS_RESPONSE_POLICY = ServerPolicy(
     response_dlp_detectors={name: "redact" for name in BUILTIN_DETECTORS},
-    # Budget above the largest size, so this measures scanning, not truncation.
+    response_dlp_max_bytes=16_777_216,
+)
+SECRETS_7_RESPONSE_POLICY = ServerPolicy(
+    response_dlp_detectors={name: "redact" for name in SECRETS_7},
     response_dlp_max_bytes=16_777_216,
 )
 
@@ -166,20 +181,26 @@ def _tools_call_result(text: str) -> dict:
     return {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": text}], "isError": False}}
 
 
-async def bench_responses() -> None:
-    print(f"\nResponse DLP: scan_result, all {len(BUILTIN_DETECTORS)} built-ins = redact, kubectl-logs-shaped text\n")
-    print(f"{'size':>8} {'iters':>6} {'p50 ms':>9} {'p99 ms':>9}")
-    gate_p99 = None
+async def _bench_response_set(label: str, policy: ServerPolicy) -> dict[int, tuple[float, float]]:
+    """Returns {kb: (p50, tail)}; tail is p99 with >= 100 samples, else max."""
+    print(f"\nResponse DLP: scan_result, {label}, kubectl-logs-shaped text\n")
+    print(f"{'size':>8} {'iters':>6} {'p50 ms':>9} {'tail ms':>9}")
+    out = {}
     for kb in (10, 100, 1000):
         message = _tools_call_result(kubectl_logs(kb * 1024))
         n = RESPONSE_ITERATIONS[kb]
-        await time_call(lambda: scan_result(message, ALL_BUILTINS_RESPONSE_POLICY), iters(5, 1))
-        samples = await time_call(lambda: scan_result(message, ALL_BUILTINS_RESPONSE_POLICY), n)
-        p99 = percentile(samples, 99) if n >= 100 else max(samples)
-        label = "p99" if n >= 100 else "max"
-        print(f"{kb:>6}KB {n:>6} {statistics.median(samples):>9.2f} {p99:>9.2f}" + ("" if n >= 100 else f"  ({label}: <100 samples)"))
-        if kb == 100:
-            gate_p99 = p99
+        await time_call(lambda: scan_result(message, policy), iters(5, 1))
+        samples = await time_call(lambda: scan_result(message, policy), n)
+        tail = percentile(samples, 99) if n >= 100 else max(samples)
+        out[kb] = (statistics.median(samples), tail)
+        print(f"{kb:>6}KB {n:>6} {out[kb][0]:>9.2f} {tail:>9.2f}  ({'p99' if n >= 100 else 'max'})")
+    return out
+
+
+async def bench_responses() -> None:
+    secrets = await _bench_response_set(f"secrets-7 ({', '.join(SECRETS_7)})", SECRETS_7_RESPONSE_POLICY)
+    everything = await _bench_response_set(f"all {len(BUILTIN_DETECTORS)} built-ins (recorded, not gated)",
+                                           ALL_BUILTINS_RESPONSE_POLICY)
 
     text = kubectl_logs(100 * 1024)
     print("\nPer detector at 100 KB (finditer + validator, ms per pass):")
@@ -191,8 +212,16 @@ async def bench_responses() -> None:
                     detector.validator(m.group(0))
         print(f"  {name:<22} {(time.perf_counter() - start) * 1000 / 20:7.2f}")
 
-    verdict = "PASS" if gate_p99 is not None and gate_p99 <= RESPONSE_GATE_MS else "FAIL"
-    print(f"\nGate (spec Verification 7): 100 KB p99 {gate_p99:.2f} ms vs {RESPONSE_GATE_MS} ms -> {verdict}")
+    ratio = everything[1000][0] / everything[100][0]
+    checks = [
+        ("(a) secrets-7 100 KB p99", secrets[100][1], GATE_SECRETS_100KB_P99_MS, "ms"),
+        ("(a) secrets-7 1 MB max", secrets[1000][1], GATE_SECRETS_1MB_MAX_MS, "ms"),
+        ("(b) all-11 1 MB / 100 KB p50", ratio, GATE_ALL_LINEARITY, "x"),
+    ]
+    print("\nGate (spec Verification 7, Amendment 1):")
+    for name, value, limit, unit in checks:
+        print(f"  {name:<30} {value:8.2f} {unit} <= {limit:g} {unit} -> {'PASS' if value <= limit else 'FAIL'}")
+    print(f"  overall -> {'PASS' if all(v <= l for _, v, l, _ in checks) else 'FAIL'}")
 
 
 async def bench_e2e(base_url: str, on_slug: str, off_slug: str) -> None:
