@@ -16,7 +16,8 @@ import { POLICY_PRESETS } from '../lib/policyPresets'
 import { HealthBadge, ProtocolBadge } from '../components/HealthBadge'
 import { CredentialBadge } from '../components/CredentialBadge'
 import { ToolTester } from '../components/ToolTester'
-import { DlpEditor } from '../components/DlpEditor'
+import { DlpEditor, ResponseDlpEditor } from '../components/DlpEditor'
+import { DLP_DETECTORS, RESPONSE_DLP_MAX_BYTES_DEFAULT } from '../api/types'
 import type { ParamRule, PolicyMode, PolicyResponse, ServerResponse } from '../api/types'
 
 // Enterprise #5: mirrors the identical helper in pages/Servers.tsx — a display-only heuristic
@@ -399,7 +400,23 @@ export function ServerDetail() {
   }
 
   function setDlpConfig(dlp_detectors: PolicyResponse['dlp_detectors'], dlp_custom_patterns: PolicyResponse['dlp_custom_patterns']) {
-    setDraft((d) => (d ? { ...d, dlp_detectors, dlp_custom_patterns } : d))
+    setDraft((d) => {
+      if (!d) return d
+      // #165: a removed custom pattern can't stay named in the response map (the backend
+      // rejects a name that is neither a built-in nor a custom pattern).
+      const known = new Set<string>([...DLP_DETECTORS.map((x) => x.name as string), ...dlp_custom_patterns.map((p) => p.name)])
+      const response_dlp_detectors = Object.fromEntries(
+        Object.entries(d.response_dlp_detectors ?? {}).filter(([name]) => known.has(name)),
+      )
+      return { ...d, dlp_detectors, dlp_custom_patterns, response_dlp_detectors }
+    })
+  }
+
+  function setResponseDlpConfig(
+    response_dlp_detectors: PolicyResponse['response_dlp_detectors'],
+    response_dlp_max_bytes: number,
+  ) {
+    setDraft((d) => (d ? { ...d, response_dlp_detectors, response_dlp_max_bytes } : d))
   }
 
   function applyPreset(presetId: string) {
@@ -541,6 +558,13 @@ export function ServerDetail() {
           detectors={draft.dlp_detectors}
           customPatterns={draft.dlp_custom_patterns}
           onChange={setDlpConfig}
+        />
+        <h3 className="text-xs font-semibold pt-2">Responses</h3>
+        <ResponseDlpEditor
+          detectors={draft.response_dlp_detectors ?? {}}
+          maxBytes={draft.response_dlp_max_bytes ?? RESPONSE_DLP_MAX_BYTES_DEFAULT}
+          customPatternNames={draft.dlp_custom_patterns.map((p) => p.name)}
+          onChange={setResponseDlpConfig}
         />
         {isDirty && (
           <div className="space-y-2">

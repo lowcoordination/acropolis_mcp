@@ -191,3 +191,60 @@ def test_server_record_defaults_credential_mode_to_none():
         created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00",
     )
     assert rec.credential_mode == "none"
+
+
+# ---------------------------------------------------------------------------
+# Issue #165 — ServerPolicy.response_dlp_detectors / response_dlp_max_bytes
+# ---------------------------------------------------------------------------
+
+def test_response_dlp_defaults_are_off():
+    policy = ServerPolicy()
+    assert policy.response_dlp_detectors == {}
+    assert policy.response_dlp_max_bytes == 1_048_576
+
+
+@pytest.mark.parametrize("action", ["redact", "allow"])
+def test_response_dlp_accepts_redact_and_allow(action):
+    assert ServerPolicy(response_dlp_detectors={"jwt": action}).response_dlp_detectors == {"jwt": action}
+
+
+def test_response_dlp_rejects_block():
+    with pytest.raises(ValueError, match="block is not allowed for responses"):
+        ServerPolicy(response_dlp_detectors={"jwt": "block"})
+
+
+@pytest.mark.parametrize("action", ["quarantine", "", "REDACT"])
+def test_response_dlp_rejects_other_actions(action):
+    with pytest.raises(ValueError):
+        ServerPolicy(response_dlp_detectors={"jwt": action})
+
+
+def test_response_dlp_rejects_unknown_name():
+    with pytest.raises(ValueError, match="nope"):
+        ServerPolicy(response_dlp_detectors={"nope": "redact"})
+
+
+def test_response_dlp_accepts_a_custom_pattern_name():
+    policy = ServerPolicy(
+        dlp_custom_patterns=[DlpCustomPattern(name="employee_id", pattern=r"EMP-\d{6}", action="block")],
+        response_dlp_detectors={"employee_id": "redact", "jwt": "redact"},
+    )
+    assert policy.response_dlp_detectors["employee_id"] == "redact"
+
+
+@pytest.mark.parametrize("value", [1024, 1_048_576, 16_777_216])
+def test_response_dlp_max_bytes_in_range(value):
+    assert ServerPolicy(response_dlp_max_bytes=value).response_dlp_max_bytes == value
+
+
+@pytest.mark.parametrize("value", [0, 1023, 16_777_217, -1])
+def test_response_dlp_max_bytes_out_of_range(value):
+    with pytest.raises(ValueError):
+        ServerPolicy(response_dlp_max_bytes=value)
+
+
+def test_policy_update_request_forbids_unknown_fields():
+    from archon.schemas import PolicyUpdateRequest
+
+    with pytest.raises(ValueError):
+        PolicyUpdateRequest(response_dlp_detector={"jwt": "redact"})  # typo'd field name

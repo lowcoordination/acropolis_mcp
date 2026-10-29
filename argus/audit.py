@@ -64,6 +64,11 @@ class AuditLogger(BackgroundLoop):
         dlp_detector: Optional[str] = None,  # enterprise #10 — which detector fired, if any
         dlp_action: Optional[str] = None,  # "block" | "redact" — never the matched/redacted value
         dlp_match_count: Optional[int] = None,
+        # Issue #165 (response DLP): names and counts only, never a matched value. All None
+        # when response DLP is off for the server.
+        response_dlp_detectors_fired: Optional[list[str]] = None,
+        response_dlp_match_count: Optional[int] = None,
+        response_truncated: Optional[bool] = None,
     ) -> None:
         event = {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -89,6 +94,11 @@ class AuditLogger(BackgroundLoop):
             "dlp_detector": dlp_detector,
             "dlp_action": dlp_action,
             "dlp_match_count": dlp_match_count,
+            "response_dlp_detectors_fired": (
+                ",".join(response_dlp_detectors_fired) if response_dlp_detectors_fired is not None else None
+            ),
+            "response_dlp_match_count": response_dlp_match_count,
+            "response_truncated": response_truncated,
         }
 
         level = logging.WARNING if decision == "BLOCKED" else logging.INFO

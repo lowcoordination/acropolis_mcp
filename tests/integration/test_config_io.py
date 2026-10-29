@@ -59,6 +59,8 @@ async def client(tmp_path: Path):
         mode="passthrough",
         dlp_detectors={"credit_card": "block", "email": "redact"},
         dlp_custom_patterns=[DlpCustomPattern(name="employee_id", pattern=r"EMP-\d{6}", action="redact")],
+        response_dlp_detectors={"jwt": "redact", "employee_id": "redact"},
+        response_dlp_max_bytes=65536,
     ))
 
     # The three secrets that must never appear in an export.
@@ -163,6 +165,35 @@ async def test_import_of_exported_dlp_config_reports_unchanged(client):
     resp = await client.post("/api/v1/config/import", json={"yaml": exported})
     dlp_action = next(a for a in resp.json()["actions"] if a["target"] == "server 'dlp-server'")
     assert dlp_action["kind"] == "unchanged", dlp_action
+
+
+async def test_export_round_trips_response_dlp_settings(client):
+    """Issue #165: both response fields leave in the export and come back unchanged."""
+    resp = await client.get("/api/v1/config/export")
+    data = yaml.safe_load(resp.text)
+    dlp = next(s for s in data["servers"] if s["slug"] == "dlp-server")
+    assert dlp["policy"]["response_dlp_detectors"] == {"jwt": "redact", "employee_id": "redact"}
+    assert dlp["policy"]["response_dlp_max_bytes"] == 65536
+
+
+async def test_import_detects_a_response_dlp_change(client):
+    """A changed response setting must be a delta, or the import reports `unchanged` and
+    never writes it."""
+    data = yaml.safe_load((await client.get("/api/v1/config/export")).text)
+    dlp = next(s for s in data["servers"] if s["slug"] == "dlp-server")
+    dlp["policy"]["response_dlp_detectors"] = {"jwt": "allow"}
+    resp = await client.post("/api/v1/config/import", json={"yaml": yaml.safe_dump(data)})
+    action = next(a for a in resp.json()["actions"] if a["target"] == "server 'dlp-server'")
+    assert action["kind"] == "update", action
+    assert "response_dlp_detectors" in action["detail"], action
+
+
+async def test_import_refuses_block_on_responses(client):
+    data = yaml.safe_load((await client.get("/api/v1/config/export")).text)
+    dlp = next(s for s in data["servers"] if s["slug"] == "dlp-server")
+    dlp["policy"]["response_dlp_detectors"] = {"jwt": "block"}
+    resp = await client.post("/api/v1/config/import", json={"yaml": yaml.safe_dump(data)})
+    assert "block is not allowed for responses" in resp.text
 
 
 # --------------------------------------------------------------------------- import

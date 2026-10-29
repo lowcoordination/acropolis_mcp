@@ -1,4 +1,4 @@
-# DLP (data loss prevention) on tool arguments
+# DLP (data loss prevention) on tool arguments and responses
 
 Acropolis controls *which* tools an agent may call and *what shape* the arguments take
 (allow/deny lists, param rules). Neither can express "this tool is fine, but don't let it
@@ -6,36 +6,76 @@ Acropolis controls *which* tools an agent may call and *what shape* the argument
 `tools/call` request's arguments and, per-detector, lets the call through, redacts the matched
 span, or blocks the call outright — before anything reaches the upstream.
 
-This is opt-in, per-server, off-by-default. Configure it on the server detail page, under
-**DLP (data loss prevention)**, next to the param-rule editor.
+Response DLP (issue #165) does the same for what comes **back**: it scans `tools/call` results
+and redacts secrets before they reach the agent. Both directions are opt-in, per-server,
+off-by-default, and configured independently. Configure them on the server detail page, under
+**DLP (data loss prevention)** (arguments) and **Responses** (results), next to the param-rule
+editor.
 
-## Scope: arguments only, not responses — and why
+## Scope: arguments and responses
 
-**This feature scans tool call arguments. It does not scan tool call responses.** This is a
-deliberate scope decision, not an oversight, made *before* any response-scanning code was
-written — see the benchmark section below for the numbers that back it up.
+Each direction has its own settings, so turning one on never changes the other:
 
-Argument scanning touches a small JSON object that's already parsed for policy evaluation on
-every `tools/call`. Response scanning is a different problem in kind:
+| | Arguments | Responses |
+|---|---|---|
+| Settings | `dlp_detectors`, `dlp_custom_patterns` | `response_dlp_detectors`, `response_dlp_max_bytes` |
+| Actions | `allow`, `redact`, `block` | `allow`, `redact` (no `block`) |
+| What is scanned | every string value in `tools/call` arguments | every string value under a `tools/call` response's `result`, `error` and `params` (notifications in an SSE stream) |
+| Default | off | off; budget 1 MB |
 
-- **Streaming.** Acropolis's passthrough path forwards upstream responses as a raw streamed
-  body (`StreamingResponse` over `r.aiter_raw()` in `argus/pipeline.py`). Scanning a stream
-  means either buffering it whole (defeats streaming, risks unbounded memory for a large
-  response) or scanning incrementally across chunk boundaries — and a secret can straddle two
-  chunks, which incremental scanning has to handle correctly or it's not actually safe.
-- **Size.** A response body has no size cap today. Scanning needs one, and the behavior past
-  that cap is a real, unresolved policy question: fail open (stop scanning, forward the rest
-  unscanned — a leak) or fail closed (reject a response that's simply large and legitimate)?
-  Neither answer is obviously right, and picking one without data would be a guess dressed up
-  as a decision.
-- **Bridged vs. passthrough.** The two forwarding paths in `argus/pipeline.py` handle response
-  bodies differently already (the bridge parses and re-serializes JSON-RPC; passthrough streams
-  raw bytes) — response scanning would need separate treatment and separate tests for each,
-  roughly doubling the surface area of this feature.
+Detector names are shared. A custom pattern defined in `dlp_custom_patterns` runs on responses
+only when its name appears in `response_dlp_detectors`, and there it uses the response map's
+action, never its own argument action.
 
-The honest, measurement-backed call: land argument scanning, benchmark it, and use that
-benchmark to decide whether response scanning is worth its cost — rather than build it
-speculatively and find out later it doesn't fit the gateway's own latency budget.
+Argument DLP was built first, and this doc originally explained why responses were deferred:
+streaming, no size cap, and two forwarding paths. Response DLP answers each one. The rest of this
+section covers how.
+
+### Responses: what is scanned, and where
+
+- **Only `tools/call`.** `initialize`, `tools/list` and `resources/*` are server metadata, not
+  data, and are never scanned.
+- **Object keys, numbers, booleans and nulls are not scanned**, only string values.
+- **Bridged path** (`_handle_bridged`, 2026-generation clients): the upstream body is already
+  buffered and parsed. The scan runs before re-enveloping.
+- **Passthrough path** (`_forward`, 2025-generation clients, which is where the OpenClaw
+  gateway's traffic goes): when the server has `response_dlp_detectors` set and the method is
+  `tools/call`, Acropolis stops streaming and buffers instead.
+  - It asks the upstream for `accept-encoding: identity`, because a compressed body can't be
+    scanned.
+  - It parses `application/json` as one message, and `text/event-stream` per `data:` event
+    (`argus/sse.py`).
+  - If nothing fired and nothing was cut, the original bytes are forwarded unchanged.
+    Otherwise the body is rebuilt with a correct `Content-Length`.
+- **Every other server and method** keeps zero-copy `aiter_raw()` streaming. A server with
+  empty `response_dlp_detectors` forwards byte-identical output
+  (`TestUntouchedWhenOffOrOtherMethods` in `tests/integration/test_response_dlp.py`).
+
+### Responses: too big, in two tiers
+
+Cutting raw bytes would break the JSON, so the limits apply at two levels:
+
+1. **Scan budget** (`response_dlp_max_bytes`, 1 KiB–16 MiB, default 1 MiB, counted as UTF-8
+   bytes of string content).
+   - Over budget, the longest strings are cut to an equal share, on a code-point boundary, and
+     each cut string ends with
+     `[TRUNCATED: response exceeded the 1 MB scan limit; narrow the query]`.
+   - The kept head is scanned with 4 KiB of lookahead past the cut, so a secret that straddles
+     the cut is redacted rather than left as a prefix.
+2. **Hard read ceiling** (8 × the budget, passthrough only). Acropolis stops reading the
+   upstream there and closes the connection. The caller gets a valid `tools/call` result whose
+   only content is `[TRUNCATED: response exceeded the hard read limit; narrow the query]`.
+
+### Responses: fail closed, never fail the call
+
+Nothing in response DLP turns a call into an error, and nothing unscanned reaches the caller:
+
+- **Malformed JSON, a stream cut mid-event, a compressed or unknown body, or a scan that raises**
+  (deeply nested JSON, for example): the result becomes
+  `[TRUNCATED: response could not be parsed for scanning]`.
+- **A custom pattern that times out**: that value is redacted whole, as `[REDACTED:<name>]`.
+- **`block` is refused by validation** (422). One token line in a log would otherwise hide
+  the whole log from the agent reading it.
 
 ## Detectors
 
@@ -53,6 +93,18 @@ catches `{"api_key": "..."}` by looking at the key; it has always missed
 | `aws_access_key` | 20-char `AKIA…`/`ASIA…`/etc. | Prefix + length/charset format check (there is no public checksum algorithm for AWS key IDs — see `argus/dlp.py`'s comment on this) |
 | `private_key_pem` | `-----BEGIN ... PRIVATE KEY-----` headers | — |
 | `high_entropy_string` | 20–128 char token-alphabet runs | Shannon entropy ≥ 3.5 **and** ≥3 of 4 character classes present (lower/upper/digit/symbol) — a plain long English word does not fire; a mixed-case, digit-bearing token does |
+| `bearer_token` | `Bearer <token>` (case-insensitive scheme), 16–4096 token chars | The token must mix ≥2 character classes, so `Bearer authentication` in prose does not fire. Only the token is replaced |
+| `jwt` | three base64url segments, the first starting `eyJ` (covers Kubernetes ServiceAccount tokens) | The `eyJ` header and three bounded segments; a git SHA or base64 PNG fragment does not fire |
+| `github_token` | `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_` + 36–251 chars, `github_pat_` + 22 + `_` + 59 | Prefix plus exact charset and length, bounded by lookarounds |
+| `secret_assignment` | `password`, `passwd`, `secret`, `token`, `api_key`, `access_key`, `private_key`, `credentials` followed by `=` or `:` and a value | The key must end at the keyword (`password_policy=strict` does not fire); `true`/`false`/`null`/`none`/`nil` and integers up to 6 digits are dropped. Only the value is replaced, so the key stays readable. Also matches backslash-escaped quotes (`\"password\":\"x\"`), the shape of a JSON log line nested in a JSON string |
+| `url_credentials` | `scheme://user:password@host`, and the escaped-slash form `scheme:\/\/user:password@host` | Needs both a user and a password; a URL with only a user does not fire. Only the password is replaced |
+
+The last five were added with response DLP. They are available in both directions, and are off
+by default like the rest. Every built-in is fuzz-gated
+(`test_all_builtin_detector_patterns_resist_randomized_fuzz`).
+
+Overlapping findings are merged before redaction, so a match nested inside another (a URL
+password that is also high-entropy) cannot leave a fragment behind.
 
 Plus **operator-defined custom patterns** (`dlp_custom_patterns`): a name, a regex, and an
 action, evaluated the same way as the built-ins.
@@ -230,6 +282,40 @@ Two takeaways:
    with pattern count, not argument size. This is the real, load-bearing reason custom patterns
    are a deliberate, visible opt-in rather than bundled into the default detector set.
 
+### Response scanning, measured
+
+Response scanning cost was originally projected from the argument numbers above: about 0.55 /
+5.5 / 55 ms at 10 KB / 100 KB / 1 MB. That projection was wrong. The six argument-era detectors
+alone take 12 ms p99 at 100 KB. The measured numbers below replace it. They come from
+`scan_result()` on `kubectl logs`-shaped text (an email on every line, a planted DSN every 100
+lines), with the budget raised out of the way, on an AMD Ryzen AI MAX+ 395. Times in ms; 1 MB is
+p50/max over 30 runs:
+
+| Detectors on | 10 KB p50/p99 | 100 KB p50/p99 | 1 MB p50/max |
+|---|---|---|---|
+| **Secrets-7** (the five new + `aws_access_key` + `private_key_pem`) | 0.9 / 1.0 | 9.1 / 9.4–12.0 | 88–92 / 93–108 |
+| All 11 | 2.0 / 2.2 | 20.0 / 24–32 | 195–203 / 207–227 |
+
+Cost per detector at 100 KB, in ms: `high_entropy_string` 4.6, `secret_assignment` 3.1,
+`url_credentials` 1.9, `credit_card` 1.7, `us_ssn` 1.4, `email` 1.3, `aws_access_key` 1.0,
+`bearer_token` 1.0, `jwt` 0.8, `github_token` 0.8, `private_key_pem` 0.0. Cost is linear in size
+(1 MB ÷ 100 KB ≈ 9.8×). End to end through the passthrough path, all 11 added 12.5 ms at 100 KB.
+
+**Pick detectors per server for what its responses carry.** The PII detectors find little in
+lab logs, and `high_entropy_string` costs the most while firing on request ids and hashes.
+Secrets-7 is the recommended response set for log- and config-reading servers.
+
+**The gate** (`python -m tests.bench.bench_dlp`, spec Verification 7):
+- Secrets-7: 100 KB p99 ≤ 15 ms and 1 MB max ≤ 150 ms.
+- All 11: 1 MB p50 ÷ 100 KB p50 ≤ 12, which catches a pattern that starts backtracking.
+
+**Memory.** 20 concurrent ~8 MB responses, just under the hard ceiling, went through the
+passthrough scan path in a container limited to 512 MiB (the pod's limit). The container's
+cgroup `memory.peak` reached 327 MiB, page cache included, over three runs. There were no OOM
+events, and every response came back redacted and truncated.
+
+### The original deferral, kept for history
+
 **The response-scanning deferral, quantified:** extrapolating the built-in-only scanning rate
 (~0.055ms added p99 per KB) to response-sized payloads projects to ~0.55ms at 10KB, ~5.5ms at
 100KB, and ~55ms at 1MB — response bodies routinely exceed all of these sizes, and that number
@@ -239,6 +325,17 @@ measurements**, explicitly not a benchmark of a real response-scanning implement
 exists) — but it's specific enough to make the "measure before building" call defensible rather
 than a hand-wave. If response scanning is built in a future PR, this projection is the number to
 beat, and to re-derive from a real implementation before shipping it.
+
+## Stated gaps
+
+- **Encoding evasion** (below) applies to responses exactly as to arguments.
+- **A secret in a format no detector knows passes through.** The detectors cover common
+  formats, not every format.
+- **Response DLP is per server, not per caller.** Turning it on for a server that several agents
+  share (for example `mcp-unifi2`) scans every agent's calls to it. That is harmless, and it is
+  what per-server configuration means.
+- **Emptying a server's policy turns response DLP off for that server.** Nothing inside
+  Acropolis detects that. Re-run an end-to-end planted-secret check after any policy change.
 
 ## Explicitly out of scope: encoding evasion
 
@@ -264,7 +361,12 @@ sophisticated actor deliberately trying to exfiltrate data past it.
 ```python
 dlp_detectors: dict[str, str]         # detector name -> "allow" | "redact" | "block"
 dlp_custom_patterns: list[DlpCustomPattern]  # {name, pattern, action}
+response_dlp_detectors: dict[str, str]  # detector or custom-pattern name -> "allow" | "redact"
+response_dlp_max_bytes: int             # scan budget, 1024..16_777_216, default 1_048_576
 ```
+
+The response fields ride in the same `dlp_config` JSON column, written only when set, so an
+argument-only policy encodes exactly as before and an old row decodes as "response DLP off".
 
 Stored on `server_policies.dlp_config` as a single JSON column (migration
 `0008_gateway_dlp_config.sql`). **Correction to the original plan doc**, documented here because
@@ -283,6 +385,19 @@ enumerating fields — adding `dlp_detectors`/`dlp_custom_patterns` to the model
 with zero changes needed in `config_io.py` itself. Verified with a round-trip test
 (`test_export_round_trips_dlp_config_faithfully` / `test_import_of_exported_dlp_config_reports_unchanged`
 in `tests/integration/test_config_io.py`) rather than assumed.
+
+## Response audit fields
+
+A scanned call's `audit_events` row gains `response_dlp_detectors_fired` (names only),
+`response_dlp_match_count` and `response_truncated` (migrations `0016_response_dlp_audit.sql`
+and `audit/0002_response_dlp_audit.sql`). As for arguments, a matched value never appears in
+the audit table, application logs, traces or API responses. `AuditEventResponse` uses
+`extra="forbid"`, and `test_values_never_reach_audit_logs_or_spans` searches all of them for
+each planted value.
+
+For a server with response DLP on, the `ALLOWED` row is written after the response scan, not
+before the forward. So that row's latency includes the upstream call and the scan. The scan
+itself is traced as its own `response.dlp_scan` span.
 
 ## Admin audit trail
 
