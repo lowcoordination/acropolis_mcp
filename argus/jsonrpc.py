@@ -74,7 +74,9 @@ def parse_single_message(body_bytes: bytes) -> dict:
     try:
         parsed = json.loads(body_bytes)
     except (ValueError, RecursionError):
-        raise NotASingleMessage(PARSE_ERROR, "Parse error: body is not valid JSON") from None
+        raise NotASingleMessage(
+            PARSE_ERROR, "Parse error: body is not UTF-8 JSON, or is nested too deeply",
+        ) from None
     if isinstance(parsed, list):
         raise NotASingleMessage(
             INVALID_REQUEST,
