@@ -46,3 +46,11 @@ def test_incomplete_stream_raises(body):
 def test_non_utf8_raises():
     with pytest.raises(UnicodeDecodeError):
         parse_events(b"data: \xff\n\n")
+
+
+def test_leading_bom_is_ignored_like_a_browser_does():
+    """/code-review on PR #168: the SSE spec strips one leading U+FEFF. Without that, the first
+    event's field name was '\\ufeffdata', so its data was never scanned but a client read it."""
+    events = parse_events("﻿data: {\"a\":1}\n\n".encode())
+    assert [ev.data for ev in events] == ['{"a":1}']
+    assert serialize(events) == b"data: {\"a\":1}\n\n"

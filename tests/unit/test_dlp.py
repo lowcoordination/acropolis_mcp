@@ -535,3 +535,24 @@ async def test_nested_findings_never_leak_the_outer_span():
     for digit_run in ("4567", "6789", "0123"):
         assert digit_run not in result.redacted_value
     assert result.redacted_value == "x [REDACTED:outer] y"
+
+
+# /code-review on PR #168: escaped forms. A JSON log line stored inside another JSON string
+# (common in Loki output) carries `\"password\":\"x\"`, and some serializers escape `/`.
+@pytest.mark.parametrize("text,expected", [
+    ('body="{\\"password\\":\\"hunter2hunter2\\"}"',
+     'body="{\\"password\\":\\"[REDACTED:secret_assignment]\\"}"'),
+    ("{\\'api_key\\': \\'x9Qz7LmN2pR4\\'}", "{\\'api_key\\': \\'[REDACTED:secret_assignment]\\'}"),
+])
+async def test_secret_assignment_escaped_quotes(text, expected):
+    assert await _redact(text, "secret_assignment") == expected
+
+
+@pytest.mark.parametrize("text", ['{\\"secret\\":\\"true\\"}', '{\\"token_count\\":\\"5\\"}'])
+async def test_secret_assignment_escaped_near_misses(text):
+    assert await _redact(text, "secret_assignment") is None
+
+
+async def test_url_credentials_escaped_slashes():
+    out = await _redact('"dsn":"postgres:\\/\\/app:s3cr3t@db:5432\\/x"', "url_credentials")
+    assert out == '"dsn":"postgres:\\/\\/app:[REDACTED:url_credentials]@db:5432\\/x"'

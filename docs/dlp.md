@@ -96,8 +96,8 @@ catches `{"api_key": "..."}` by looking at the key; it has always missed
 | `bearer_token` | `Bearer <token>` (case-insensitive scheme), 16–4096 token chars | The token must mix ≥2 character classes, so `Bearer authentication` in prose does not fire. Only the token is replaced |
 | `jwt` | three base64url segments, the first starting `eyJ` (covers Kubernetes ServiceAccount tokens) | The `eyJ` header and three bounded segments; a git SHA or base64 PNG fragment does not fire |
 | `github_token` | `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_` + 36–251 chars, `github_pat_` + 22 + `_` + 59 | Prefix plus exact charset and length, bounded by lookarounds |
-| `secret_assignment` | `password`, `passwd`, `secret`, `token`, `api_key`, `access_key`, `private_key`, `credentials` followed by `=` or `:` and a value | The key must end at the keyword (`password_policy=strict` does not fire); `true`/`false`/`null`/`none`/`nil` and integers up to 6 digits are dropped. Only the value is replaced, so the key stays readable |
-| `url_credentials` | `scheme://user:password@host` | Needs both a user and a password; a URL with only a user does not fire. Only the password is replaced |
+| `secret_assignment` | `password`, `passwd`, `secret`, `token`, `api_key`, `access_key`, `private_key`, `credentials` followed by `=` or `:` and a value | The key must end at the keyword (`password_policy=strict` does not fire); `true`/`false`/`null`/`none`/`nil` and integers up to 6 digits are dropped. Only the value is replaced, so the key stays readable. Also matches backslash-escaped quotes (`\"password\":\"x\"`), the shape of a JSON log line nested in a JSON string |
+| `url_credentials` | `scheme://user:password@host`, and the escaped-slash form `scheme:\/\/user:password@host` | Needs both a user and a password; a URL with only a user does not fire. Only the password is replaced |
 
 The last five were added with response DLP. They are available in both directions, and are off
 by default like the rest. Every built-in is fuzz-gated

@@ -444,6 +444,19 @@ class TestPassthroughHostileBodies:
         _assert_no_secret(resp.text)
         assert UNPARSEABLE_MARKER in resp.text
 
+    async def test_sse_leading_bom_is_still_scanned(self, env, upstream):
+        """/code-review on PR #168: a BOM hid the first event's data from the parser, so it went
+        out unscanned while a conforming client (which drops the BOM) read it."""
+        client, repo, server, _ = env
+        await _set_response_dlp(repo, server, ALL_NEW_REDACT)
+        # The BOM must sit right before `data:`: in front of `event:` the data line still parses.
+        body = "\ufeffdata: " + json.dumps(_planted_result(1)) + "\nevent: message\n\n"
+        upstream.script["tools/call"] = lambda req: Reply([body.encode()], content_type="text/event-stream")
+        resp = await passthrough(client, _call())
+        assert resp.status_code == 200
+        _assert_no_secret(resp.text)
+        assert "[REDACTED:jwt]" in resp.text
+
     async def test_compressed_upstream_fails_closed(self, env, upstream):
         import gzip
         client, repo, server, _ = env

@@ -155,7 +155,21 @@ _NON_SECRET_ASSIGNMENT_VALUE = re.compile(r"^(?:true|false|null|none|nil|[0-9]{1
 
 def _secret_assignment_validator(matched: str) -> bool:
     m = _SECRET_ASSIGNMENT_RE.match(matched)
-    return m is not None and not _NON_SECRET_ASSIGNMENT_VALUE.match(m.group(1))
+    return m is not None and not _NON_SECRET_ASSIGNMENT_VALUE.match(_unescape_tail(m.group(1)))
+
+
+def _unescape_tail(value: str) -> str:
+    # In `\"password\":\"x\"` the value group ends with the backslash of the closing `\"`.
+    return value[:-1] if value.endswith("\\") else value
+
+
+def _secret_assignment_span(m: re.Match) -> tuple[int, int]:
+    """The value only, without the backslash that escapes its closing quote, so the redacted
+    text keeps the escape intact: `\"password\":\"[REDACTED:secret_assignment]\"`."""
+    start, end = m.span(1)
+    if m.group(1).endswith("\\") and m.string[end:end + 1] in ("\"", "'"):
+        end -= 1
+    return start, end
 
 
 # ReDoS notes for the five response-era patterns (issue #165). Every quantifier is bounded,
@@ -166,7 +180,7 @@ def _secret_assignment_validator(matched: str) -> bool:
 # detector's comment describes. Both fuzz tests in tests/unit/test_dlp.py cover these.
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)"
-    r"[\"']?[ \t]{0,8}[:=][ \t]{0,8}[\"']?([^\s\"',;&]{1,512})"
+    r"(?:\\?[\"'])?[ \t]{0,8}[:=][ \t]{0,8}(?:\\?[\"'])?([^\s\"',;&]{1,512})"
 )
 
 
@@ -264,7 +278,7 @@ BUILTIN_DETECTORS: dict[str, Detector] = {
         # small integers. Only the value is replaced.
         pattern=_SECRET_ASSIGNMENT_RE,
         validator=_secret_assignment_validator,
-        replace_span=_group_span(1),
+        replace_span=_secret_assignment_span,
     ),
     "url_credentials": Detector(
         name="url_credentials",
@@ -272,7 +286,7 @@ BUILTIN_DETECTORS: dict[str, Detector] = {
         # The user part excludes ':' and '@', so the first ':' after `://` splits user from
         # password exactly once. Only the password is replaced.
         pattern=re.compile(
-            r"(?i)\b[a-z][a-z0-9+.-]{1,31}://[^\s:/?#@]{1,256}:([^\s/?#@]{1,256})@"
+            r"(?i)\b[a-z][a-z0-9+.-]{1,31}:(?://|\\/\\/)[^\s:/?#@\\]{1,256}:([^\s/?#@]{1,256})@"
         ),
         replace_span=_group_span(1),
     ),

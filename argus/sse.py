@@ -69,7 +69,15 @@ def _split_field(line: bytes) -> tuple[str, str]:
     return name, value
 
 
+_BOM = "\ufeff".encode("utf-8")
+
+
 def parse_events(body: bytes) -> list[SseEvent]:
+    # The SSE spec ignores one leading U+FEFF, and so does every conforming client. Keeping it
+    # would make the first field name "\ufeffdata": that event's data would go unscanned while
+    # the client still reads it. It is dropped from the rebuilt body too.
+    if body.startswith(_BOM):
+        body = body[len(_BOM):]
     events: list[SseEvent] = []
     pending: list[bytes] = []
     pos = 0
