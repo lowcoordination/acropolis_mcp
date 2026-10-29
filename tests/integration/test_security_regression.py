@@ -408,10 +408,9 @@ class TestSpecLegalBodiesDoNotCrash:
     both reached body_json.get(...)/params.get(...) on a non-dict and raised AttributeError,
     which escaped as a bare 500 with a stack trace — reachable by any client, trivially.
 
-    These tests need a REAL, reachable upstream: a non-dict body makes _process() fall through
-    to raw passthrough (the same path an unparseable body takes), so with no live upstream the
-    request would 500 for the unrelated, not-yet-fixed reason of F3 (unreachable upstream ->
-    unhandled exception, Plan 3 scope) rather than proving F11 specifically."""
+    Since #166 a batch or bare scalar is refused with a 400 before anything is forwarded
+    (tests/integration/test_batch_bodies.py covers that in depth). The real upstream stays so
+    the params: null case, which still forwards, exercises the live path."""
 
     async def test_batch_body_on_per_server_endpoint_does_not_500(self, tmp_path):
         async with run_fastmcp_server() as upstream:
@@ -424,7 +423,7 @@ class TestSpecLegalBodiesDoNotCrash:
                         content='[{"jsonrpc":"2.0","id":1,"method":"ping"}]',
                         headers={"Content-Type": "application/json"},
                     )
-                    assert r.status_code != 500
+                    assert r.status_code == 400
 
     async def test_null_params_on_per_server_endpoint_does_not_500(self, tmp_path):
         async with run_fastmcp_server() as upstream:
@@ -449,7 +448,7 @@ class TestSpecLegalBodiesDoNotCrash:
                         content='"just a string, not an object"',
                         headers={"Content-Type": "application/json"},
                     )
-                    assert r.status_code != 500
+                    assert r.status_code == 400
 
     async def test_batch_body_on_aggregate_endpoint_does_not_500(self, tmp_path):
         async with run_acropolis_server(tmp_path, auth_mode="open") as (port, db):
@@ -460,7 +459,6 @@ class TestSpecLegalBodiesDoNotCrash:
                     headers={"Content-Type": "application/json"},
                 )
                 assert r.status_code != 500
-                # Non-dict body should get the same clean 400 as an unparseable body, not a 500.
                 assert r.status_code == 400
 
 
