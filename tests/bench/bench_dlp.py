@@ -135,7 +135,7 @@ RESPONSE_ITERATIONS = {10: iters(300, 5), 100: iters(150, 5), 1000: iters(30, 2)
 
 # Spec Verification 7, as revised by Amendment 1 (approved 2026-10-29). The original rule (all 11
 # built-ins, 100 KB p99 <= 11 ms) came from an extrapolation that the six argument-era detectors
-# alone already miss. The gate now measures the set Hephaestus's servers ship with, plus a
+# alone already miss. The gate now measures the recommended response set (Secrets-7), plus a
 # linearity check that catches a pattern starting to backtrack.
 SECRETS_7 = (
     "bearer_token", "jwt", "github_token", "secret_assignment", "url_credentials",
