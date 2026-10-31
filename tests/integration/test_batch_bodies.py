@@ -72,7 +72,7 @@ REFUSED_BODIES = {
 async def gateway(tmp_path: Path, monkeypatch):
     forwarded: list[bytes] = []
 
-    async def spy_forward(self, request, server, path, body_bytes, resolved_auth_header):
+    async def spy_forward(self, request, server, path, body_bytes, resolved_auth_header, **_kw):
         forwarded.append(body_bytes)
         return Response(content=b"{}", status_code=200, media_type="application/json")
 

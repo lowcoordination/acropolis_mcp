@@ -36,6 +36,17 @@ from argus.jsonrpc import (
 from argus.metering import Metering
 from argus.policy import Decision, evaluate
 from argus.rate_limiter import RateLimiterRegistry
+from argus import sse
+from argus.response_dlp import (
+    HARD_CEILING_FACTOR,
+    HARD_LIMIT_MARKER,
+    UNPARSEABLE_MARKER,
+    ResponseScan,
+    loads_strict,
+    marker_message,
+    response_dlp_enabled,
+    scan_result,
+)
 from argus.toolslist import ToolsCache
 from argus.tokens import TokenIssuer
 from argus.tracing import TracingManager, _DisabledTracingManager
@@ -81,6 +92,10 @@ class _EnforcementOutcome:
     blocked_response: Optional[Response] = None
     decision: Optional[Decision] = None
     policy: Optional[ServerPolicy] = None
+    # Issue #165: set when response DLP is on for this call. The ALLOWED audit row is held back
+    # so it can record what the response scan found; the caller MUST log it with
+    # Pipeline._log_deferred_allowed, in a `finally`, once the response is built (or failed).
+    pending_audit: Optional[dict] = None
 
 
 class Pipeline:
@@ -387,6 +402,10 @@ class Pipeline:
         rpc_method: str = ""
         tool_name: Optional[str] = None
         client_ip = _client_ip(request)
+        # Issue #165: set only for a tools/call whose server opted in to response DLP; None
+        # keeps _forward's streaming byte proxy exactly as it was.
+        scan_policy: Optional[ServerPolicy] = None
+        pending_audit: Optional[dict] = None
 
         # Only POST carries a JSON-RPC message in Streamable HTTP. GET/DELETE are bodiless and
         # PUT/PATCH are not MCP at all, but _forward relays request.method and the raw body as
@@ -476,6 +495,10 @@ class Pipeline:
                 if outcome.blocked_response is not None:
                     return outcome.blocked_response
 
+                if outcome.policy is not None and response_dlp_enabled(outcome.policy, rpc_method):
+                    scan_policy = outcome.policy
+                    pending_audit = outcome.pending_audit
+
                 # DLP redact: the redacted body MUST be what actually leaves the process —
                 # re-serialize the JSON-RPC envelope with the redacted arguments substituted
                 # in and forward THAT, never the original body_bytes.
@@ -495,14 +518,23 @@ class Pipeline:
                     latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
                 )
 
+        # Issue #165: with response DLP on, the ALLOWED row is written after the scan, in a
+        # finally so a credential or upstream failure (RoutingError) still leaves it behind.
+        scan_out: list[ResponseScan] = []
         try:
-            resolved_auth_header = await self._resolve_credential(
-                server, rpc_method=rpc_method, rpc_id=rpc_id, tool_name=tool_name,
-                api_key_id=api_key_id, start=start, client_ip=client_ip, origin=origin,
+            try:
+                resolved_auth_header = await self._resolve_credential(
+                    server, rpc_method=rpc_method, rpc_id=rpc_id, tool_name=tool_name,
+                    api_key_id=api_key_id, start=start, client_ip=client_ip, origin=origin,
+                )
+            except self._CredentialResolutionFailed as e:
+                return e.response
+            return await self._forward(
+                request, server, path, body_bytes, resolved_auth_header,
+                scan_policy=scan_policy, rpc_id=rpc_id, scan_out=scan_out,
             )
-        except self._CredentialResolutionFailed as e:
-            return e.response
-        return await self._forward(request, server, path, body_bytes, resolved_auth_header)
+        finally:
+            await self._log_deferred_allowed(pending_audit, start, scan_out[0] if scan_out else None)
 
     async def _evaluate_with_tracing(
         self, tool_name: str, arguments: dict, server: ServerRecord, policy: ServerPolicy,
@@ -597,16 +629,22 @@ class Pipeline:
             return _EnforcementOutcome(blocked_response=quota_response)
 
         decision = await self._evaluate_with_tracing(tool_name, arguments, server, policy)
-        await self._audit.log(
+        decision_audit = dict(
             tool=tool_name,
             decision="BLOCKED" if decision.blocked else "ALLOWED",
             rule=decision.rule, matched=decision.matched,
             args_summary=decision.args_summary, reason=decision.reason,
             dlp_detector=decision.dlp_detector, dlp_action=decision.dlp_action,
             dlp_match_count=decision.dlp_match_count,
-            latency_ms=int((time.monotonic() - start) * 1000),
             **audit_common,
         )
+        pending_audit: Optional[dict] = None
+        if not decision.blocked and response_dlp_enabled(policy, rpc_method):
+            # Issue #165: logged by the caller after the response scan (see pending_audit).
+            # Its latency_ms then covers the upstream call and the scan, not just enforcement.
+            pending_audit = decision_audit
+        else:
+            await self._audit.log(latency_ms=int((time.monotonic() - start) * 1000), **decision_audit)
         await self._record_usage(server, tool_name, api_key_id)
 
         if decision.blocked:
@@ -619,7 +657,7 @@ class Pipeline:
                     status_code=403, media_type="application/json",
                 )
             )
-        return _EnforcementOutcome(decision=decision, policy=policy)
+        return _EnforcementOutcome(decision=decision, policy=policy, pending_audit=pending_audit)
 
     async def _refuse(
         self, *, server_slug, tool, rpc_id, message, status, rule, api_key_id,
@@ -708,6 +746,9 @@ class Pipeline:
         client_ip: Optional[str] = None, origin: Optional[str] = None,
     ) -> Response:
         api_key_id = key_record.id if key_record is not None else None
+        # Issue #165: set only for a tools/call whose server opted in to response DLP.
+        scan_policy: Optional[ServerPolicy] = None
+        pending_audit: Optional[dict] = None
         if rpc_method == "tools/call":
             tool_name = params.get("name")
             outcome = await self._enforce(
@@ -716,6 +757,9 @@ class Pipeline:
             )
             if outcome.blocked_response is not None:
                 return outcome.blocked_response
+            if outcome.policy is not None and response_dlp_enabled(outcome.policy, rpc_method):
+                scan_policy = outcome.policy
+                pending_audit = outcome.pending_audit
 
             # DLP redact: the bridged path forwards `params` directly to
             # ProtocolBridge.bridge_call rather than raw body bytes, so redaction here means
@@ -741,30 +785,75 @@ class Pipeline:
                 client_ip=client_ip, origin=origin,
             )
 
+        # Issue #165: with response DLP on, the ALLOWED row is written here, after the scan, and
+        # in a finally so an upstream or credential failure still leaves it in the audit trail.
+        scan: Optional[ResponseScan] = None
         try:
-            resolved_auth_header = await self._resolve_credential(
-                server, rpc_method=rpc_method, rpc_id=rpc_id,
-                tool_name=params.get("name") if rpc_method == "tools/call" else None,
-                api_key_id=api_key_id, start=start, client_ip=client_ip, origin=origin, bridged=True,
-            )
-        except self._CredentialResolutionFailed as e:
-            return e.response
-        try:
-            status, body = await self._bridge.bridge_call(
-                server_id=server.id, upstream_url=server.upstream_url, rpc_method=rpc_method,
-                rpc_id=rpc_id, params=params, meta=meta,
-                upstream_auth_header=resolved_auth_header,
-            )
-        except BridgeError as e:
-            return await self._error(
-                server_slug=server.slug, tool=None, status=e.status_code,
-                content=e.body, reason=e.body[:200],
-                api_key_id=api_key_id, start=start, client_ip=client_ip,
-                bridged=True, origin=origin,
-                endpoint="per-server", rpc_method=rpc_method,
-            )
+            try:
+                resolved_auth_header = await self._resolve_credential(
+                    server, rpc_method=rpc_method, rpc_id=rpc_id,
+                    tool_name=params.get("name") if rpc_method == "tools/call" else None,
+                    api_key_id=api_key_id, start=start, client_ip=client_ip, origin=origin, bridged=True,
+                )
+            except self._CredentialResolutionFailed as e:
+                return e.response
+            try:
+                status, body = await self._bridge.bridge_call(
+                    server_id=server.id, upstream_url=server.upstream_url, rpc_method=rpc_method,
+                    rpc_id=rpc_id, params=params, meta=meta,
+                    upstream_auth_header=resolved_auth_header,
+                )
+            except BridgeError as e:
+                return await self._error(
+                    server_slug=server.slug, tool=None, status=e.status_code,
+                    content=e.body, reason=e.body[:200],
+                    api_key_id=api_key_id, start=start, client_ip=client_ip,
+                    bridged=True, origin=origin,
+                    endpoint="per-server", rpc_method=rpc_method,
+                )
 
-        return Response(content=json.dumps(body), status_code=status, media_type="application/json")
+            if scan_policy is not None:
+                body, scan = await self._scan_message(body, scan_policy, rpc_id)
+                self._trace_scan(scan)
+            return Response(content=json.dumps(body), status_code=status, media_type="application/json")
+        finally:
+            await self._log_deferred_allowed(pending_audit, start, scan)
+
+    async def _scan_message(
+        self, message: Any, policy: ServerPolicy, rpc_id: Any,
+    ) -> tuple[Any, ResponseScan]:
+        """Issue #165: scan one parsed upstream response. Any failure inside the scan fails
+        closed to a marker; the caller never forwards the message it passed in."""
+        try:
+            scan = await scan_result(message, policy)
+        except Exception:  # noqa: BLE001 — fail closed on anything; never log the message
+            logger.exception("response DLP scan failed — replacing the response with a marker")
+            marker = marker_message(sanitize_rpc_id(rpc_id), UNPARSEABLE_MARKER)
+            return marker, ResponseScan(result=marker, detectors_fired=[], match_count=0, truncated=True)
+        return scan.result, scan
+
+    def _trace_scan(self, scan: ResponseScan) -> None:
+        """Issue #165: one span per response scan carrying detector NAMES and counts, never a
+        value."""
+        with self._tracing.span("response.dlp_scan", attributes={
+            "acropolis.response_dlp.detectors_fired": ",".join(scan.detectors_fired),
+            "acropolis.response_dlp.match_count": scan.match_count,
+            "acropolis.response_dlp.truncated": scan.truncated,
+        }):
+            pass
+
+    async def _log_deferred_allowed(
+        self, pending_audit: Optional[dict], start: float, scan: Optional[ResponseScan],
+    ) -> None:
+        if pending_audit is None:
+            return
+        await self._audit.log(
+            latency_ms=int((time.monotonic() - start) * 1000),
+            response_dlp_detectors_fired=scan.detectors_fired if scan is not None else None,
+            response_dlp_match_count=scan.match_count if scan is not None else None,
+            response_truncated=scan.truncated if scan is not None else None,
+            **pending_audit,
+        )
 
     async def _check_header_consistency(
         self, request: Request, rpc_method: str, body_name: Optional[str],
@@ -904,7 +993,9 @@ class Pipeline:
 
     async def _forward(
         self, request: Request, server: ServerRecord, path: str, body_bytes: bytes,
-        resolved_auth_header: Optional[str] = None,
+        resolved_auth_header: Optional[str] = None, *,
+        scan_policy: Optional[ServerPolicy] = None, rpc_id: Any = None,
+        scan_out: Optional[list[ResponseScan]] = None,
     ) -> Response:
         # GEN_2025 passthrough path (see the fork comment in _process): raw byte proxy to the
         # upstream. The bridged counterpart is ProtocolBridge.bridge_call (argus/bridge.py).
@@ -931,6 +1022,13 @@ class Pipeline:
                 (k, v) for k, v in forward_headers if k.lower() != b"authorization"
             ]
             forward_headers.append((b"authorization", resolved_auth_header.encode()))
+
+        # Issue #165: the scan path reads the body as sent, so ask for it uncompressed. Decoding
+        # a compressed body in memory would let a small upstream payload expand past the hard
+        # ceiling before it is counted; an upstream that compresses anyway fails closed below.
+        if scan_policy is not None:
+            forward_headers = [(k, v) for k, v in forward_headers if k.lower() != b"accept-encoding"]
+            forward_headers.append((b"accept-encoding", b"identity"))
 
         # traceparent/tracestate are added here — deliberately, inside upstream.forward's
         # span, and ONLY here. argus/headers.py's strip_hop_by_hop already removed any
@@ -965,7 +1063,84 @@ class Pipeline:
                 raise RoutingError(502, rpc_error(None, f"upstream request failed: {e}"))
             forward_span.set_attribute("http.status_code", r.status_code)
 
-        return StreamingResponse(
-            r.aiter_raw(), status_code=r.status_code,
-            headers=filter_response_headers(r.headers), background=BackgroundTask(r.aclose),
+        if scan_policy is None:
+            return StreamingResponse(
+                r.aiter_raw(), status_code=r.status_code,
+                headers=filter_response_headers(r.headers), background=BackgroundTask(r.aclose),
+            )
+        response, scan = await self._scan_passthrough_response(r, scan_policy, rpc_id)
+        self._trace_scan(scan)
+        if scan_out is not None:
+            scan_out.append(scan)
+        return response
+
+    async def _scan_passthrough_response(
+        self, r: httpx.Response, policy: ServerPolicy, rpc_id: Any,
+    ) -> tuple[Response, ResponseScan]:
+        """Issue #165: buffer, parse, scan and rebuild one passthrough tools/call response.
+
+        Never forwards unscanned bytes: past the hard ceiling, on a compressed or unparseable
+        body, or on any scan failure, the client gets a marker result instead. Never fails the
+        call: those markers are HTTP 200 tools/call results."""
+        headers = {
+            k: v for k, v in filter_response_headers(r.headers).items()
+            if k.lower() not in ("content-length", "content-encoding", "transfer-encoding")
+        }
+        ceiling = HARD_CEILING_FACTOR * policy.response_dlp_max_bytes
+        buf = bytearray()
+        try:
+            async for chunk in r.aiter_raw():
+                buf += chunk
+                if len(buf) > ceiling:
+                    return self._marker_response(rpc_id, HARD_LIMIT_MARKER, headers)
+        except httpx.HTTPError:
+            return self._marker_response(rpc_id, UNPARSEABLE_MARKER, headers)
+        finally:
+            await r.aclose()
+
+        if not buf:
+            return Response(content=b"", status_code=r.status_code, headers=headers), ResponseScan(
+                result=None, detectors_fired=[], match_count=0, truncated=False,
+            )
+        encoding = r.headers.get("content-encoding", "identity").strip().lower()
+        content_type = r.headers.get("content-type", "").split(";")[0].strip().lower()
+        try:
+            if encoding not in ("", "identity"):
+                raise ValueError("compressed upstream body")
+            if content_type == "application/json" or content_type.endswith("+json"):
+                message = loads_strict(bytes(buf))
+                scanned, scan = await self._scan_message(message, policy, rpc_id)
+                if scan.match_count == 0 and not scan.truncated:
+                    out = bytes(buf)
+                else:
+                    out = json.dumps(scanned, separators=(",", ":")).encode("utf-8")
+            elif content_type == "text/event-stream":
+                events = sse.parse_events(bytes(buf))
+                with_data = [ev for ev in events if ev.data is not None]
+                messages = [loads_strict(ev.data) for ev in with_data]
+                scanned, scan = await self._scan_message(messages, policy, rpc_id)
+                if not isinstance(scanned, list):
+                    # _scan_message failed closed to a single marker message.
+                    return self._marker_response(rpc_id, UNPARSEABLE_MARKER, headers)
+                for ev, before, after in zip(with_data, messages, scanned):
+                    if after != before:
+                        ev.replace_data(json.dumps(after, separators=(",", ":")))
+                out = sse.serialize(events)
+            else:
+                raise ValueError(f"unscannable content type {content_type!r}")
+        except Exception:  # noqa: BLE001 — fail closed on anything (bad JSON, half SSE event,
+            # RecursionError from a deeply nested body). Logged without the body.
+            logger.warning("response DLP could not parse the upstream response — replacing it with a marker")
+            return self._marker_response(rpc_id, UNPARSEABLE_MARKER, headers)
+        return Response(content=out, status_code=r.status_code, headers=headers), scan
+
+    @staticmethod
+    def _marker_response(
+        rpc_id: Any, text: str, headers: dict[str, str],
+    ) -> tuple[Response, ResponseScan]:
+        marker = marker_message(sanitize_rpc_id(rpc_id), text)
+        kept = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+        return (
+            Response(content=json.dumps(marker), status_code=200, media_type="application/json", headers=kept),
+            ResponseScan(result=marker, detectors_fired=[], match_count=0, truncated=True),
         )

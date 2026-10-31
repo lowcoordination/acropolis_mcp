@@ -7,7 +7,10 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from db.models import SLUG_RE, _VALID_CREDENTIAL_MODES, DlpCustomPattern, ParamRule, ServerPolicy
+from db.models import (
+    RESPONSE_DLP_MAX_BYTES_DEFAULT, SLUG_RE, _VALID_CREDENTIAL_MODES, DlpCustomPattern, ParamRule,
+    ServerPolicy,
+)
 
 
 def _validate_slug(slug: str) -> str:
@@ -234,10 +237,18 @@ class PolicyResponse(BaseModel):
     param_rules: dict[str, dict[str, ParamRule]]
     dlp_detectors: dict[str, str] = {}
     dlp_custom_patterns: list[DlpCustomPattern] = []
+    # Issue #165: response DLP. Names and actions only — operator configuration, not secrets.
+    response_dlp_detectors: dict[str, str] = {}
+    response_dlp_max_bytes: int = RESPONSE_DLP_MAX_BYTES_DEFAULT
+
+    # A new ServerPolicy field has to be added here on purpose, not leak out by default.
+    model_config = ConfigDict(extra="forbid")
 
 
 class PolicyUpdateRequest(ServerPolicy):
-    pass
+    # Issue #165: a typo'd field name (`response_dlp_detector`) is a 422, not silently dropped
+    # while the operator believes response DLP is on.
+    model_config = ConfigDict(extra="forbid")
 
 
 class ServerToolResponse(BaseModel):
@@ -547,6 +558,22 @@ class AuditEventResponse(BaseModel):
     dlp_detector: Optional[str] = None  # enterprise #10 — which detector fired, if any
     dlp_action: Optional[str] = None  # "block" | "redact" — never the matched/redacted value
     dlp_match_count: Optional[int] = None
+    # Issue #165 (response DLP): names and counts only. None when response DLP was off.
+    response_dlp_detectors_fired: Optional[list[str]] = None
+    response_dlp_match_count: Optional[int] = None
+    response_truncated: Optional[bool] = None
+
+    # A new audit_events column must be added here on purpose: GET /audit builds this model from
+    # SELECT *, so an unknown column is a loud failure instead of a field that leaks or vanishes.
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("response_dlp_detectors_fired", mode="before")
+    @classmethod
+    def _split_detectors(cls, value):
+        # Stored comma-joined (TEXT); '' means scanned and nothing fired.
+        if isinstance(value, str):
+            return [name for name in value.split(",") if name]
+        return value
 
 
 class AdminEventResponse(BaseModel):

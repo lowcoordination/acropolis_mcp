@@ -11,22 +11,30 @@ and update that doc if argus/dlp.py's detector set or matching strategy changes 
 Shares the stats/timing/argument machinery with the other benches via tests/bench/_harness.py
 (the epic's harness issue).
 
-Scope note: this measures ARGUMENT scanning only, matching the PR's scope (see docs/dlp.md).
-The "extrapolated response-scanning cost" section applies the same per-KB scanning rate to
-response-sized payloads to produce the honest, documented finding behind the decision to defer
-response scanning to a future, benchmark-gated PR — it does not benchmark a real response-body
-scanning implementation, because none exists yet.
+Two parts. ARGUMENT scanning (evaluate(), on vs off). RESPONSE scanning (issue #165): measured,
+replacing the earlier extrapolation. It runs argus.response_dlp.scan_result with all eleven
+built-ins on `kubectl logs`-shaped results at 10 KB, 100 KB and 1 MB, and prints a per-detector
+breakdown at 100 KB. The spec's gate (Verification 7) is 100 KB p99 <= 11 ms (2x the 5.5 ms
+projection).
+
+End to end, optionally: `--e2e http://127.0.0.1:18000 ON_SLUG OFF_SLUG` times a passthrough
+tools/call through a running Acropolis to a fixture upstream whose `logs` tool returns `size`
+bytes when called with {"kind": "big", "size": N}, with response DLP on (ON_SLUG) and off.
 """
 from __future__ import annotations
 
 import asyncio
+import random
 import statistics
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from argus.dlp import BUILTIN_DETECTORS  # noqa: E402
 from argus.policy import evaluate  # noqa: E402
+from argus.response_dlp import scan_result  # noqa: E402
 from db.models import DlpCustomPattern, ServerPolicy  # noqa: E402
 from tests.bench._harness import (  # noqa: E402
     iters, percentile, print_latency_table, representative_arguments, time_call,
@@ -115,21 +123,126 @@ async def main() -> None:
         custom_results,
     )
 
-    # Extrapolation for the response-scanning deferral decision (see docs/dlp.md). Uses the
-    # BUILT-IN-ONLY "large" cell's added-latency-per-KB as the scanning rate (the realistic
-    # profile most servers run — custom patterns are an explicit opt-in with a fundamentally
-    # different, spawn-dominated cost shape that doesn't scale with payload size the same way)
-    # and projects it out to representative response payload sizes. This is a projection from
-    # argument-scanning measurements, NOT a benchmark of an actual response-scanning
-    # implementation — flagged explicitly here and in the doc so the number is never mistaken
-    # for a real measurement.
-    large = builtin_results[-1]
-    added_p99_per_kb = (large["on_p99"] - large["off_p99"]) / (large["arg_bytes"] / 1024)
-    print("\nExtrapolation for response-scanning cost (NOT a real benchmark — see docs/dlp.md):")
-    print(f"  (based on built-in-detector-only scanning rate: {added_p99_per_kb:.4f}ms added p99 per KB)")
-    for response_kb in (10, 100, 1000):
-        projected_ms = added_p99_per_kb * response_kb
-        print(f"  {response_kb:>5} KB response -> ~{projected_ms:.2f}ms added p99 (projected)")
+    await bench_responses()
+    if "--e2e" in sys.argv:
+        k = sys.argv.index("--e2e")
+        await bench_e2e(*sys.argv[k + 1:k + 4])
+
+
+# --------------------------------------------------------------------------- response DLP
+
+RESPONSE_ITERATIONS = {10: iters(300, 5), 100: iters(150, 5), 1000: iters(30, 2)}
+
+# Spec Verification 7, as revised by Amendment 1 (approved 2026-10-29). The original rule (all 11
+# built-ins, 100 KB p99 <= 11 ms) came from an extrapolation that the six argument-era detectors
+# alone already miss. The gate now measures the recommended response set (Secrets-7), plus a
+# linearity check that catches a pattern starting to backtrack.
+SECRETS_7 = (
+    "bearer_token", "jwt", "github_token", "secret_assignment", "url_credentials",
+    "aws_access_key", "private_key_pem",
+)
+GATE_SECRETS_100KB_P99_MS = 15.0
+GATE_SECRETS_1MB_MAX_MS = 150.0
+GATE_ALL_LINEARITY = 12.0  # all 11: 1 MB p50 / 100 KB p50
+
+# Budget above the largest size, so these measure scanning, not truncation.
+ALL_BUILTINS_RESPONSE_POLICY = ServerPolicy(
+    response_dlp_detectors={name: "redact" for name in BUILTIN_DETECTORS},
+    response_dlp_max_bytes=16_777_216,
+)
+SECRETS_7_RESPONSE_POLICY = ServerPolicy(
+    response_dlp_detectors={name: "redact" for name in SECRETS_7},
+    response_dlp_max_bytes=16_777_216,
+)
+
+
+def kubectl_logs(n_bytes: int, seed: int = 7) -> str:
+    """Log lines shaped like a Java service's `kubectl logs`: timestamps, thread names, paths,
+    request ids, durations, a user email per line (pessimistic for the email detector), and a
+    planted secret roughly every 100 lines."""
+    rng = random.Random(seed)
+    lines, size, i = [], 0, 0
+    while size < n_bytes:
+        if i % 100 == 99:
+            line = f"2026-10-28T12:00:00.000Z WARN  [main] c.example.Db - retry dsn=postgres://app:s3cr3tpw@db:5432/items\n"
+        else:
+            line = (
+                f"2026-10-28T12:{i % 60:02d}:{i % 60:02d}.{i % 1000:03d}Z INFO  [http-nio-8080-exec-{i % 16}] "
+                f"c.example.api.ItemController - GET /api/v1/items/{rng.randint(1, 99999)} status=200 "
+                f"dur={rng.randint(1, 900)}ms req_id={rng.getrandbits(64):016x} user=user{i % 50}@example.com\n"
+            )
+        lines.append(line)
+        size += len(line)
+        i += 1
+    return "".join(lines)[:n_bytes]
+
+
+def _tools_call_result(text: str) -> dict:
+    return {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": text}], "isError": False}}
+
+
+async def _bench_response_set(label: str, policy: ServerPolicy) -> dict[int, tuple[float, float]]:
+    """Returns {kb: (p50, tail)}; tail is p99 with >= 100 samples, else max."""
+    print(f"\nResponse DLP: scan_result, {label}, kubectl-logs-shaped text\n")
+    print(f"{'size':>8} {'iters':>6} {'p50 ms':>9} {'tail ms':>9}")
+    out = {}
+    for kb in (10, 100, 1000):
+        message = _tools_call_result(kubectl_logs(kb * 1024))
+        n = RESPONSE_ITERATIONS[kb]
+        await time_call(lambda: scan_result(message, policy), iters(5, 1))
+        samples = await time_call(lambda: scan_result(message, policy), n)
+        tail = percentile(samples, 99) if n >= 100 else max(samples)
+        out[kb] = (statistics.median(samples), tail)
+        print(f"{kb:>6}KB {n:>6} {out[kb][0]:>9.2f} {tail:>9.2f}  ({'p99' if n >= 100 else 'max'})")
+    return out
+
+
+async def bench_responses() -> None:
+    secrets = await _bench_response_set(f"secrets-7 ({', '.join(SECRETS_7)})", SECRETS_7_RESPONSE_POLICY)
+    everything = await _bench_response_set(f"all {len(BUILTIN_DETECTORS)} built-ins (recorded, not gated)",
+                                           ALL_BUILTINS_RESPONSE_POLICY)
+
+    text = kubectl_logs(100 * 1024)
+    print("\nPer detector at 100 KB (finditer + validator, ms per pass):")
+    for name, detector in BUILTIN_DETECTORS.items():
+        start = time.perf_counter()
+        for _ in range(20):
+            for m in detector.pattern.finditer(text):
+                if detector.validator is not None:
+                    detector.validator(m.group(0))
+        print(f"  {name:<22} {(time.perf_counter() - start) * 1000 / 20:7.2f}")
+
+    ratio = everything[1000][0] / everything[100][0]
+    checks = [
+        ("(a) secrets-7 100 KB p99", secrets[100][1], GATE_SECRETS_100KB_P99_MS, "ms"),
+        ("(a) secrets-7 1 MB max", secrets[1000][1], GATE_SECRETS_1MB_MAX_MS, "ms"),
+        ("(b) all-11 1 MB / 100 KB p50", ratio, GATE_ALL_LINEARITY, "x"),
+    ]
+    print("\nGate (spec Verification 7, Amendment 1):")
+    for name, value, limit, unit in checks:
+        print(f"  {name:<30} {value:8.2f} {unit} <= {limit:g} {unit} -> {'PASS' if value <= limit else 'FAIL'}")
+    print(f"  overall -> {'PASS' if all(v <= l for _, v, l, _ in checks) else 'FAIL'}")
+
+
+async def bench_e2e(base_url: str, on_slug: str, off_slug: str) -> None:
+    import httpx
+
+    print(f"\nEnd to end through {base_url} (passthrough tools/call, fixture upstream)\n")
+    print(f"{'size':>8} {'off p50':>9} {'on p50':>9} {'added p50':>10}")
+    async with httpx.AsyncClient(base_url=base_url, timeout=60) as client:
+        for kb in (10, 100, 1000):
+            body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "logs", "arguments": {"kind": "big", "size": kb * 1024}}}
+            results = {}
+            for slug in (off_slug, on_slug):
+                async def call():
+                    r = await client.post(f"/mcp/{slug}/mcp", json=body,
+                                          headers={"Accept": "application/json, text/event-stream"})
+                    r.raise_for_status()
+                n = 40 if kb < 1000 else 10
+                await time_call(call, 3)
+                results[slug] = statistics.median(await time_call(call, n))
+            print(f"{kb:>6}KB {results[off_slug]:>9.2f} {results[on_slug]:>9.2f} {results[on_slug] - results[off_slug]:>10.2f}")
 
 
 if __name__ == "__main__":

@@ -73,8 +73,18 @@ export type DlpDetectorName =
   | 'aws_access_key'
   | 'private_key_pem'
   | 'high_entropy_string'
+  | 'bearer_token'
+  | 'jwt'
+  | 'github_token'
+  | 'secret_assignment'
+  | 'url_credentials'
 
 export type DlpAction = 'allow' | 'redact' | 'block'
+// Issue #165: responses can be redacted or let through, never blocked (the backend returns 422).
+export type ResponseDlpAction = 'allow' | 'redact'
+export const RESPONSE_DLP_MAX_BYTES_DEFAULT = 1_048_576
+export const RESPONSE_DLP_MAX_BYTES_MIN = 1024
+export const RESPONSE_DLP_MAX_BYTES_MAX = 16_777_216
 
 export const DLP_DETECTORS: { name: DlpDetectorName; label: string }[] = [
   { name: 'credit_card', label: 'Credit card number (Luhn-validated)' },
@@ -83,6 +93,11 @@ export const DLP_DETECTORS: { name: DlpDetectorName; label: string }[] = [
   { name: 'aws_access_key', label: 'AWS access key ID' },
   { name: 'private_key_pem', label: 'PEM private key header' },
   { name: 'high_entropy_string', label: 'Generic high-entropy string (likely a secret)' },
+  { name: 'bearer_token', label: 'HTTP Bearer token' },
+  { name: 'jwt', label: 'JSON Web Token' },
+  { name: 'github_token', label: 'GitHub token (classic or fine-grained)' },
+  { name: 'secret_assignment', label: 'Secret-named key with a value (password=, token:, ...)' },
+  { name: 'url_credentials', label: 'Password in a URL (scheme://user:password@host)' },
 ]
 
 export interface DlpCustomPattern {
@@ -99,6 +114,8 @@ export interface PolicyResponse {
   param_rules: Record<string, Record<string, ParamRule>>
   dlp_detectors: Record<string, DlpAction>
   dlp_custom_patterns: DlpCustomPattern[]
+  response_dlp_detectors: Record<string, ResponseDlpAction>
+  response_dlp_max_bytes: number
 }
 
 export type QuotaPeriod = 'day' | 'month'
@@ -214,6 +231,10 @@ export interface AuditEvent {
   dlp_detector: string | null
   dlp_action: DlpAction | null
   dlp_match_count: number | null
+  // #165: response DLP. Names and counts only; null when response DLP was off.
+  response_dlp_detectors_fired?: string[] | null
+  response_dlp_match_count?: number | null
+  response_truncated?: boolean | null
   // #123: null = real gateway traffic; 'test' = Try-it; 'local:<key>[/<harness>@<host>]' = a
   // local-execution evaluation. The backend has returned this since migration 0004 but nothing
   // in the SPA read it until the origin filter landed.

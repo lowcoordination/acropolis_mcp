@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from pydantic import BaseModel, PrivateAttr, field_validator
+from pydantic import BaseModel, PrivateAttr, field_validator, model_validator
 
 # #112: re2 fast path for operator patterns. re2 (google-re2) guarantees linear-time matching —
 # a pattern it accepts CANNOT catastrophically backtrack — so argus/policy.py matches those
@@ -171,8 +171,17 @@ _VALID_DLP_ACTIONS = {"allow", "redact", "block"}
 # above).
 _VALID_DLP_DETECTOR_NAMES = {
     "credit_card", "email", "us_ssn", "aws_access_key", "private_key_pem", "high_entropy_string",
+    # Issue #165 (response DLP): secrets as they appear in logs and ConfigMaps.
+    "bearer_token", "jwt", "github_token", "secret_assignment", "url_credentials",
 }
 _MAX_CUSTOM_PATTERN_LENGTH = 200
+# Issue #165 (response DLP): a response can be redacted or let through, never blocked. Blocking
+# a response would fail the call AFTER the upstream has already acted on it, and a call that
+# fails on a false positive is worse than one that comes back redacted.
+_VALID_RESPONSE_DLP_ACTIONS = {"allow", "redact"}
+RESPONSE_DLP_MAX_BYTES_DEFAULT = 1_048_576
+RESPONSE_DLP_MAX_BYTES_MIN = 1024
+RESPONSE_DLP_MAX_BYTES_MAX = 16_777_216
 
 
 class DlpCustomPattern(BaseModel):
@@ -222,6 +231,14 @@ class ServerPolicy(BaseModel):
     # UNTRUSTED input — see argus/dlp.py's module docstring on why every match against these
     # goes through the F2 ReDoS-safe forkserver path, never raw `re`.
     dlp_custom_patterns: list[DlpCustomPattern] = []
+    # Issue #165 (response DLP): name -> "redact" | "allow" for tools/call RESPONSES. A name is
+    # a built-in detector or a dlp_custom_patterns entry; for a custom pattern the action here
+    # applies on responses, never the pattern's own (argument) action. Empty (the default)
+    # means responses are forwarded exactly as today, on both forwarding paths.
+    response_dlp_detectors: dict[str, str] = {}
+    # Scan budget in UTF-8 bytes of string content. Over it, the longest strings are cut with a
+    # marker; past HARD_CEILING_FACTOR times it, Acropolis stops reading (argus/response_dlp.py).
+    response_dlp_max_bytes: int = RESPONSE_DLP_MAX_BYTES_DEFAULT
 
     @field_validator("mode")
     @classmethod
@@ -259,6 +276,45 @@ class ServerPolicy(BaseModel):
             if action not in _VALID_DLP_ACTIONS:
                 raise ValueError(f"dlp_detectors[{name!r}] action must be one of {sorted(_VALID_DLP_ACTIONS)}, got {action!r}")
         return detectors
+
+    @field_validator("response_dlp_detectors")
+    @classmethod
+    def _validate_response_dlp_actions(cls, detectors: dict[str, str]) -> dict[str, str]:
+        for name, action in detectors.items():
+            if action == "block":
+                raise ValueError(
+                    f"response_dlp_detectors[{name!r}]: block is not allowed for responses "
+                    f"(use redact or allow)"
+                )
+            if action not in _VALID_RESPONSE_DLP_ACTIONS:
+                raise ValueError(
+                    f"response_dlp_detectors[{name!r}] action must be one of "
+                    f"{sorted(_VALID_RESPONSE_DLP_ACTIONS)}, got {action!r}"
+                )
+        return detectors
+
+    @field_validator("response_dlp_max_bytes")
+    @classmethod
+    def _validate_response_dlp_max_bytes(cls, value: int) -> int:
+        if not RESPONSE_DLP_MAX_BYTES_MIN <= value <= RESPONSE_DLP_MAX_BYTES_MAX:
+            raise ValueError(
+                f"response_dlp_max_bytes must be between {RESPONSE_DLP_MAX_BYTES_MIN} and "
+                f"{RESPONSE_DLP_MAX_BYTES_MAX}, got {value}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_response_dlp_names(self) -> "ServerPolicy":
+        # Needs both fields, so it runs after field validation: a response key may name a
+        # built-in or one of THIS policy's custom patterns.
+        custom_names = {p.name for p in self.dlp_custom_patterns}
+        for name in self.response_dlp_detectors:
+            if name not in _VALID_DLP_DETECTOR_NAMES and name not in custom_names:
+                raise ValueError(
+                    f"unknown response dlp detector {name!r}: not a built-in "
+                    f"({sorted(_VALID_DLP_DETECTOR_NAMES)}) or a dlp_custom_patterns name"
+                )
+        return self
 
 
 # Issue #134 (upstream token auth): the three mechanisms by which Acropolis can authenticate to

@@ -1,6 +1,11 @@
 import { useState } from 'react'
-import { DLP_DETECTORS } from '../api/types'
-import type { DlpAction, DlpCustomPattern } from '../api/types'
+import {
+  DLP_DETECTORS,
+  RESPONSE_DLP_MAX_BYTES_DEFAULT,
+  RESPONSE_DLP_MAX_BYTES_MAX,
+  RESPONSE_DLP_MAX_BYTES_MIN,
+} from '../api/types'
+import type { DlpAction, DlpCustomPattern, ResponseDlpAction } from '../api/types'
 
 const ACTIONS: DlpAction[] = ['allow', 'redact', 'block']
 
@@ -167,6 +172,111 @@ export function DlpEditor({
           hanging the request.
         </p>
       </div>
+    </div>
+  )
+}
+
+const RESPONSE_ACTIONS: ResponseDlpAction[] = ['redact', 'allow']
+
+/**
+ * Issue #165: response DLP. Same detector list as arguments, plus this server's custom patterns
+ * by name; only redact/allow (a response is never blocked). Off means absent from the map, as
+ * for arguments, and an empty map forwards responses exactly as before.
+ */
+export function ResponseDlpEditor({
+  detectors,
+  maxBytes,
+  customPatternNames,
+  onChange,
+}: {
+  detectors: Record<string, ResponseDlpAction>
+  maxBytes: number
+  customPatternNames: string[]
+  onChange: (detectors: Record<string, ResponseDlpAction>, maxBytes: number) => void
+}) {
+  const [budgetText, setBudgetText] = useState(String(maxBytes))
+  const budget = Number(budgetText)
+  const budgetValid =
+    Number.isInteger(budget) && budget >= RESPONSE_DLP_MAX_BYTES_MIN && budget <= RESPONSE_DLP_MAX_BYTES_MAX
+
+  function toggle(name: string, enabled: boolean) {
+    const next = { ...detectors }
+    if (enabled) {
+      next[name] = 'redact'
+    } else {
+      delete next[name]
+    }
+    onChange(next, maxBytes)
+  }
+
+  const rows: { name: string; label: string; custom: boolean }[] = [
+    ...DLP_DETECTORS.map(({ name, label }) => ({ name: name as string, label, custom: false })),
+    ...customPatternNames.map((name) => ({ name, label: `Custom pattern: ${name}`, custom: true })),
+  ]
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+        Scan tools/call responses before they reach the caller. "redact" replaces the matched value;
+        a response is never blocked. Responses larger than the scan budget are cut, with a marker,
+        and anything past 8x the budget is not read at all. Other methods (tools/list, resources)
+        are never scanned.
+      </p>
+      <ul className="space-y-1.5">
+        {rows.map(({ name, label, custom }) => {
+          const enabled = name in detectors
+          return (
+            <li key={`${custom ? 'c' : 'b'}:${name}`} className="flex items-center justify-between gap-3 text-xs">
+              <label className="flex items-center gap-2 min-w-0">
+                <input
+                  type="checkbox"
+                  aria-label={`Scan responses: ${label}`}
+                  checked={enabled}
+                  onChange={(e) => toggle(name, e.target.checked)}
+                />
+                <span className={custom ? 'truncate font-mono' : 'truncate'}>{label}</span>
+              </label>
+              {enabled && (
+                <select
+                  className="rounded px-2 py-1 text-xs"
+                  aria-label={`Response action: ${label}`}
+                  value={detectors[name]}
+                  onChange={(e) => onChange({ ...detectors, [name]: e.target.value as ResponseDlpAction }, maxBytes)}
+                >
+                  {RESPONSE_ACTIONS.map((action) => (
+                    <option key={action} value={action}>
+                      {action}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </li>
+          )
+        })}
+      </ul>
+      <label className="flex items-center gap-2 text-xs">
+        <span>Scan budget (bytes)</span>
+        <input
+          type="number"
+          className="rounded px-2 py-1 text-xs font-mono w-36"
+          min={RESPONSE_DLP_MAX_BYTES_MIN}
+          max={RESPONSE_DLP_MAX_BYTES_MAX}
+          step={1}
+          value={budgetText}
+          onChange={(e) => {
+            setBudgetText(e.target.value)
+            const n = Number(e.target.value)
+            if (Number.isInteger(n) && n >= RESPONSE_DLP_MAX_BYTES_MIN && n <= RESPONSE_DLP_MAX_BYTES_MAX) {
+              onChange(detectors, n)
+            }
+          }}
+        />
+        <span style={{ color: budgetValid ? 'var(--text-muted)' : 'var(--danger)' }}>
+          {budgetValid
+            ? `default ${RESPONSE_DLP_MAX_BYTES_DEFAULT.toLocaleString()}`
+            : `between ${RESPONSE_DLP_MAX_BYTES_MIN.toLocaleString()} and ${RESPONSE_DLP_MAX_BYTES_MAX.toLocaleString()}`}
+        </span>
+      </label>
     </div>
   )
 }

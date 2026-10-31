@@ -45,6 +45,19 @@ function EventRow({ event }: { event: AuditEvent }) {
               {event.dlp_match_count ? `, ${event.dlp_match_count} match(es)` : ''})
             </div>
           )}
+          {event.response_dlp_detectors_fired != null && (
+            // #165: names and counts only, same rule as argument DLP above.
+            <div>
+              Response DLP:{' '}
+              {event.response_dlp_detectors_fired.length > 0 ? (
+                <span className="font-mono">{event.response_dlp_detectors_fired.join(', ')}</span>
+              ) : (
+                'nothing found'
+              )}
+              {event.response_dlp_match_count ? ` (${event.response_dlp_match_count} match(es))` : ''}
+              {event.response_truncated ? ', truncated' : ''}
+            </div>
+          )}
           {event.args_summary && <div className="font-mono break-all">Args: {event.args_summary}</div>}
           {event.origin && <div className="font-mono">Origin: {event.origin}</div>}
           {!!event.bridged && <div>Bridged (2026 stateless client)</div>}

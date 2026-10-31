@@ -95,3 +95,52 @@ async def test_parity_with_full_policy(server_repo):
     assert loaded.param_rules["tool_b"]["secret"].denied is True
     assert loaded.dlp_detectors == {"credit_card": "block", "email": "redact"}
     assert [p.name for p in loaded.dlp_custom_patterns] == ["aws-key"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #165: response DLP settings ride in the same dlp_config JSON.
+# ---------------------------------------------------------------------------
+
+from db.repo import _decode_dlp_config, _encode_dlp_config  # noqa: E402
+
+
+def test_argument_only_policy_encodes_exactly_as_before():
+    """Argument DLP is provably untouched: same literal JSON as master (0ee0b44)."""
+    policy = ServerPolicy(
+        dlp_detectors={"credit_card": "block"},
+        dlp_custom_patterns=[DlpCustomPattern(name="emp", pattern=r"EMP-\d{6}", action="redact")],
+    )
+    assert _encode_dlp_config(policy) == (
+        '{"detectors": {"credit_card": "block"}, '
+        '"custom_patterns": [{"name": "emp", "pattern": "EMP-\\\\d{6}", "action": "redact"}]}'
+    )
+    assert _encode_dlp_config(ServerPolicy()) is None
+
+
+def test_old_row_without_response_keys_decodes_to_off():
+    decoded = _decode_dlp_config('{"detectors": {"email": "redact"}, "custom_patterns": []}')
+    assert decoded.response_detectors == {}
+    assert decoded.response_max_bytes == 1_048_576
+    assert decoded.detectors == {"email": "redact"}
+
+
+def test_response_settings_round_trip_through_dlp_config():
+    policy = ServerPolicy(response_dlp_detectors={"jwt": "redact", "email": "allow"}, response_dlp_max_bytes=65536)
+    raw = _encode_dlp_config(policy)
+    assert raw is not None  # response-only config must not collapse to NULL
+    decoded = _decode_dlp_config(raw)
+    assert decoded.response_detectors == {"jwt": "redact", "email": "allow"}
+    assert decoded.response_max_bytes == 65536
+
+
+async def test_response_settings_persist_through_set_and_get_policy(server_repo):
+    server = await server_repo.create(slug="resp", name="resp", upstream_url="http://upstream:4")
+    await server_repo.set_policy(server.id, ServerPolicy(
+        dlp_custom_patterns=[DlpCustomPattern(name="emp", pattern=r"EMP-\d{6}", action="block")],
+        response_dlp_detectors={"jwt": "redact", "emp": "redact"},
+        response_dlp_max_bytes=2048,
+    ))
+    await _assert_parity(server_repo, server.id)
+    policy = await server_repo.get_policy(server.id)
+    assert policy.response_dlp_detectors == {"jwt": "redact", "emp": "redact"}
+    assert policy.response_dlp_max_bytes == 2048
