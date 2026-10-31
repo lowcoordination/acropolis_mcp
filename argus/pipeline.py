@@ -29,7 +29,10 @@ from argus.headers import (
     header_matches_body,
     strip_hop_by_hop,
 )
-from argus.jsonrpc import HEADER_MISMATCH_ERROR, rpc_error, sanitize_rpc_id
+from argus.jsonrpc import (
+    HEADER_MISMATCH_ERROR, INVALID_REQUEST, NotASingleMessage, parse_single_message, rpc_error,
+    sanitize_rpc_id,
+)
 from argus.metering import Metering
 from argus.policy import Decision, evaluate
 from argus.rate_limiter import RateLimiterRegistry
@@ -54,6 +57,10 @@ if TYPE_CHECKING:
     from stoa.webhooks import WebhookDispatcher
 
 logger = logging.getLogger("argus.pipeline")
+
+
+# Audit `rule` for a body refused because it is not one JSON-RPC object (#166).
+SINGLE_MESSAGE_RULE = "single_message"
 
 
 def _client_ip(request: Request) -> Optional[str]:
@@ -400,103 +407,116 @@ class Pipeline:
         scan_policy: Optional[ServerPolicy] = None
         pending_audit: Optional[dict] = None
 
+        # Only POST carries a JSON-RPC message in Streamable HTTP. GET/DELETE are bodiless and
+        # PUT/PATCH are not MCP at all, but _forward relays request.method and the raw body as
+        # given, so a tools/call body on any other method would skip enforcement (#166).
+        if request.method != "POST" and body_bytes:
+            return await self._refuse(
+                server_slug=server.slug, tool=None, rpc_id=None,
+                message=f"a request body is only accepted on POST, not {request.method}",
+                code=INVALID_REQUEST, status=400, rule=SINGLE_MESSAGE_RULE,
+                api_key_id=api_key_id, start=start, client_ip=client_ip, origin=origin,
+                endpoint="per-server", status_code=400,
+            )
+
         if request.method == "POST" and body_bytes:
+            # Fail closed (#166). A body that is not exactly one JSON-RPC object (a batch, a
+            # bare scalar, unparseable bytes) used to fall through to _forward untouched,
+            # which skipped _enforce: a denylisted call wrapped in [...] reached the upstream
+            # with no BLOCKED row. No MCP version Acropolis speaks allows batches.
             try:
-                body_json = json.loads(body_bytes)
-            except json.JSONDecodeError:
-                body_json = None
+                body_json = parse_single_message(body_bytes)
+            except NotASingleMessage as e:
+                return await self._refuse(
+                    server_slug=server.slug, tool=None, rpc_id=None, message=e.reason,
+                    code=e.code, status=400, rule=SINGLE_MESSAGE_RULE, api_key_id=api_key_id,
+                    start=start, client_ip=client_ip, origin=origin,
+                    endpoint="per-server", status_code=400,
+                )
 
-            # A JSON-RPC batch (a top-level array — spec-legal) or a bare top-level JSON
-            # string/number both parse successfully but aren't a dict, and body_json.get(...)
-            # below would raise AttributeError. Treat anything non-dict the same as
-            # unparseable — falls through to the passthrough/forward path below with
-            # rpc_method="" untouched, rather than inventing new handling.
-            if not isinstance(body_json, dict):
-                body_json = None
+            rpc_id = body_json.get("id")
+            rpc_method = body_json.get("method", "")
+            params = body_json.get("params", {}) or {}
+            body_name = extract_name_from_params(rpc_method, params)
 
-            if body_json is not None:
-                rpc_id = body_json.get("id")
-                rpc_method = body_json.get("method", "")
-                params = body_json.get("params", {}) or {}
-                body_name = extract_name_from_params(rpc_method, params)
+            # Header/body consistency is only meaningful when headers were actually sent by
+            # the real client — skip it for a forced (aggregate-originated) dispatch, since
+            # the rewritten body's tool name legitimately won't match the ORIGINAL request's
+            # (still-namespaced) Mcp-Name header, if one was even present.
+            if force_generation is None:
+                mismatch_response = await self._check_header_consistency(
+                    request, rpc_method, body_name, server=server,
+                    api_key_id=api_key_id, start=start, client_ip=client_ip,
+                )
+                if mismatch_response is not None:
+                    return mismatch_response
 
-                # Header/body consistency is only meaningful when headers were actually sent by
-                # the real client — skip it for a forced (aggregate-originated) dispatch, since
-                # the rewritten body's tool name legitimately won't match the ORIGINAL request's
-                # (still-namespaced) Mcp-Name header, if one was even present.
-                if force_generation is None:
-                    mismatch_response = await self._check_header_consistency(
-                        request, rpc_method, body_name, server=server,
-                        api_key_id=api_key_id, start=start, client_ip=client_ip,
-                    )
-                    if mismatch_response is not None:
-                        return mismatch_response
+            # TWO forwarding paths fork below, decided by detect_client_generation
+            # (presence of the Mcp-Method header; argus/generation.py):
+            #
+            #   GEN_2025 -> _forward (line ~900): raw byte proxy. Streams the upstream
+            #       response back verbatim (aiter_raw + BackgroundTask(r.aclose)), strips
+            #       hop-by-hop and credential headers, keeps no upstream session. Errors
+            #       surface as RoutingError(502, ...).
+            #   GEN_2026 -> _handle_bridged (line ~510): protocol translation. Buffers the
+            #       upstream body, parses SSE, re-envelopes as plain JSON, injects the
+            #       cached initialize handshake per server. Errors surface as
+            #       BridgeError(502, ...).
+            #
+            # Only GEN_2026 clients reach bridge_call; only GEN_2025 clients reach _forward.
+            # And only when a bridge is configured: if self._bridge is None the 2026 branch
+            # is skipped and even a 2026 client falls through to the passthrough path below.
+            # Do not merge the two paths — one proxies bytes, the other translates protocol
+            # generations. Their shared enforcement prelude lives in _enforce (deduped in
+            # issue #52); the paths legitimately diverge after it.
+            generation = force_generation or detect_client_generation(request)
 
-                # TWO forwarding paths fork below, decided by detect_client_generation
-                # (presence of the Mcp-Method header; argus/generation.py):
-                #
-                #   GEN_2025 -> _forward (line ~900): raw byte proxy. Streams the upstream
-                #       response back verbatim (aiter_raw + BackgroundTask(r.aclose)), strips
-                #       hop-by-hop and credential headers, keeps no upstream session. Errors
-                #       surface as RoutingError(502, ...).
-                #   GEN_2026 -> _handle_bridged (line ~510): protocol translation. Buffers the
-                #       upstream body, parses SSE, re-envelopes as plain JSON, injects the
-                #       cached initialize handshake per server. Errors surface as
-                #       BridgeError(502, ...).
-                #
-                # Only GEN_2026 clients reach bridge_call; only GEN_2025 clients reach _forward.
-                # And only when a bridge is configured: if self._bridge is None the 2026 branch
-                # is skipped and even a 2026 client falls through to the passthrough path below.
-                # Do not merge the two paths — one proxies bytes, the other translates protocol
-                # generations. Their shared enforcement prelude lives in _enforce (deduped in
-                # issue #52); the paths legitimately diverge after it.
-                generation = force_generation or detect_client_generation(request)
+            if rpc_method == "server/discover":
+                return self._handle_discover(server, rpc_id)
 
-                if rpc_method == "server/discover":
-                    return self._handle_discover(server, rpc_id)
+            if rpc_method == "tools/list" and self._tools_cache is not None:
+                return await self._handle_tools_list(server, rpc_id, api_key_id, start, client_ip)
 
-                if rpc_method == "tools/list" and self._tools_cache is not None:
-                    return await self._handle_tools_list(server, rpc_id, api_key_id, start, client_ip)
+            if generation == ClientGeneration.GEN_2026 and self._bridge is not None:
+                return await self._handle_bridged(
+                    server, rpc_method, rpc_id, params, body_json.get("_meta"),
+                    key_record, start, client_ip, origin=origin,
+                )
 
-                if generation == ClientGeneration.GEN_2026 and self._bridge is not None:
-                    return await self._handle_bridged(
-                        server, rpc_method, rpc_id, params, body_json.get("_meta"),
-                        key_record, start, client_ip, origin=origin,
-                    )
+            if rpc_method == "tools/call":
+                # Reuse the `params` local computed above (which already has the `or {}`
+                # guard) rather than re-reading body_json.get("params", {}) here — there
+                # is only one place the params-can-be-None case is guarded.
+                tool_name = params.get("name")
+                outcome = await self._enforce(
+                    server, rpc_method, rpc_id, params, tool_name, key_record,
+                    start, client_ip, origin=origin,
+                )
+                if outcome.blocked_response is not None:
+                    return outcome.blocked_response
 
-                if rpc_method == "tools/call":
-                    # Reuse the `params` local computed above (which already has the `or {}`
-                    # guard) rather than re-reading body_json.get("params", {}) here — there
-                    # is only one place the params-can-be-None case is guarded.
-                    tool_name = params.get("name")
-                    outcome = await self._enforce(
-                        server, rpc_method, rpc_id, params, tool_name, key_record,
-                        start, client_ip, origin=origin,
-                    )
-                    if outcome.blocked_response is not None:
-                        return outcome.blocked_response
-                    if outcome.policy is not None and response_dlp_enabled(outcome.policy, rpc_method):
-                        scan_policy = outcome.policy
-                        pending_audit = outcome.pending_audit
+                if outcome.policy is not None and response_dlp_enabled(outcome.policy, rpc_method):
+                    scan_policy = outcome.policy
+                    pending_audit = outcome.pending_audit
 
-                    # DLP redact: the redacted body MUST be what actually leaves the process —
-                    # re-serialize the JSON-RPC envelope with the redacted arguments substituted
-                    # in and forward THAT, never the original body_bytes.
-                    if (
-                        outcome.decision is not None
-                        and outcome.decision.dlp_redacted_arguments is not None
-                    ):
-                        rewritten = dict(body_json)
-                        rewritten_params = dict(params)
-                        rewritten_params["arguments"] = outcome.decision.dlp_redacted_arguments
-                        rewritten["params"] = rewritten_params
-                        body_bytes = json.dumps(rewritten).encode("utf-8")
-                else:
-                    await self._audit.log(
-                        server_slug=server.slug, tool=body_name, decision="PASSTHROUGH",
-                        endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
-                        latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
-                    )
+                # DLP redact: the redacted body MUST be what actually leaves the process —
+                # re-serialize the JSON-RPC envelope with the redacted arguments substituted
+                # in and forward THAT, never the original body_bytes.
+                if (
+                    outcome.decision is not None
+                    and outcome.decision.dlp_redacted_arguments is not None
+                ):
+                    rewritten = dict(body_json)
+                    rewritten_params = dict(params)
+                    rewritten_params["arguments"] = outcome.decision.dlp_redacted_arguments
+                    rewritten["params"] = rewritten_params
+                    body_bytes = json.dumps(rewritten).encode("utf-8")
+            else:
+                await self._audit.log(
+                    server_slug=server.slug, tool=body_name, decision="PASSTHROUGH",
+                    endpoint="per-server", rpc_method=rpc_method, api_key_id=api_key_id,
+                    latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
+                )
 
         # Issue #165: with response DLP on, the ALLOWED row is written after the scan, in a
         # finally so a credential or upstream failure (RoutingError) still leaves it behind.
@@ -642,7 +662,7 @@ class Pipeline:
     async def _refuse(
         self, *, server_slug, tool, rpc_id, message, status, rule, api_key_id,
         start, client_ip, data=None, reason=None, bridged=False, origin=None,
-        **audit_extra,
+        code: int = -32600, **audit_extra,
     ) -> Response:
         """Log a BLOCKED audit row and build the matching JSON-RPC error response (issue #53).
 
@@ -661,7 +681,7 @@ class Pipeline:
             bridged=bridged, origin=origin, **audit_extra,
         )
         return Response(
-            content=rpc_error(rpc_id, message, data=data),
+            content=rpc_error(rpc_id, message, code=code, data=data),
             status_code=status, media_type="application/json",
         )
 

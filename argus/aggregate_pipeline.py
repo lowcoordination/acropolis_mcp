@@ -15,8 +15,8 @@ from argus.audit import AuditLogger
 from argus.credentials import UpstreamCredentialError
 from argus.discover import synthesize_gateway_discover
 from argus.generation import ClientGeneration
-from argus.jsonrpc import rpc_error, sanitize_rpc_id
-from argus.pipeline import Pipeline, RoutingError, _client_ip
+from argus.jsonrpc import NotASingleMessage, parse_single_message, rpc_error, sanitize_rpc_id
+from argus.pipeline import SINGLE_MESSAGE_RULE, Pipeline, RoutingError, _client_ip
 from db.models import ApiKeyRecord
 from db.repo import ServerNotFoundError, ServerRepo, SettingsRepo
 
@@ -100,21 +100,17 @@ class AggregatePipeline:
                 endpoint="aggregate",
             )
 
+        # Same single-message rule as the per-server data plane (#166): a batch, a scalar or
+        # unparseable bytes is refused with an audited BLOCKED row. An empty body is a parse
+        # error here, because the aggregate endpoint has nothing to forward it to.
         try:
-            body_json = json.loads(body_bytes) if body_bytes else None
-        except json.JSONDecodeError:
-            body_json = None
-
-        # A JSON-RPC batch (top-level array — spec-legal) parses successfully but isn't a dict,
-        # so body_json.get(...) below would raise AttributeError -> unhandled 500. Treat
-        # non-dict JSON the same as unparseable JSON, matching argus/pipeline.py's _process.
-        if not isinstance(body_json, dict):
-            body_json = None
-
-        if body_json is None:
-            return Response(
-                content=rpc_error(None, "aggregate endpoint requires a JSON-RPC body"),
-                status_code=400, media_type="application/json",
+            body_json = parse_single_message(body_bytes)
+        except NotASingleMessage as e:
+            return await self._per_server._refuse(
+                server_slug=None, tool=None, rpc_id=None, message=e.reason, code=e.code,
+                status=400, rule=SINGLE_MESSAGE_RULE,
+                api_key_id=key_record.id if key_record is not None else None,
+                start=start, client_ip=client_ip, endpoint="aggregate", status_code=400,
             )
 
         rpc_id = body_json.get("id")

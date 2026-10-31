@@ -44,3 +44,45 @@ def rpc_error(rpc_id: Any, message: str, code: int = -32600, data: dict | None =
 HEADER_MISMATCH_ERROR = -32020
 MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
 UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+# JSON-RPC 2.0 standard codes
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+
+
+class NotASingleMessage(ValueError):
+    """The POST body is not exactly one JSON-RPC object (issue #166). `code` is the JSON-RPC
+    error code to serve; `reason` is safe to return to the client and to audit."""
+
+    def __init__(self, code: int, reason: str):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+def parse_single_message(body_bytes: bytes) -> dict:
+    """Parse a data-plane POST body that must hold exactly one JSON-RPC message.
+
+    Every MCP version Acropolis speaks (2025-06-18, 2026-07-28) says the Streamable HTTP POST
+    body MUST be a single JSON-RPC request, notification or response; 2025-06-18 removed
+    batching. Anything else is refused, never forwarded. The data plane used to forward
+    whatever it could not read as an object, and that skipped all enforcement (#166).
+
+    ValueError covers JSONDecodeError and UnicodeDecodeError (invalid UTF-8). RecursionError
+    is what json.loads raises for deeply nested arrays, well under max_body_bytes.
+    """
+    try:
+        parsed = json.loads(body_bytes)
+    except (ValueError, RecursionError):
+        raise NotASingleMessage(
+            PARSE_ERROR, "Parse error: body is not UTF-8 JSON, or is nested too deeply",
+        ) from None
+    if isinstance(parsed, list):
+        raise NotASingleMessage(
+            INVALID_REQUEST,
+            "JSON-RPC batching is not supported (removed in MCP 2025-06-18); "
+            "send one message per request",
+        )
+    if not isinstance(parsed, dict):
+        raise NotASingleMessage(INVALID_REQUEST, "body must be a single JSON-RPC object")
+    return parsed
