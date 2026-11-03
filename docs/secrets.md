@@ -230,8 +230,8 @@ client then trusts **only** the CA(s) in that file for this one connection, so p
 trusted for the secret server, and the server name is still checked against the certificate. It
 needs an `https://` `VAULT_ADDR` (a CA file beside a plain `http://` address is a startup error,
 because it would look like transport security and give none), cannot be combined with an injected
-client, and an unreadable, empty or non-PEM file is a startup error that names the path and never
-echoes the file. The file is read once at startup, so replacing the CA certificate needs a restart.
+client, and an unreadable, empty, non-PEM, non-regular (a FIFO would otherwise hang startup) or
+over-1-MiB file is a startup error that names the path and never echoes the file. The file is read once at startup, so replacing the CA certificate needs a restart.
 This does not touch `SSL_CERT_FILE` or any other client in the process. The server's certificate
 must carry an Authority Key Identifier (any normal CA adds one; a hand-rolled `openssl x509 -req`
 template may not), because current Python's default verification rejects a leaf without it (observed on 3.14).

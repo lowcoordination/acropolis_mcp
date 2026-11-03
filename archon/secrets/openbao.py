@@ -137,15 +137,36 @@ def parse_vault_ref(ref: str) -> VaultRef:
     return VaultRef(mount=mount, path=path, key=key)
 
 
+MAX_CA_FILE_BYTES = 1024 * 1024  # a CA bundle is a few KiB; this only bounds a mis-pointed path
+
+
 def _ssl_context_from_ca_file(path: str) -> ssl.SSLContext:
     """A verifying TLS context that trusts exactly the certificates in `path`.
 
-    Passing `cafile` to `create_default_context` loads that file INSTEAD of the system bundle,
-    and hostname checking stays on: a certificate from this CA is still rejected if it is for a
-    different name. Errors name the path and the kind of failure, never the file's contents (a
-    mis-pointed setting can land on a private key)."""
+    Passing `cadata` to `create_default_context` loads that INSTEAD of the system bundle, and
+    hostname checking stays on: a certificate from this CA is still rejected if it is for a
+    different name. The file is opened non-blocking and checked with fstat BEFORE reading (a FIFO
+    with no writer would otherwise hang startup forever), read once, and loaded from memory so
+    what was checked is what is trusted. Errors name the path and the kind of failure, never the
+    file's contents (a mis-pointed setting can land on a private key)."""
     try:
-        context = ssl.create_default_context(cafile=path)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OpenBaoConfigError(f"ca_file {path!r} is not a regular file")
+            raw = b""
+            while len(raw) <= MAX_CA_FILE_BYTES:
+                chunk = _read(fd, MAX_CA_FILE_BYTES + 1 - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            os.close(fd)
+        if len(raw) > MAX_CA_FILE_BYTES:
+            raise OpenBaoConfigError(f"ca_file {path!r} is too large (over {MAX_CA_FILE_BYTES} bytes)")
+        context = ssl.create_default_context(cadata=raw.decode("ascii"))
+    except UnicodeDecodeError:
+        raise OpenBaoConfigError(f"ca_file {path!r} is not a PEM bundle of CA certificates") from None
     except (OSError, ssl.SSLError) as e:
         reason = e.strerror if isinstance(e, OSError) and e.strerror else type(e).__name__
         raise OpenBaoConfigError(f"ca_file {path!r} is not a usable PEM bundle of CA certificates: {reason}") from None

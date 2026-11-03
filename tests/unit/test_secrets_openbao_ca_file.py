@@ -16,6 +16,7 @@ import datetime
 import ipaddress
 import json
 import logging
+import os
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -208,6 +209,44 @@ def test_an_unusable_ca_file_fails_at_construction(tmp_path, content):
     with pytest.raises(OpenBaoConfigError) as e:
         OpenBaoSecretProvider("https://127.0.0.1:8200", token="t", ca_file=str(path))
     assert "ca_file" in str(e.value)
+
+
+def test_a_fifo_is_refused_not_blocked_on(tmp_path):
+    """Loading a FIFO with no writer blocks forever, which would hang startup instead of failing
+    it. Same rule as the credential files: only a regular file is read."""
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    result: list = []
+
+    def build():
+        try:
+            OpenBaoSecretProvider("https://127.0.0.1:8200", token="t", ca_file=str(fifo))
+        except Exception as e:  # noqa: BLE001 - the type is asserted below
+            result.append(e)
+
+    t = threading.Thread(target=build, daemon=True)
+    t.start()
+    t.join(timeout=3.0)
+    try:
+        hung = t.is_alive()
+    finally:
+        # If a regression left the thread opening the FIFO, release it so the test FAILS instead
+        # of leaving a stuck thread behind.
+        try:
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+        t.join(timeout=3.0)
+    assert not hung, "constructing the provider blocked on a FIFO"
+    assert isinstance(result[0], OpenBaoConfigError) and "regular file" in str(result[0])
+
+
+def test_an_oversized_ca_file_is_refused(tmp_path):
+    big = tmp_path / "big.pem"
+    big.write_bytes(b"A" * (1024 * 1024 + 1))
+    with pytest.raises(OpenBaoConfigError) as e:
+        OpenBaoSecretProvider("https://127.0.0.1:8200", token="t", ca_file=str(big))
+    assert "too large" in str(e.value)
 
 
 def test_a_directory_is_not_a_ca_file(tmp_path):
