@@ -138,6 +138,7 @@ Configuration (env vars, all under `ACROPOLIS_`):
 | `VAULT_AUTH_METHOD` = `kubernetes` + `VAULT_K8S_ROLE` | | Kubernetes auth (no static secret at all) |
 | `VAULT_K8S_TOKEN_FILE` | no (default `/var/run/secrets/kubernetes.io/serviceaccount/token`) | Where the pod's service-account token is read from |
 | `VAULT_K8S_MOUNT` | no (default `kubernetes`) | Name the Kubernetes auth method is mounted under |
+| `VAULT_CA_FILE` | no | PEM file of the CA(s) that signed the secret server's certificate — see "Private CA" below |
 | `VAULT_TTL_SECONDS` | no (default 60) | Resolved-value cache TTL — see below |
 
 #### Authenticating to the secret server
@@ -221,6 +222,19 @@ lifetime explicitly, project a token instead and point `ACROPOLIS_VAULT_K8S_TOKE
 (`serviceAccountToken` volume with a short `expirationSeconds`). Do not set a custom `audience` on
 the projected token unless you also set the matching `audience` on the OpenBao role; that pairing
 is not exercised by this project's tests.
+
+Private CA: when the secret server's certificate comes from a CA that no public trust store knows
+(an in-cluster OpenBao behind an internal CA), set `ACROPOLIS_VAULT_CA_FILE` to a PEM file holding
+that CA's certificate (a ConfigMap mount is enough; it is a public certificate, not a secret). The
+client then trusts **only** the CA(s) in that file for this one connection, so public CAs are not
+trusted for the secret server, and the server name is still checked against the certificate. It
+needs an `https://` `VAULT_ADDR` (a CA file beside a plain `http://` address is a startup error,
+because it would look like transport security and give none), cannot be combined with an injected
+client, and an unreadable, empty or non-PEM file is a startup error that names the path and never
+echoes the file. The file is read once at startup, so replacing the CA certificate needs a restart.
+This does not touch `SSL_CERT_FILE` or any other client in the process. The server's certificate
+must carry an Authority Key Identifier (any normal CA adds one; a hand-rolled `openssl x509 -req`
+template may not), because current Python's default verification rejects a leaf without it (observed on 3.14).
 
 Transport and files: a `VAULT_ADDR` that is plain `http://` to anything other than localhost logs a
 warning at startup, because the login credential and every secret then travel in clear text (it is

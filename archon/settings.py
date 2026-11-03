@@ -119,6 +119,10 @@ class Settings(BaseSettings):
     vault_k8s_role: str | None = None
     vault_k8s_token_file: str = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     vault_k8s_mount: str = "kubernetes"
+    # PEM file of the CA(s) that signed the secret server's certificate, for a private CA that no
+    # public trust store knows. The client then trusts ONLY this file (not the public CAs) and
+    # still checks the server name. A path, not a secret. Requires an https vault_addr.
+    vault_ca_file: str | None = None
     vault_ttl_seconds: float = 60.0
 
     # Issue #134 (Task 1): the signing key Acropolis uses to mint audience-bound JWTs for the
