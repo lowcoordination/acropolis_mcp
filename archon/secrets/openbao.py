@@ -164,7 +164,12 @@ def _ssl_context_from_ca_file(path: str) -> ssl.SSLContext:
             os.close(fd)
         if len(raw) > MAX_CA_FILE_BYTES:
             raise OpenBaoConfigError(f"ca_file {path!r} is too large (over {MAX_CA_FILE_BYTES} bytes)")
-        context = ssl.create_default_context(cadata=raw.decode("ascii"))
+        text = raw.decode("ascii")
+        if not text.strip():
+            # create_default_context treats an EMPTY cadata as "none given" (on 3.12) and falls
+            # back to the system bundle, which would trust every public CA: refuse it here.
+            raise OpenBaoConfigError(f"ca_file {path!r} is empty")
+        context = ssl.create_default_context(cadata=text)
     except UnicodeDecodeError:
         raise OpenBaoConfigError(f"ca_file {path!r} is not a PEM bundle of CA certificates") from None
     except (OSError, ssl.SSLError) as e:

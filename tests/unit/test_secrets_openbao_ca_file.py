@@ -249,6 +249,21 @@ def test_an_oversized_ca_file_is_refused(tmp_path):
     assert "too large" in str(e.value)
 
 
+@pytest.mark.parametrize("content", ["", "\n", "  \r\n\t"], ids=["empty", "newline", "whitespace"])
+def test_an_empty_ca_file_never_reaches_create_default_context(tmp_path, monkeypatch, content):
+    """On Python 3.12 `create_default_context(cadata="")` means "none given" and loads the SYSTEM
+    bundle, so an empty file would silently trust every public CA (found by CI on 3.12; 3.13+
+    raises instead, which hid it locally). Assert on the call, so this fails on any Python."""
+    calls = []
+    real = ssl.create_default_context
+    monkeypatch.setattr(ssl, "create_default_context", lambda *a, **k: calls.append((a, k)) or real(*a, **k))
+    path = tmp_path / "ca.pem"
+    path.write_text(content)
+    with pytest.raises(OpenBaoConfigError):
+        OpenBaoSecretProvider("https://127.0.0.1:8200", token="t", ca_file=str(path))
+    assert calls == []
+
+
 def test_a_directory_is_not_a_ca_file(tmp_path):
     with pytest.raises(OpenBaoConfigError):
         OpenBaoSecretProvider("https://127.0.0.1:8200", token="t", ca_file=str(tmp_path))
