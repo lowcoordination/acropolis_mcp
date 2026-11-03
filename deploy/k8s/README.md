@@ -54,7 +54,7 @@ Then open `http://localhost:8000` and finish setup, same as the
 ## Building and rolling out a new image
 
 There is no CI image publish, so a release is built by hand from a **merged** commit. This is the
-procedure used for 0.1.8; every step below was run.
+procedure used for 0.1.8; steps 1–6 were run, step 7 (rollback) was not exercised.
 
 1. **Pick the commit and see what goes out with it.** Everything merged since the last build ships,
    not only your change:
