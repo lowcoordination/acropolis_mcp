@@ -51,6 +51,59 @@ kubectl -n acropolis port-forward svc/acropolis 8000:8000
 Then open `http://localhost:8000` and finish setup, same as the
 [quickstart](../../docs/quickstart.md).
 
+## Building and rolling out a new image
+
+There is no CI image publish, so a release is built by hand from a **merged** commit. This is the
+procedure used for 0.1.8; steps 1–6 were run, step 7 (rollback) was not exercised.
+
+1. **Pick the commit and see what goes out with it.** Everything merged since the last build ships,
+   not only your change:
+   ```bash
+   git log --oneline <previous-build-commit>..<commit>
+   ```
+   0.1.8 carried a gateway behaviour change (#167) alongside the change it was built for. Read
+   that list before building.
+2. **Build from a clean archive, not your working tree.** Untracked and local files must not
+   reach the image:
+   ```bash
+   B=$(mktemp -d) && git archive <commit> | tar -x -C "$B" && cd "$B"
+   docker build -t <registry>/acropolis:<version> .
+   ```
+   Versions are never reused. List the registry's tags first
+   (`curl -s https://<registry>/v2/<repo>/tags/list`) and take the next one.
+3. **Push, then read the digest back from the registry** rather than trusting your local copy:
+   ```bash
+   docker push <registry>/acropolis:<version>
+   curl -sI -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json" \
+     https://<registry>/v2/<repo>/manifests/<version> | grep -i docker-content-digest
+   ```
+   The digest must equal the one `docker push` printed.
+4. **Pin the manifest by tag and digest** in `deployment.yaml`:
+   `image: <registry>/acropolis:<version>@sha256:<digest>`. The tag is for people; the digest is
+   what the cluster enforces. Put the source commit in a comment next to it. Then validate:
+   ```bash
+   kubectl apply --dry-run=server -f deployment.yaml
+   ```
+5. **Change the manifest through review, then apply after it merges.** Cluster manifests are
+   security-relevant, so the change gets a code review and a security scan like any other.
+6. **Apply and verify what is actually running**, not that the command succeeded:
+   ```bash
+   kubectl apply -f deployment.yaml
+   kubectl -n acropolis rollout status deploy/acropolis
+   kubectl -n acropolis get pod -l app=acropolis \
+     -o jsonpath='{.items[*].status.containerStatuses[0].imageID}'   # must contain the new digest
+   kubectl -n acropolis logs deploy/acropolis | grep -i -E "error|traceback"
+   curl -s https://<your-host>/api/v1/health                          # {"status":"ok"}
+   ```
+   Then exercise whatever the release changed with a real call through the gateway; health
+   checks alone do not prove client traffic still works. A fresh pod sees no client requests
+   until a client next calls, so a quiet log is not evidence.
+7. **Rollback** is re-applying the previous `image:` line. Old tags stay in the registry, which is
+   why they are never reused.
+
+Test on the Python the image ships (see the `Dockerfile` base), not only your development one:
+a TLS-trust bug in 0.1.8 passed on Python 3.14 and was caught only by CI on 3.12.
+
 ## What's in here
 
 | File | Purpose |
