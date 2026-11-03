@@ -51,6 +51,7 @@ import logging
 import math
 import os
 import re
+import ssl
 import stat
 import time
 from dataclasses import dataclass
@@ -136,6 +137,49 @@ def parse_vault_ref(ref: str) -> VaultRef:
     return VaultRef(mount=mount, path=path, key=key)
 
 
+MAX_CA_FILE_BYTES = 1024 * 1024  # a CA bundle is a few KiB; this only bounds a mis-pointed path
+
+
+def _ssl_context_from_ca_file(path: str) -> ssl.SSLContext:
+    """A verifying TLS context that trusts exactly the certificates in `path`.
+
+    Passing `cadata` to `create_default_context` loads that INSTEAD of the system bundle, and
+    hostname checking stays on: a certificate from this CA is still rejected if it is for a
+    different name. The file is opened non-blocking and checked with fstat BEFORE reading (a FIFO
+    with no writer would otherwise hang startup forever), read once, and loaded from memory so
+    what was checked is what is trusted. Errors name the path and the kind of failure, never the
+    file's contents (a mis-pointed setting can land on a private key)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OpenBaoConfigError(f"ca_file {path!r} is not a regular file")
+            raw = b""
+            while len(raw) <= MAX_CA_FILE_BYTES:
+                chunk = _read(fd, MAX_CA_FILE_BYTES + 1 - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            os.close(fd)
+        if len(raw) > MAX_CA_FILE_BYTES:
+            raise OpenBaoConfigError(f"ca_file {path!r} is too large (over {MAX_CA_FILE_BYTES} bytes)")
+        text = raw.decode("ascii")
+        if not text.strip():
+            # create_default_context treats an EMPTY cadata as "none given" (on 3.12) and falls
+            # back to the system bundle, which would trust every public CA: refuse it here.
+            raise OpenBaoConfigError(f"ca_file {path!r} is empty")
+        context = ssl.create_default_context(cadata=text)
+    except UnicodeDecodeError:
+        raise OpenBaoConfigError(f"ca_file {path!r} is not a PEM bundle of CA certificates") from None
+    except (OSError, ssl.SSLError) as e:
+        reason = e.strerror if isinstance(e, OSError) and e.strerror else type(e).__name__
+        raise OpenBaoConfigError(f"ca_file {path!r} is not a usable PEM bundle of CA certificates: {reason}") from None
+    if not context.get_ca_certs():
+        raise OpenBaoConfigError(f"ca_file {path!r} contains no CA certificates")
+    return context
+
+
 class OpenBaoConfigError(Exception):
     """Raised at provider construction time for missing/invalid configuration — a base URL is
     required, and exactly one consistent auth mode (token, AppRole or Kubernetes) must be
@@ -160,6 +204,7 @@ class OpenBaoSecretProvider:
         k8s_role: Optional[str] = None,
         k8s_token_file: str = DEFAULT_K8S_TOKEN_FILE,
         k8s_mount: str = DEFAULT_K8S_MOUNT,
+        ca_file: Optional[str] = None,
         client: Optional[httpx.AsyncClient] = None,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -215,6 +260,19 @@ class OpenBaoSecretProvider:
                 f"k8s_mount must be a plain auth mount name like 'kubernetes' or 'team/k8s', got {k8s_mount!r}"
             )
 
+        # Blank means unset: an env var that is present but empty must not become the path ''.
+        ca_file = ca_file or None
+        ssl_context = None
+        if ca_file is not None:
+            if parsed.scheme != "https":
+                raise OpenBaoConfigError(
+                    "ca_file is set but the address is not https: a CA file next to a plain http "
+                    "address would look like transport security and provide none"
+                )
+            if client is not None:
+                raise OpenBaoConfigError("ca_file cannot be combined with an injected client")
+            ssl_context = _ssl_context_from_ca_file(ca_file)
+
         if parsed.scheme == "http" and (parsed.hostname or "") not in _LOOPBACK_HOSTS:
             # Not blocked: an in-cluster service is often plain http. But the login credential and
             # every secret then travel in clear text, so it must never be silent. Host and port only:
@@ -234,12 +292,17 @@ class OpenBaoSecretProvider:
         self._k8s_role = k8s_role
         self._k8s_token_file = k8s_token_file
         self._k8s_mount = k8s_mount
+        self._ca_file = ca_file
         self._request_timeout = request_timeout_seconds
         # A dedicated client (rather than the app-wide shared http_client) so this provider's
         # short, fixed request timeout can never be affected by — or affect — the generous
         # upstream-call timeout budget the rest of the gateway uses. Tests may inject their own
-        # client pointed at a disposable dev server.
-        self._client = client or httpx.AsyncClient(timeout=self._request_timeout)
+        # client pointed at a disposable dev server. With a ca_file the client trusts that file and
+        # nothing else (no public CAs): this one connection is pinned to the operator's own CA.
+        self._client = client or httpx.AsyncClient(
+            timeout=self._request_timeout,
+            **({"verify": ssl_context} if ssl_context is not None else {}),
+        )
         self._owns_client = client is None
 
         self._cache = _TTLCache(ttl_seconds)

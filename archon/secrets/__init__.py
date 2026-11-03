@@ -227,6 +227,7 @@ def build_secret_provider(settings) -> "SecretProvider":
             k8s_role=settings.vault_k8s_role,
             k8s_token_file=settings.vault_k8s_token_file,
             k8s_mount=settings.vault_k8s_mount,
+            ca_file=settings.vault_ca_file,
             ttl_seconds=getattr(settings, "vault_ttl_seconds", 60.0),
         )
     raise ValueError(f"unknown secret_provider {provider!r} (expected 'local', 'encrypted', or 'openbao')")
