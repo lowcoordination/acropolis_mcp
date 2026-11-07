@@ -20,6 +20,7 @@ from argus.bridge import BridgeError, ProtocolBridge
 from argus.credentials import UpstreamCredentialError, resolve_upstream_credential
 from argus.discover import synthesize_server_discover
 from argus.generation import ClientGeneration, detect_client_generation
+from argus.result_envelope import envelope_2026_result
 from argus.headers import (
     MCP_METHOD_HEADER,
     MCP_NAME_HEADER,
@@ -475,7 +476,9 @@ class Pipeline:
                 return self._handle_discover(server, rpc_id)
 
             if rpc_method == "tools/list" and self._tools_cache is not None:
-                return await self._handle_tools_list(server, rpc_id, api_key_id, start, client_ip)
+                return await self._handle_tools_list(
+                    server, rpc_id, api_key_id, start, client_ip, generation=generation,
+                )
 
             if generation == ClientGeneration.GEN_2026 and self._bridge is not None:
                 return await self._handle_bridged(
@@ -708,7 +711,8 @@ class Pipeline:
         return Response(content=content, status_code=status, media_type=media_type)
 
     def _handle_discover(self, server: ServerRecord, rpc_id: Any) -> Response:
-        result = synthesize_server_discover(server)
+        # server/discover only exists in 2026-07-28, so its caller always needs the 2026 fields.
+        result = envelope_2026_result("server/discover", synthesize_server_discover(server))
         return Response(
             content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": result}),
             status_code=200, media_type="application/json",
@@ -716,7 +720,7 @@ class Pipeline:
 
     async def _handle_tools_list(
         self, server: ServerRecord, rpc_id: Any, api_key_id: Optional[int], start: float,
-        client_ip: Optional[str] = None,
+        client_ip: Optional[str] = None, generation: ClientGeneration = ClientGeneration.GEN_2025,
     ) -> Response:
         try:
             resolved_auth_header = await self._resolve_credential(
@@ -735,8 +739,12 @@ class Pipeline:
             endpoint="per-server", rpc_method="tools/list", api_key_id=api_key_id,
             latency_ms=int((time.monotonic() - start) * 1000), client_ip=client_ip,
         )
+        result: dict = {"tools": tools}
+        if generation == ClientGeneration.GEN_2026:
+            # #172: a 2026 client rejects a tools/list result without these fields.
+            result = envelope_2026_result("tools/list", result)
         return Response(
-            content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": {"tools": tools}}),
+            content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": result}),
             status_code=200, media_type="application/json",
         )
 
@@ -815,6 +823,11 @@ class Pipeline:
             if scan_policy is not None:
                 body, scan = await self._scan_message(body, scan_policy, rpc_id)
                 self._trace_scan(scan)
+            # #172: the upstream is 2025-generation, so its result has no resultType (and no
+            # ttlMs/cacheScope on the cacheable methods), all of which a 2026 client requires.
+            # After the DLP scan on purpose: the scan sees the upstream's own result.
+            if isinstance(body, dict) and isinstance(body.get("result"), dict):
+                body = {**body, "result": envelope_2026_result(rpc_method, body["result"])}
             return Response(content=json.dumps(body), status_code=status, media_type="application/json")
         finally:
             await self._log_deferred_allowed(pending_audit, start, scan)
