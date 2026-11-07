@@ -14,7 +14,8 @@ from argus.aggregate import namespace_tool_definition, split_namespaced_tool_nam
 from argus.audit import AuditLogger
 from argus.credentials import UpstreamCredentialError
 from argus.discover import synthesize_gateway_discover
-from argus.generation import ClientGeneration
+from argus.generation import ClientGeneration, detect_client_generation
+from argus.result_envelope import envelope_2026_result
 from argus.jsonrpc import NotASingleMessage, parse_single_message, rpc_error, sanitize_rpc_id
 from argus.pipeline import SINGLE_MESSAGE_RULE, Pipeline, RoutingError, _client_ip
 from db.models import ApiKeyRecord
@@ -118,7 +119,10 @@ class AggregatePipeline:
         params = body_json.get("params", {}) or {}
 
         if rpc_method == "tools/list":
-            return await self._handle_tools_list(rpc_id, start, client_ip, key_record)
+            return await self._handle_tools_list(
+                rpc_id, start, client_ip, key_record,
+                generation=detect_client_generation(request),
+            )
         if rpc_method == "tools/call":
             return await self._handle_tools_call(request, body_json, rpc_id, params, key_record)
         if rpc_method == "server/discover":
@@ -155,7 +159,8 @@ class AggregatePipeline:
     async def _handle_discover(self, rpc_id: Any, key_record: Optional[ApiKeyRecord] = None) -> Response:
         project_id = await self._caller_project_id(key_record)
         servers = await self._servers.list(project_id=project_id)
-        result = synthesize_gateway_discover(servers)
+        # server/discover only exists in 2026-07-28, so its caller always needs the 2026 fields.
+        result = envelope_2026_result("server/discover", synthesize_gateway_discover(servers))
         return Response(
             content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": result}),
             status_code=200, media_type="application/json",
@@ -209,6 +214,7 @@ class AggregatePipeline:
     async def _handle_tools_list(
         self, rpc_id: Any, start: float, client_ip=None,
         key_record: Optional[ApiKeyRecord] = None,
+        generation: ClientGeneration = ClientGeneration.GEN_2025,
     ) -> Response:
         # Servers are fetched CONCURRENTLY (the gather below), never in a sequential loop: each
         # server's cost is a full upstream handshake plus a tools/list round-trip on a cache
@@ -236,8 +242,12 @@ class AggregatePipeline:
             client_ip=client_ip,
         )
 
+        result: dict = {"tools": merged}
+        if generation == ClientGeneration.GEN_2026:
+            # #172: a 2026 client rejects a tools/list result without these fields.
+            result = envelope_2026_result("tools/list", result)
         return Response(
-            content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": {"tools": merged}}),
+            content=json.dumps({"jsonrpc": "2.0", "id": sanitize_rpc_id(rpc_id), "result": result}),
             status_code=200, media_type="application/json",
         )
 
