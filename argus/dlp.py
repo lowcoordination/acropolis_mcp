@@ -265,9 +265,21 @@ BUILTIN_DETECTORS: dict[str, Detector] = {
     ),
     "github_token": Detector(
         name="github_token",
-        label="GitHub token (classic or fine-grained)",
+        label="GitHub token (classic, fine-grained or App installation)",
+        # Two top-level alternatives. The first is the classic and fine-grained shapes, bounded on
+        # both sides. The second is the App installation token GitHub now issues by default,
+        # `ghs_<numeric app id>_<jwt-like body>` (about 520 characters). Its body contains `_`,
+        # `-` and `.`, so the first alternative's "nothing in [A-Za-z0-9_] after the run" rule
+        # cannot hold for it, and the `jwt` detector refuses a match preceded by `_`.
+        # The second alternative has NO trailing lookahead on purpose. With one, a body of more than
+        # 1000 letters and digits fails to match at all (the greedy run stops at 1000, the next
+        # character is in the class, and every shorter run fails the same way), so an over-long
+        # token would pass unredacted. Without it the first 1000 characters are still redacted.
+        # It is also about 14x cheaper on adversarial input (measured; both are linear). The price
+        # is that a tail beyond 1000 characters survives; real tokens are about half that.
         pattern=re.compile(
             r"(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,251}|github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59})(?![A-Za-z0-9_])"
+            r"|(?<![A-Za-z0-9_])ghs_[0-9]{1,20}_[A-Za-z0-9_.~+/=-]{40,1000}"
         ),
     ),
     "secret_assignment": Detector(

@@ -397,6 +397,14 @@ _FAKE_JWT = ".".join([
 ])
 _FAKE_GHP = "gh" + "p_" + "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5"
 _FAKE_GH_PAT = "github" + "_pat_" + "11ABCDEFG0123456789abc" + "_" + ("Zx9" * 19 + "Qw")
+# GitHub's current App installation token: ghs_<app id>_<three base64url segments joined by dots>,
+# about 520 characters. Built from pieces and made-up filler, not a real credential.
+_FAKE_GHS_V2_BODY = (
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9" + "."
+    + "".join(chr(ord("a") + (i * 7) % 26) if i % 5 else str(i % 10) for i in range(300)) + "."
+    + "".join(chr(ord("A") + (i * 11) % 26) if i % 4 else "-_"[i % 2] for i in range(170))
+)
+_FAKE_GHS_V2 = "gh" + "s_" + "1234567" + "_" + _FAKE_GHS_V2_BODY
 
 
 async def _redact(text: str, name: str) -> str | None:
@@ -450,6 +458,63 @@ async def test_github_fine_grained_pat_redacted():
 
 async def test_github_token_near_miss():
     assert await _redact("ghp_short and gho_ also short", "github_token") is None
+
+
+def test_fake_installation_token_has_the_real_shape():
+    assert 480 <= len(_FAKE_GHS_V2) <= 560
+    assert _FAKE_GHS_V2.count(".") == 2 and _FAKE_GHS_V2.startswith("ghs_1234567_eyJ")
+
+
+async def test_github_installation_token_redacted_whole():
+    out = await _redact(f"token: {_FAKE_GHS_V2} ok", "github_token")
+    assert out == "token: [REDACTED:github_token] ok"
+
+
+async def test_github_installation_token_redacted_in_json_text():
+    out = await _redact('{"token":"' + _FAKE_GHS_V2 + '","expires":"x"}', "github_token")
+    assert out == '{"token":"[REDACTED:github_token]","expires":"x"}'
+
+
+async def test_github_old_installation_token_still_redacted():
+    old = "gh" + "s_" + "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5"
+    assert await _redact(f"x {old} y", "github_token") == "x [REDACTED:github_token] y"
+
+
+@pytest.mark.parametrize("text", [
+    "ghs_1234567_shortbody",                                   # body under 40 characters
+    "ghs_abc_" + "x" * 60,                                     # no numeric app id
+    "ghs__" + "x" * 60,                                        # empty app id
+    "ghs_" + "1" * 21 + "_" + "x" * 60,                        # app id longer than 20 digits
+    "x" + _FAKE_GHS_V2,                                        # letter before the prefix
+    "_" + _FAKE_GHS_V2,                                        # underscore before the prefix
+])
+async def test_github_installation_token_near_misses(text):
+    assert await _redact(text, "github_token") is None
+
+
+async def test_github_installation_token_longer_than_the_cap_is_still_redacted():
+    """A trailing lookahead would make a body of more than 1000 letters and digits fail to match
+    at all, so an over-long token would pass whole. The first 1000 characters must still go."""
+    out = await _redact("t " + "gh" + "s_1_" + "a" * 1200 + " end", "github_token")
+    assert out is not None and out.startswith("t [REDACTED:github_token]")
+
+
+def test_github_installation_token_scan_is_linear_on_hostile_input():
+    """Hostile shapes: the prefix repeated, a run just under the minimum body, a single run far
+    past the cap, and a run of dots. Absolute bound only; the doubling-size measurement is in
+    the PR description."""
+    det = BUILTIN_DETECTORS["github_token"]
+    cases = {
+        "repeated prefix": "ghs_1_" * 40000,
+        "run just under minimum": ("ghs_1_" + "a" * 39 + " ") * 5000,
+        "one run past the cap": "ghs_1_" + "a" * 200000,
+        "prefix then dots": "ghs_1_" + "." * 200000,
+    }
+    for label, text in cases.items():
+        start = time.monotonic()
+        list(det.pattern.finditer(text))
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, f"{label}: {elapsed:.2f}s on {len(text)} chars"
 
 
 async def test_secret_assignment_redacts_value_keeps_key():
@@ -511,7 +576,7 @@ def test_all_builtin_detector_patterns_resist_structured_fuzz():
     import random
 
     rng = random.Random(4321)
-    tokens = list("abcXYZ019._-:/@=\"' \t") + ["Bearer ", "eyJ", "password=", "://", "ghp_", "token: "]
+    tokens = list("abcXYZ019._-:/@=\"' \t") + ["Bearer ", "eyJ", "password=", "://", "ghp_", "ghs_1_", "token: "]
     for name, detector in BUILTIN_DETECTORS.items():
         for _ in range(15):
             n = rng.randint(500, 20000)

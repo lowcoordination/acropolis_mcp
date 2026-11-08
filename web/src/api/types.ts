@@ -95,7 +95,7 @@ export const DLP_DETECTORS: { name: DlpDetectorName; label: string }[] = [
   { name: 'high_entropy_string', label: 'Generic high-entropy string (likely a secret)' },
   { name: 'bearer_token', label: 'HTTP Bearer token' },
   { name: 'jwt', label: 'JSON Web Token' },
-  { name: 'github_token', label: 'GitHub token (classic or fine-grained)' },
+  { name: 'github_token', label: 'GitHub token (classic, fine-grained or App installation)' },
   { name: 'secret_assignment', label: 'Secret-named key with a value (password=, token:, ...)' },
   { name: 'url_credentials', label: 'Password in a URL (scheme://user:password@host)' },
 ]
