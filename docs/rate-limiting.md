@@ -5,6 +5,19 @@ answer *how fast* a caller may call. They are a different control from
 [quotas](quotas.md), which answer *how much, over a billing period* — see that page for the
 distinction and why the two behave differently under failure.
 
+## What a limit counts
+
+- **The spec is `N/second`, `N/minute` or `N/hour`.** Any other unit, or a spec without exactly one
+  `/`, is refused (`argus/rate_limiter.py`, `parse_spec_parts`).
+- **There is one bucket per server, shared by every API key.** The bucket is `srv:{slug}`; a second
+  key calling the same server draws from the same budget, so one busy key can use it up for all the
+  others. There is no per-key rate limit. A per-key budget is a [quota](quotas.md), which counts per
+  day or month, not per second.
+- **Only `tools/call` is counted.** `initialize`, `tools/list` and the other protocol methods do not
+  consume the bucket. Policy evaluations do (see [below](#policy-evaluations-share-the-same-buckets)).
+- **A refused call returns an error, it is not queued.** Size the limit for the busiest moment, not the
+  average.
+
 ## Backends
 
 | Backend | Setting | Use when |
