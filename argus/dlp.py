@@ -152,10 +152,31 @@ def _bearer_validator(matched: str) -> bool:
 # and small counts (`max_token: 4096`).
 _NON_SECRET_ASSIGNMENT_VALUE = re.compile(r"^(?:true|false|null|none|nil|[0-9]{1,6})$", re.IGNORECASE)
 
+# Values that are visibly not a secret, from reviews of this project's own source and docs (#177).
+# Deliberately narrow: `password=hunter2` is shaped like an identifier and `Winter2023(` like a
+# truncated call, so identifiers and calls in general are NOT dropped. Every alternative is
+# anchored and bounded, so the validator is linear in the (at most 512-character) value.
+#   1. only ellipsis, mask or markup characters: `...`, `********`, a stray backtick or `)`
+#   2. a reference or template: `${VAR...`, `$(cmd...`, `{{ x }}`, `%(x)s`, or a whole `<name>`
+#   3. a bare type name, optionally subscripted: `str`, `bool`, `Optional[str]`, `list[str]`
+_PLACEHOLDER_ASSIGNMENT_VALUE = re.compile(
+    r"^(?:"
+    r"[.\u2026*`)\]}>:_-]+"
+    r"|(?:\$\{|\$\(|\{\{|%\().*"
+    r"|<[A-Za-z0-9_.-]{1,64}>[,.)\]}`:]*"
+    r"|(?:str|string|int|integer|bool|boolean|float|bytes|dict|list|any|object|number|secretstr|optional)"
+    r"(?:\[[^\]]{0,64}\]?)?[,)\]}`:|]*"
+    r")$",
+    re.IGNORECASE,
+)
+
 
 def _secret_assignment_validator(matched: str) -> bool:
     m = _SECRET_ASSIGNMENT_RE.match(matched)
-    return m is not None and not _NON_SECRET_ASSIGNMENT_VALUE.match(_unescape_tail(m.group(1)))
+    if m is None:
+        return False
+    value = _unescape_tail(m.group(1))
+    return not _NON_SECRET_ASSIGNMENT_VALUE.match(value) and not _PLACEHOLDER_ASSIGNMENT_VALUE.match(value)
 
 
 def _unescape_tail(value: str) -> str:

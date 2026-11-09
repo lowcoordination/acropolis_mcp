@@ -540,6 +540,57 @@ async def test_secret_assignment_near_misses(text):
     assert await _redact(text, "secret_assignment") is None
 
 
+# False positives seen in reviews of this repo's own source and docs (#177): the value after the
+# key is not a secret. Each of these must NOT redact.
+@pytest.mark.parametrize("text", [
+    "see ``ToolsCache.get_raw_tools(resolve_credential=...)``.",   # ellipsis and markup
+    "credential=...)``:",
+    "password=********",                                           # a mask
+    "token=\u2026",                                                # a typographic ellipsis
+    "credentials: bool",                                           # type annotations
+    "secret: str,",
+    "token: Optional[str]",
+    "credentials: list[str]",
+    "api_key: string",
+    "password: SecretStr",
+    "PASSWORD=${ACROPOLIS_DB_PASSWORD:?Set a password}",           # references and templates
+    "TOKEN=$(openssl rand -hex 32)",
+    "password={{ vault_password }}",
+    "token=<your-token>",
+    "secret=%(secret)s",
+    '{"password":"${DB_PASSWORD}"}',
+])
+async def test_secret_assignment_ignores_placeholders_types_and_references(text):
+    assert await _redact(text, "secret_assignment") is None
+
+
+# The rules above are narrow. Values that sit right next to them but could be real secrets keep
+# matching: a rule widened by one step would drop one of these.
+@pytest.mark.parametrize("text, secret", [
+    ("password=hunter2", "hunter2"),
+    ("password: correcthorsebatterystaple", "correcthorsebatterystaple"),
+    ('token = "a8Fk29xQ1pLm"', "a8Fk29xQ1pLm"),
+    ("api_key=sk-live-4eC39HqLyjWDarjtT1zdp7dc", "sk-live-4eC39HqLyjWDarjtT1zdp7dc"),
+    ("secret: s3cr3t!", "s3cr3t!"),
+    ("PASSWORD=!@#$%^&*", "!@#$%^"),                               # symbols with no letters
+    ("password=$ecret123", "$ecret123"),                           # starts with "$" but is not "${" or "$("
+    ("password=<>Zx9", "<>Zx9"),                                   # not a whole <name>
+    ("password=<token>x9", "<token>x9"),                           # text after the closing ">"
+    ("password={9f8e7d6c}", "{9f8e7d6c}"),                         # one brace, not "{{"
+    ("password=string1", "string1"),                               # starts like a type name
+    ("token=list-9f8e7d", "list-9f8e7d"),
+    ("secret=int8Kq2pLm", "int8Kq2pLm"),
+    ("password=str0ngPass", "str0ngPass"),
+    ("token=boolean9Zq", "boolean9Zq"),
+    ("password=Winter2023(", "Winter2023("),                       # looks like a truncated call
+    ("password=....x9", "....x9"),                                 # starts with dots, has a letter
+    ("secret=****a1", "****a1"),
+])
+async def test_secret_assignment_keeps_values_that_could_be_secrets(text, secret):
+    out = await _redact(text, "secret_assignment")
+    assert out is not None and secret not in out, text
+
+
 async def test_url_credentials_redacts_password_only():
     out = await _redact("dsn postgres://app:s3cr3t@db:5432/x ok", "url_credentials")
     assert out == "dsn postgres://app:[REDACTED:url_credentials]@db:5432/x ok"
