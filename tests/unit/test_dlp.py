@@ -591,6 +591,77 @@ async def test_secret_assignment_keeps_values_that_could_be_secrets(text, secret
     assert out is not None and secret not in out, text
 
 
+# Prose, not a value (#179): the word after `password:` is an ordinary function word in a sentence.
+# Each of these must NOT redact.
+@pytest.mark.parametrize("text", [
+    "Use a strong password: they are stored in the vault.",
+    "None of these is a real credential: they are random strings in the shapes issued.",
+    "the credential: it is rotated monthly",
+    "Note on the token: this is only valid for one hour.",
+    "The secret: the value lives in the vault.",
+    "Each password: a unique string.",
+    "password: They.",                                             # case and a full stop
+    "token: is",
+    "api_key: not set",
+    "secret: you must rotate it",
+    "credentials: to be supplied",
+    "password: if unset, a random one is generated",
+    "token=its,",
+])
+async def test_secret_assignment_ignores_function_words_in_prose(text):
+    assert await _redact(text, "secret_assignment") is None, text
+
+
+# What the prose rule must NOT touch: the same words quoted (code), a value that only starts with a
+# function word, digits or symbols next to it, and weak values that really are secrets. A rule widened
+# by one step (quotes, prefixes, content words) would drop one of these.
+@pytest.mark.parametrize("text, secret", [
+    ('password = "the"', "the"),                                   # quoted literal: code, not prose
+    ("password = 'they'", "they"),
+    ('{"password": "it"}', "it"),
+    ('{\\"password\\":\\"are\\"}', "are"),                        # escaped quotes
+    ("password: it2", "it2"),                                      # digit
+    ("password: they!x", "they!x"),                                # symbol inside
+    ("password: theory", "theory"),                                # starts with "the", is not one
+    ("password: isolated", "isolated"),
+    ("password: inside", "inside"),
+    ("password: another", "another"),
+    ("password: Thethe", "Thethe"),
+    ("password: it$#", "it$#"),                                    # a symbol tail is not sentence punctuation
+    ("password: the@@", "the@@"),
+    ("password: you%", "you%"),
+    ("password: is#", "is#"),
+    ("password: they....", "they...."),                            # the tail is bounded to three characters
+    ("password: toolong1", "toolong1"),
+    ("password: never", "never"),                                  # not closed-class: could be chosen
+    ("password: here", "here"),
+    ("token: see", "see"),
+    ("secret: love", "love"),
+    ("The password: hunter2 must be rotated.", "hunter2"),         # the real leak in the same sentence
+    ("# the admin password: letmein is set on the NAS", "letmein"),
+    ("export TOKEN=abc123", "abc123"),
+    ("API_KEY=changeme", "changeme"),
+])
+async def test_secret_assignment_prose_rule_does_not_hide_real_values(text, secret):
+    out = await _redact(text, "secret_assignment")
+    assert out is not None and secret not in out.replace("[REDACTED:secret_assignment]", ""), text
+
+
+async def test_secret_assignment_prose_rule_keeps_the_rest_of_the_sentence():
+    out = await _redact("Pick a password: hunter2 and a token: they are stored.", "secret_assignment")
+    assert out == "Pick a password: [REDACTED:secret_assignment] and a token: they are stored."
+
+
+def test_secret_assignment_function_words_are_closed_class_only():
+    """The list is a security decision. Pin it so adding a content word is a reviewed change."""
+    from argus.dlp import _PROSE_FUNCTION_WORDS
+    assert len(_PROSE_FUNCTION_WORDS) == 71
+    for risky in ("never", "here", "there", "over", "under", "all", "any", "some", "see", "use", "none",
+                  "admin", "root", "love", "secret", "password", "token", "test", "pass"):
+        assert risky not in _PROSE_FUNCTION_WORDS, risky
+    assert all(w.isascii() and w.isalpha() and w == w.lower() and len(w) <= 6 for w in _PROSE_FUNCTION_WORDS)
+
+
 async def test_url_credentials_redacts_password_only():
     out = await _redact("dsn postgres://app:s3cr3t@db:5432/x ok", "url_credentials")
     assert out == "dsn postgres://app:[REDACTED:url_credentials]@db:5432/x ok"

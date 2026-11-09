@@ -171,12 +171,44 @@ _PLACEHOLDER_ASSIGNMENT_VALUE = re.compile(
 )
 
 
+# Prose, not a value (#179): `Use a strong password: they are stored in the vault.` redacts `they`, and
+# the reader cannot tell that from `password: hunter2 must be rotated.` because the value is exactly what
+# the redaction removes. The detector still sees it, so it is judged here. Only a CLOSED-CLASS English
+# function word counts (articles, demonstratives, pronouns, be/have/do, modals, a few conjunctions and
+# prepositions, negation), only when the value is NOT quoted (prose has no quote before the value; a
+# quoted literal such as `password = "the"` is code and stays redacted), optionally followed by up to
+# three sentence-punctuation characters. Content words, adverbs and quantifiers (`never`, `here`, `over`,
+# `all`, `see`) are deliberately absent: each could be a chosen weak password. A password that really is
+# one of these words, unquoted, is the accepted cost. Digits or symbols anywhere (`it2`, `they!x`) or a
+# longer word (`theory`) keep the match.
+_PROSE_FUNCTION_WORDS = frozenset((
+    "a an the this that these those "
+    "i me my we us our you your he him his she her it its they them their "
+    "who whom whose which what "
+    "am is are was were be been being has have had do does did "
+    "can could will would shall should may might must "
+    "and or but nor if so as of to in on at by for with from not no"
+).split())
+_PROSE_WORD_VALUE = re.compile(r"^([A-Za-z]{1,6})[.!?:)\]]{0,3}$")
+
+
+def _is_unquoted_function_word(matched: str, m: re.Match, value: str) -> bool:
+    if matched[m.start(1) - 1] in "\"'":
+        return False
+    w = _PROSE_WORD_VALUE.match(value)
+    return w is not None and w.group(1).lower() in _PROSE_FUNCTION_WORDS
+
+
 def _secret_assignment_validator(matched: str) -> bool:
     m = _SECRET_ASSIGNMENT_RE.match(matched)
     if m is None:
         return False
     value = _unescape_tail(m.group(1))
-    return not _NON_SECRET_ASSIGNMENT_VALUE.match(value) and not _PLACEHOLDER_ASSIGNMENT_VALUE.match(value)
+    return (
+        not _NON_SECRET_ASSIGNMENT_VALUE.match(value)
+        and not _PLACEHOLDER_ASSIGNMENT_VALUE.match(value)
+        and not _is_unquoted_function_word(matched, m, value)
+    )
 
 
 def _unescape_tail(value: str) -> str:
